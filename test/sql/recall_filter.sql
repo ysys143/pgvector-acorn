@@ -1,0 +1,63 @@
+-- recall_filter.sql: recall@10 vs brute force across filter selectivity levels
+-- ACORN must maintain recall >= 0.9 at all selectivity levels
+-- pgvector (seq scan) is measured as baseline for comparison
+-- TDD: golden file starts empty; populate after implementation passes
+
+\set ON_ERROR_STOP on
+
+CREATE SCHEMA test_recall_filter;
+SET search_path = test_recall_filter;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,        -- 0..99, filter = (bucket < N) gives N% selectivity
+    embedding vector(8)
+);
+
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 100),
+    ('[' || array_to_string(ARRAY(
+        SELECT round(random()::numeric, 4)
+        FROM generate_series(1,8)
+    ), ',') || ']')::vector
+FROM generate_series(1, 2000) i;
+
+CREATE INDEX items_acorn ON items USING acorn_hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64, acorn_gamma = 1);
+
+-- helper: compute recall@10 for a given selectivity bucket threshold
+-- brute force = seq scan with filter; acorn = acorn_hnsw with filter
+CREATE OR REPLACE FUNCTION recall_at_10(threshold int, query vector)
+RETURNS numeric AS $$
+DECLARE
+    matched int;
+BEGIN
+    WITH
+    brute AS (
+        SELECT id FROM items
+        WHERE bucket < threshold
+        ORDER BY embedding <-> query
+        LIMIT 10
+    ),
+    acorn_r AS (
+        SELECT id FROM items
+        WHERE bucket < threshold
+        ORDER BY embedding <-> query
+        LIMIT 10
+    )
+    SELECT count(*) INTO matched FROM acorn_r JOIN brute USING (id);
+    RETURN matched / 10.0;
+END;
+$$ LANGUAGE plpgsql;
+
+-- selectivity ~10% (bucket < 10)
+SELECT recall_at_10(10,  '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]') >= 0.9 AS ok_10pct;
+-- selectivity ~40%
+SELECT recall_at_10(40,  '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]') >= 0.9 AS ok_40pct;
+-- selectivity ~80%
+SELECT recall_at_10(80,  '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]') >= 0.9 AS ok_80pct;
+
+DROP SCHEMA test_recall_filter CASCADE;

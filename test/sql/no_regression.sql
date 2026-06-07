@@ -1,0 +1,50 @@
+-- no_regression.sql: without a WHERE filter, acorn_hnsw must return the same
+-- top-k results as pgvector hnsw (unfiltered behavior must be identical)
+-- TDD: golden file starts empty; populate after implementation passes
+
+\set ON_ERROR_STOP on
+
+CREATE SCHEMA test_no_regression;
+SET search_path = test_no_regression;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    embedding vector(4)
+);
+
+-- deterministic data for stable golden file
+INSERT INTO items (embedding) VALUES
+    ('[1.0, 0.0, 0.0, 0.0]'),
+    ('[0.0, 1.0, 0.0, 0.0]'),
+    ('[0.0, 0.0, 1.0, 0.0]'),
+    ('[0.0, 0.0, 0.0, 1.0]'),
+    ('[0.5, 0.5, 0.0, 0.0]'),
+    ('[0.0, 0.5, 0.5, 0.0]'),
+    ('[0.0, 0.0, 0.5, 0.5]'),
+    ('[0.5, 0.0, 0.0, 0.5]');
+
+CREATE INDEX hnsw_idx   ON items USING hnsw       (embedding vector_cosine_ops)
+  WITH (m = 4, ef_construction = 16);
+
+CREATE INDEX acorn_idx  ON items USING acorn_hnsw  (embedding vector_cosine_ops)
+  WITH (m = 4, ef_construction = 16, acorn_gamma = 1);
+
+-- unfiltered: both indexes must return same top-3
+SET enable_seqscan = off;
+
+SELECT 'hnsw' AS src, id FROM items
+ORDER BY embedding <-> '[1.0,0.1,0.0,0.0]' LIMIT 3;
+
+-- force acorn_hnsw (hnsw_idx will be preferred by default if both exist;
+-- drop hnsw_idx to force acorn path)
+DROP INDEX hnsw_idx;
+
+SELECT 'acorn' AS src, id FROM items
+ORDER BY embedding <-> '[1.0,0.1,0.0,0.0]' LIMIT 3;
+
+RESET enable_seqscan;
+
+DROP SCHEMA test_no_regression CASCADE;

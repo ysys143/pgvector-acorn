@@ -1,0 +1,5 @@
+comment     = 'Filterable HNSW for PostgreSQL via ACORN'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_acorn'
+requires    = 'vector'
+relocatable = false

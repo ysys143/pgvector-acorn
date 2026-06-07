@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - -I/opt/homebrew/include/postgresql@14/server
+    - -I/opt/homebrew/include/postgresql@14
+    - -DUSE_ASSERT_CHECKING
+  Remove:
+    - -mno-outline-atomics

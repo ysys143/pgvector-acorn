@@ -1,0 +1,30 @@
+-- smoke.sql: extension loads and basic objects are registered
+-- TDD: golden file starts empty; populate after implementation passes
+
+\set ON_ERROR_STOP on
+
+CREATE SCHEMA test_smoke;
+SET search_path = test_smoke;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+
+-- acorn_hnsw AM must be registered
+SELECT amname FROM pg_am WHERE amname = 'acorn_hnsw';
+
+-- GUCs must exist
+SHOW pg_acorn.enable_hook;
+SHOW pg_acorn.default_gamma;
+
+-- basic table + index creation must not error
+CREATE TABLE items (id int, embedding vector(3));
+INSERT INTO items VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0,0,1]');
+
+CREATE INDEX ON items USING acorn_hnsw (embedding vector_cosine_ops)
+  WITH (m = 4, ef_construction = 16, acorn_gamma = 1);
+
+SELECT COUNT(*) FROM items
+WHERE id > 0
+ORDER BY embedding <-> '[1,0,0]' LIMIT 3;
+
+DROP SCHEMA test_smoke CASCADE;

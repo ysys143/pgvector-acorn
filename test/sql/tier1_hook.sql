@@ -1,0 +1,52 @@
+-- tier1_hook.sql: Tier 1 hook intercepts USING hnsw + WHERE and injects AcornScan
+-- TDD: golden file starts empty; populate after implementation passes
+
+\set ON_ERROR_STOP on
+
+CREATE SCHEMA test_tier1;
+SET search_path = test_tier1;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+
+SET pg_acorn.enable_hook = on;
+
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    category  text,
+    embedding vector(4)
+);
+
+INSERT INTO items (category, embedding) SELECT
+    CASE WHEN i % 5 = 0 THEN 'shoes' ELSE 'other' END,
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 200) i;
+
+-- Tier 1: existing hnsw index, no rebuild
+CREATE INDEX items_hnsw_idx ON items USING hnsw (embedding vector_cosine_ops);
+
+-- planner must choose Custom Scan (AcornScan), not Seq Scan
+EXPLAIN (COSTS OFF)
+SELECT id FROM items
+WHERE category = 'shoes'
+ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+LIMIT 5;
+
+-- result must not be empty (at least 1 shoe exists)
+SELECT COUNT(*) >= 1 AS has_results
+FROM items
+WHERE category = 'shoes'
+ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+LIMIT 5;
+
+-- hook off: planner must fall back (Seq Scan or Index Scan without AcornScan)
+SET pg_acorn.enable_hook = off;
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM items
+WHERE category = 'shoes'
+ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+LIMIT 5;
+
+DROP SCHEMA test_tier1 CASCADE;
