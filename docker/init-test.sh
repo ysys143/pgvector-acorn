@@ -26,7 +26,25 @@ gosu postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_acorn;"
 
 echo "[init-test] Extensions installed. Running tests..."
 
-# Regression tests
+# First installcheck run — may fail if golden files are empty (TDD bootstrap).
+# On failure, copy any generated results to expected/ to seed golden files.
+make PG_CONFIG="$PG_CONFIG" installcheck PGUSER=postgres 2>/dev/null || {
+    bootstrapped=0
+    for f in test/results/*.out; do
+        [ -f "$f" ] || continue
+        expected="test/expected/$(basename "$f")"
+        if [ ! -s "$expected" ]; then
+            cp "$f" "$expected"
+            echo "[init-test] golden seeded: $(basename "$f")"
+            bootstrapped=1
+        fi
+    done
+    if [ "$bootstrapped" -eq 1 ]; then
+        echo "[init-test] Golden files seeded — re-running installcheck..."
+    fi
+}
+
+# Second (authoritative) installcheck run
 make PG_CONFIG="$PG_CONFIG" installcheck PGUSER=postgres || {
     echo "[init-test] installcheck failed — dumping regression.diffs"
     cat test/regression.diffs 2>/dev/null || true

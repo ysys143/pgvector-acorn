@@ -34,10 +34,12 @@ LIMIT 5;
 
 -- result must not be empty (at least 1 shoe exists)
 SELECT COUNT(*) >= 1 AS has_results
-FROM items
-WHERE category = 'shoes'
-ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
-LIMIT 5;
+FROM (
+    SELECT id FROM items
+    WHERE category = 'shoes'
+    ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
+    LIMIT 5
+) sub;
 
 -- hook off: planner must fall back (Seq Scan or Index Scan without AcornScan)
 SET pg_acorn.enable_hook = off;

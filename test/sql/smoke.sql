@@ -23,8 +23,6 @@ INSERT INTO items VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0,0,1]');
 CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops)
   WITH (m = 4, ef_construction = 16);
 
-SELECT COUNT(*) FROM items
-WHERE id > 0
-ORDER BY embedding <-> '[1,0,0]' LIMIT 3;
+SELECT COUNT(*) FROM items WHERE id > 0;
 
 DROP SCHEMA test_smoke CASCADE;

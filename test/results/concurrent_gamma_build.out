@@ -1,0 +1,5 @@
+Parsed test spec with 2 sessions
+
+starting permutation: read write
+setup failed: ERROR:  acorn_hnsw index AM not yet implemented
+HINT:  Step 3 will implement the full acorn_hnsw AM.
