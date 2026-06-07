@@ -133,13 +133,19 @@ acorn_meta_read(Relation index, BlockNumber *entry_blkno,
 
 /*
  * Load element tuple header from index page.
- * Caller gets the primary heaptid and the item's level.
- * Pins and returns the buffer — caller must UnlockReleaseBuffer.
+ *
+ * Returns the primary heaptid, the node's level, deleted flag, and the index
+ * TID (page/offset) of the node's neighbor tuple — which in pgvector lives on
+ * a separate index tuple, not adjacent to the element.
+ *
+ * Pins and returns the buffer — caller must UnlockReleaseBuffer (it can read
+ * the inline vector first).
  */
 static Buffer
 acorn_load_element(Relation index, BlockNumber blkno, OffsetNumber offno,
 				   ItemPointerData *heaptid_out, int *level_out,
-				   bool *deleted_out)
+				   bool *deleted_out,
+				   BlockNumber *nbr_blkno_out, OffsetNumber *nbr_offno_out)
 {
 	Buffer				buf;
 	Page				page;
@@ -153,24 +159,26 @@ acorn_load_element(Relation index, BlockNumber blkno, OffsetNumber offno,
 	etup = (HnswElementTuple) PageGetItem(page, iid);
 
 	Assert(etup->type == HNSW_ELEMENT_TUPLE_TYPE);
-	*heaptid_out = etup->heaptids[0];		/* primary TID (first in HOT chain) */
-	*level_out   = (int) etup->level;
-	*deleted_out = (etup->deleted != 0);
+	*heaptid_out   = etup->heaptids[0];		/* primary TID (first in HOT chain) */
+	*level_out     = (int) etup->level;
+	*deleted_out   = (etup->deleted != 0);
+	*nbr_blkno_out = ItemPointerGetBlockNumber(&etup->neighbortid);
+	*nbr_offno_out = ItemPointerGetOffsetNumber(&etup->neighbortid);
 
 	/* Buffer remains locked — caller reads vector then calls UnlockReleaseBuffer */
 	return buf;
 }
 
 /*
- * Get neighbor index TIDs for the element at (blkno, offno), layer `layer`,
- * using `m` from the meta page.
+ * Get neighbor index TIDs for an element at layer `layer`.
  *
- * In pgvector 0.8.x the neighbor tuple immediately follows the element tuple
- * on the same page at offset (offno + 1).
+ * The neighbor tuple is read from (nbr_blkno, nbr_offno) — the separate index
+ * tuple referenced by the element's neighbortid.  `level` is the element's own
+ * highest layer, needed to compute the per-layer start offset.
  */
 static int
-acorn_get_neighbors(Relation index, BlockNumber blkno, OffsetNumber offno,
-					int layer, int m,
+acorn_get_neighbors(Relation index, BlockNumber nbr_blkno, OffsetNumber nbr_offno,
+					int level, int layer, int m,
 					ItemPointerData *neighbors_out, int max_neighbors)
 {
 	Buffer				buf;
@@ -181,17 +189,17 @@ acorn_get_neighbors(Relation index, BlockNumber blkno, OffsetNumber offno,
 	int					start;
 	int					count;
 
-	buf = ReadBuffer(index, blkno);
+	buf = ReadBuffer(index, nbr_blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
-	iid = PageGetItemId(page, offno + 1);	/* neighbor tuple follows element */
+	iid = PageGetItemId(page, nbr_offno);
 	ntup = (HnswNeighborTuple) PageGetItem(page, iid);
 
 	Assert(ntup->type == HNSW_NEIGHBOR_TUPLE_TYPE);
 
 	tids  = HnswNeighborTupleGetTids(ntup);
-	start = HnswNeighborOffset(m, layer);
+	start = HnswNeighborStart(m, level, layer);
 	count = Min(HnswNeighborCount(m, layer), max_neighbors);
 
 	for (int i = 0; i < count; i++)
@@ -297,21 +305,34 @@ acorn_greedy_descent(Relation index, int m,
 					 int start_level, int target_level,
 					 Datum query, FmgrInfo *dist_proc)
 {
+	double cur_dist = acorn_distance(index, *cur_blkno, *cur_offno,
+									 query, dist_proc);
+
 	for (int lc = start_level; lc > target_level; lc--)
 	{
-		ItemPointerData neighbors[HNSW_MAX_M];
-		double			cur_dist;
-		bool			improved;
-
-		cur_dist = acorn_distance(index, *cur_blkno, *cur_offno,
-								  query, dist_proc);
+		bool improved;
 
 		do {
-			int n_count;
+			ItemPointerData neighbors[HNSW_MAX_NEIGHBORS];
+			ItemPointerData cur_heaptid;
+			int				cur_level;
+			bool			cur_deleted;
+			BlockNumber		nbr_blkno;
+			OffsetNumber	nbr_offno;
+			Buffer			ebuf;
+			int				n_count;
 
 			improved = false;
-			n_count = acorn_get_neighbors(index, *cur_blkno, *cur_offno,
-										  lc, m, neighbors, HNSW_MAX_M);
+
+			/* Load current element for its level + neighbor tuple location */
+			ebuf = acorn_load_element(index, *cur_blkno, *cur_offno,
+									  &cur_heaptid, &cur_level, &cur_deleted,
+									  &nbr_blkno, &nbr_offno);
+			UnlockReleaseBuffer(ebuf);
+
+			n_count = acorn_get_neighbors(index, nbr_blkno, nbr_offno,
+										  cur_level, lc, m, neighbors,
+										  HNSW_MAX_NEIGHBORS);
 
 			for (int i = 0; i < n_count; i++)
 			{
@@ -319,7 +340,7 @@ acorn_greedy_descent(Relation index, int m,
 				OffsetNumber noffno  = ItemPointerGetOffsetNumber(&neighbors[i]);
 				double       nd;
 
-				if (!BlockNumberIsValid(nblkno))
+				if (!ItemPointerIsValid(&neighbors[i]))
 					continue;
 
 				nd = acorn_distance(index, nblkno, noffno, query, dist_proc);
@@ -386,11 +407,13 @@ acorn_layer0_search(Relation index, Relation heap, int m,
 		AcornPQNode    *c_node;
 		AcornElem		c;
 		double			f_dist;		/* distance of furthest result in W */
-		ItemPointerData neighbors[HNSW_MAX_M];
+		ItemPointerData neighbors[HNSW_MAX_NEIGHBORS];
 		int				n_count;
 		ItemPointerData c_heaptid;
 		int				c_level;
 		bool			c_deleted;
+		BlockNumber		c_nbr_blkno;
+		OffsetNumber	c_nbr_offno;
 		Buffer			c_buf;
 
 		/* Pop closest candidate */
@@ -407,18 +430,18 @@ acorn_layer0_search(Relation index, Relation heap, int m,
 		if (c.distance > f_dist && n_results >= k)
 			break;
 
-		/* Load heaptid from index page */
+		/* Load candidate element: heaptid, level, and neighbor tuple location */
 		c_buf = acorn_load_element(index,
 								   ItemPointerGetBlockNumber(&c.indextid),
 								   ItemPointerGetOffsetNumber(&c.indextid),
-								   &c_heaptid, &c_level, &c_deleted);
+								   &c_heaptid, &c_level, &c_deleted,
+								   &c_nbr_blkno, &c_nbr_offno);
 		UnlockReleaseBuffer(c_buf);
 
 		/* Get layer-0 neighbors of c */
-		n_count = acorn_get_neighbors(index,
-									  ItemPointerGetBlockNumber(&c.indextid),
-									  ItemPointerGetOffsetNumber(&c.indextid),
-									  0, m, neighbors, HNSW_MAX_M);
+		n_count = acorn_get_neighbors(index, c_nbr_blkno, c_nbr_offno,
+									  c_level, 0, m, neighbors,
+									  HNSW_MAX_NEIGHBORS);
 
 		for (int i = 0; i < n_count; i++)
 		{
@@ -429,6 +452,8 @@ acorn_layer0_search(Relation index, Relation heap, int m,
 			ItemPointerData nheaptid;
 			int			 nlevel;
 			bool		 ndeleted;
+			BlockNumber	 n_nbr_blkno;	/* unused here; n's neighbors are */
+			OffsetNumber n_nbr_offno;	/* loaded when n is popped from C */
 			Buffer		 nbuf;
 
 			if (!ItemPointerIsValid(&neighbors[i]))
@@ -452,7 +477,8 @@ acorn_layer0_search(Relation index, Relation heap, int m,
 
 			/* Load heaptid to evaluate predicate */
 			nbuf = acorn_load_element(index, nblkno, noffno,
-									  &nheaptid, &nlevel, &ndeleted);
+									  &nheaptid, &nlevel, &ndeleted,
+									  &n_nbr_blkno, &n_nbr_offno);
 			UnlockReleaseBuffer(nbuf);
 
 			if (ndeleted)

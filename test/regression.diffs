@@ -1,9 +1,0 @@
-diff -U3 /workspace/test/expected/tier1_hook.out /workspace/test/results/tier1_hook.out
---- /workspace/test/expected/tier1_hook.out	2026-06-07 16:57:37.655008207 +0000
-+++ /workspace/test/results/tier1_hook.out	2026-06-07 16:57:38.033975758 +0000
-@@ -46,4 +46,4 @@
-     ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
-     LIMIT 5
- ) sub;
--ERROR:  different vector dimensions 16 and 4
-+ERROR:  different vector dimensions 20 and 4

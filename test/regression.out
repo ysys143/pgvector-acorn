@@ -1,8 +1,0 @@
-# using postmaster on Unix socket, default port
-ok 1         - smoke                                      53 ms
-not ok 2     - tier1_hook                                177 ms
-# (test process exited with exit code 3)
-1..2
-# 1 of 2 tests failed.
-# The differences that caused some tests to fail can be viewed in the file "/workspace/test/regression.diffs".
-# A copy of the test summary that you see above is saved in the file "/workspace/test/regression.out".

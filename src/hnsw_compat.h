@@ -33,6 +33,12 @@
 #define HNSW_MAX_M				100
 #define HNSW_DEFAULT_EF_CONSTRUCTION	64
 
+/*
+ * Max neighbors stored for any single layer.  pgvector's base layer (0) holds
+ * HnswGetLayerM(m, 0) = 2*m neighbors, so a per-layer buffer must hold 2*m.
+ */
+#define HNSW_MAX_NEIGHBORS		(HNSW_MAX_M * 2)
+
 /* -----------------------------------------------------------------------
  * Page opaque — at PageGetSpecialPointer(page)
  * ----------------------------------------------------------------------- */
@@ -84,31 +90,44 @@ typedef struct HnswElementTupleData
 	uint8		type;			/* HNSW_ELEMENT_TUPLE_TYPE */
 	uint8		level;			/* highest layer this node appears in */
 	uint8		deleted;		/* 1 = logically deleted */
-	uint8		unused;
+	uint8		version;		/* tuple format version */
 	ItemPointerData heaptids[HNSW_HEAPTIDS]; /* heap TIDs (HOT chain) */
-	/* Vector data follows immediately here */
+	ItemPointerData neighbortid; /* index TID of this node's neighbor tuple */
+	uint16		unused;
+	/* Vector data (pgvector inlines a `Vector` struct) follows here */
 } HnswElementTupleData;
 typedef HnswElementTupleData *HnswElementTuple;
 
-/* Access the inline vector data */
+/*
+ * Access the inline vector data.
+ *
+ * In pgvector this is offsetof(HnswElementTupleData, data) where `data` is a
+ * Vector.  Because all members above are <= 4-byte aligned and the running
+ * offset (72 bytes) is already 4-aligned, sizeof(HnswElementTupleData) here
+ * equals that offset exactly.
+ */
 #define HnswElementTupleGetVector(etup) \
 	((void *) ((char *)(etup) + sizeof(HnswElementTupleData)))
 
 /* -----------------------------------------------------------------------
  * Neighbor tuple — one per HNSW node (type = HNSW_NEIGHBOR_TUPLE_TYPE)
  *
- * In pgvector 0.8.x, the neighbor tuple immediately follows the element
- * tuple on the same index page (offset = element_offno + 1).
+ * IMPORTANT: the neighbor tuple lives on a SEPARATE index tuple referenced by
+ * HnswElementTupleData.neighbortid (a possibly different page/offset) — NOT at
+ * element_offno + 1.
  *
- * Layout: header followed by an array of ItemPointerData (index TIDs).
- * Total count = sum over each layer of (layer == 0 ? m : m0), where m0
- * is typically floor(m/2).  The layer 0 neighbors come first.
+ * Layout: header followed by an ItemPointerData array of neighbor index TIDs.
+ * Neighbors are stored highest-layer-first: for an element at `level`, the
+ * array holds layer `level`, then `level-1`, ..., down to layer 0.  Each layer
+ * lc occupies HnswGetLayerM(m, lc) slots (2*m for layer 0, m otherwise), so the
+ * total slot count is (level + 2) * m.  Layer lc starts at index (level-lc)*m.
  * ----------------------------------------------------------------------- */
 
 typedef struct HnswNeighborTupleData
 {
 	uint8		type;			/* HNSW_NEIGHBOR_TUPLE_TYPE */
-	uint8		unused[3];
+	uint8		version;		/* must match element's version */
+	uint16		count;			/* total slot count = (level + 2) * m */
 	/* Immediately followed by ItemPointerData array of neighbor index TIDs */
 } HnswNeighborTupleData;
 typedef HnswNeighborTupleData *HnswNeighborTuple;
@@ -117,30 +136,37 @@ typedef HnswNeighborTupleData *HnswNeighborTuple;
 	((ItemPointerData *) ((char *)(ntup) + sizeof(HnswNeighborTupleData)))
 
 /*
- * Number of layer-0 neighbors stored per node.
- * In pgvector, layer 0 uses m, layers 1+ use max(1, floor(m/2)).
+ * Number of neighbor slots stored for a given layer.
+ * pgvector: layer 0 (the base layer) uses 2*m, all upper layers use m.
  */
-#define HnswM0(m)	(m)
-#define HnswMl(m)	Max(1, (m) / 2)
+#define HnswGetLayerM(m, layer)	((layer) == 0 ? (m) * 2 : (m))
 
 /*
- * Byte offset to the start of layer l's neighbors within the neighbor TID
- * array.  Layer 0 neighbors start at index 0 (size m0), layer 1 at m0, etc.
+ * Start index (in ItemPointerData units) of layer `layer`'s neighbors within
+ * the neighbor TID array, for an element whose highest layer is `level`.
+ * Matches pgvector's HnswLoadNeighborTids: start = (level - layer) * m.
  */
 static inline int
-HnswNeighborOffset(int m, int layer)
+HnswNeighborStart(int m, int level, int layer)
 {
-	int off = HnswM0(m);		/* layer 0 */
-	for (int l = 1; l <= layer; l++)
-		off += HnswMl(m);		/* layers 1..layer-1 already counted */
-	/* Return the start of layer l, not the running total */
-	return (layer == 0) ? 0 : HnswM0(m) + HnswMl(m) * (layer - 1);
+	return (level - layer) * m;
 }
 
 static inline int
 HnswNeighborCount(int m, int layer)
 {
-	return (layer == 0) ? HnswM0(m) : HnswMl(m);
+	return HnswGetLayerM(m, layer);
 }
+
+/*
+ * Layout guards — must match pgvector 0.8.0 on-disk format.  ItemPointerData
+ * is 6 bytes on every PostgreSQL platform, so the element header (vector
+ * offset) is 72 bytes and the neighbor header is 4 bytes.  If these fire,
+ * pgvector's struct layout changed and the offsets above are wrong.
+ */
+StaticAssertDecl(sizeof(HnswElementTupleData) == 72,
+				 "HnswElementTupleData layout mismatch vs pgvector 0.8.0");
+StaticAssertDecl(sizeof(HnswNeighborTupleData) == 4,
+				 "HnswNeighborTupleData layout mismatch vs pgvector 0.8.0");
 
 #endif /* HNSW_COMPAT_H */
