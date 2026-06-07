@@ -1,0 +1,18 @@
+-- tier1_hook.sql: Tier 1 hook intercepts USING hnsw + WHERE and injects AcornScan
+-- TDD: golden file starts empty; populate after implementation passes
+\set ON_ERROR_STOP on
+CREATE SCHEMA test_tier1;
+SET search_path = test_tier1;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+SET pg_acorn.enable_hook = on;
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    category  text,
+    embedding vector(4)
+);
+ERROR:  type "vector" does not exist
+LINE 4:     embedding vector(4)
+                      ^

@@ -1,0 +1,17 @@
+-- tier2_am.sql: acorn_hnsw index AM — creation, scan, planner selection
+-- TDD: golden file starts empty; populate after implementation passes
+\set ON_ERROR_STOP on
+CREATE SCHEMA test_tier2;
+SET search_path = test_tier2;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    category  text,
+    embedding vector(4)
+);
+ERROR:  type "vector" does not exist
+LINE 4:     embedding vector(4)
+                      ^

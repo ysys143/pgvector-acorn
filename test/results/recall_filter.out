@@ -1,0 +1,19 @@
+-- recall_filter.sql: recall@10 vs brute force across filter selectivity levels
+-- ACORN must maintain recall >= 0.9 at all selectivity levels
+-- pgvector (seq scan) is measured as baseline for comparison
+-- TDD: golden file starts empty; populate after implementation passes
+\set ON_ERROR_STOP on
+CREATE SCHEMA test_recall_filter;
+SET search_path = test_recall_filter;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,        -- 0..99, filter = (bucket < N) gives N% selectivity
+    embedding vector(8)
+);
+ERROR:  type "vector" does not exist
+LINE 4:     embedding vector(8)
+                      ^

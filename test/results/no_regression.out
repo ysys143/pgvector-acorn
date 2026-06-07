@@ -1,0 +1,17 @@
+-- no_regression.sql: without a WHERE filter, acorn_hnsw must return the same
+-- top-k results as pgvector hnsw (unfiltered behavior must be identical)
+-- TDD: golden file starts empty; populate after implementation passes
+\set ON_ERROR_STOP on
+CREATE SCHEMA test_no_regression;
+SET search_path = test_no_regression;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    embedding vector(4)
+);
+ERROR:  type "vector" does not exist
+LINE 3:     embedding vector(4)
+                      ^

@@ -1,6 +1,11 @@
 \echo Use "CREATE EXTENSION pg_acorn" to load this file. \quit
 
 -- acorn_hnsw index access method
+CREATE FUNCTION acorn_hnsw_handler(internal)
+    RETURNS index_am_handler
+    AS 'MODULE_PATHNAME'
+    LANGUAGE C;
+
 CREATE ACCESS METHOD acorn_hnsw TYPE INDEX HANDLER acorn_hnsw_handler;
 
 COMMENT ON ACCESS METHOD acorn_hnsw IS

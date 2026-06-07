@@ -1,0 +1,18 @@
+-- recall_insert.sql: recall@10 must stay >= 0.85 after incremental inserts
+-- validates fixed-slot retry logic in acorn_build.c
+-- TDD: golden file starts empty; populate after implementation passes
+\set ON_ERROR_STOP on
+CREATE SCHEMA test_recall_insert;
+SET search_path = test_recall_insert;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+ERROR:  type "vector" does not exist
+LINE 4:     embedding vector(8)
+                      ^
