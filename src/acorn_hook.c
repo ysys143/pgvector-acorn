@@ -17,6 +17,8 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 
+#include <math.h>			/* log() in acorn_estimate_cost */
+
 #include "access/amapi.h"
 #include "access/tableam.h"
 #include "catalog/pg_am.h"
