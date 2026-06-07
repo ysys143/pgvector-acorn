@@ -203,7 +203,12 @@ detect_vector_orderby(PlannerInfo *root, RelOptInfo *rel,
 				Node *arg2 = lsecond(op->args);
 				if (!IsA(arg2, Var))
 				{
-					*query_expr = arg2;
+					/*
+					 * copyObject ensures we own a stable copy of the
+					 * expression rather than an alias into the parse tree
+					 * that could be mutated by later planner passes.
+					 */
+					*query_expr = (Node *) copyObject(arg2);
 					return true;
 				}
 			}
@@ -386,11 +391,17 @@ acorn_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 	cscan->custom_scan_tlist	= NIL;
 	cscan->methods				= &acorn_scan_methods;
 
-	/* Extract qual clauses for predicate pushdown */
-	{
-		List *scan_clauses = extract_actual_clauses(clauses, false);
-		cscan->scan.plan.qual = scan_clauses;
-	}
+	/*
+	 * Keep scan.plan.qual = NIL.  Pushing the WHERE clause into the plan qual
+	 * causes set_customscan_references → fix_scan_list → expression_tree_mutator
+	 * to walk the predicate expressions.  If any node in those expressions has
+	 * an unrecognized tag (e.g. from pgvector internals or unfolded casts) that
+	 * walk aborts with "unrecognized node type: 0".
+	 *
+	 * Predicate evaluation is handled directly inside acorn_scan_execute via
+	 * the AcornScanState.predicate field, which is initialised from
+	 * rel->baserestrictinfo in acorn_begin_scan below.
+	 */
 
 	return (Plan *) cscan;
 }
