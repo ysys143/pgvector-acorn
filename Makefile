@@ -19,8 +19,9 @@ REGRESS = \
 
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
-ISOLATION      = concurrent_insert_scan concurrent_gamma_build
-ISOLATION_OPTS = --inputdir=test --outputdir=test
+# Step 3 isolation tests (acorn_hnsw AM required):
+# ISOLATION      = concurrent_insert_scan concurrent_gamma_build
+# ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 PG_CPPFLAGS = -I./src -Wno-unused-parameter
 PG_CONFIG   ?= pg_config

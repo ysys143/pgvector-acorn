@@ -1,9 +1,0 @@
-# using postmaster on Unix socket, default port
-not ok 1     - concurrent_insert_scan                    288 ms
-# (test process exited with exit code 1)
-not ok 2     - concurrent_gamma_build                    105 ms
-# (test process exited with exit code 1)
-1..2
-# 2 of 2 tests failed.
-# The differences that caused some tests to fail can be viewed in the file "/workspace/test/regression.diffs".
-# A copy of the test summary that you see above is saved in the file "/workspace/test/regression.out".

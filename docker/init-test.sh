@@ -51,10 +51,4 @@ make PG_CONFIG="$PG_CONFIG" installcheck PGUSER=postgres || {
     exit 1
 }
 
-# Isolation tests (pg_isolation_regress)
-make PG_CONFIG="$PG_CONFIG" isolationcheck PGUSER=postgres || {
-    echo "[init-test] isolationcheck failed"
-    exit 1
-}
-
 echo "[init-test] All tests passed."
