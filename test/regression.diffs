@@ -1,12 +1,12 @@
 diff -U3 /workspace/test/expected/tier1_hook.out /workspace/test/results/tier1_hook.out
---- /workspace/test/expected/tier1_hook.out	2026-06-07 16:49:52.213614222 +0000
-+++ /workspace/test/results/tier1_hook.out	2026-06-07 16:49:52.397556254 +0000
-@@ -37,7 +37,7 @@
- LOCATION:  acorn_begin_scan, acorn_hook.c:472
+--- /workspace/test/expected/tier1_hook.out	2026-06-07 16:54:46.019465455 +0000
++++ /workspace/test/results/tier1_hook.out	2026-06-07 16:54:46.200303073 +0000
+@@ -39,7 +39,7 @@
+ LOCATION:  acorn_begin_scan, acorn_hook.c:480
  NOTICE:  00000: ACORN-DBG: reading indexoid, tag[0]=460
- LOCATION:  acorn_begin_scan, acorn_hook.c:476
+ LOCATION:  acorn_begin_scan, acorn_hook.c:488
 -NOTICE:  00000: ACORN-DBG: indexoid=17064, reading k, tag[2]=460
 +NOTICE:  00000: ACORN-DBG: indexoid=17414, reading k, tag[2]=460
- LOCATION:  acorn_begin_scan, acorn_hook.c:478
+ LOCATION:  acorn_begin_scan, acorn_hook.c:490
  NOTICE:  00000: ACORN-DBG: k=5, opening index
- LOCATION:  acorn_begin_scan, acorn_hook.c:480
+ LOCATION:  acorn_begin_scan, acorn_hook.c:492

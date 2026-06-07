@@ -471,6 +471,18 @@ acorn_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	int		   k;
 	elog(NOTICE, "ACORN-DBG: begin_scan entered, custom_private len=%d",
 		 list_length(cscan->custom_private));
+	/* Print plan tree structure to understand what ExecEndNode will traverse */
+	{
+		Plan *top   = estate->es_plannedstmt->planTree;
+		Plan *mid   = top  ? outerPlan(top)  : NULL;
+		Plan *bot   = mid  ? outerPlan(mid)  : NULL;
+		Plan *leaf  = bot  ? outerPlan(bot)  : NULL;
+		elog(NOTICE, "ACORN-DBG: plan-tree top=%d mid=%d bot=%d leaf=%d",
+			 top  ? (int) nodeTag(top)  : -1,
+			 mid  ? (int) nodeTag(mid)  : -1,
+			 bot  ? (int) nodeTag(bot)  : -1,
+			 leaf ? (int) nodeTag(leaf) : -1);
+	}
 
 	/* custom_private layout: [0]=indexoid, [1]=query_expr, [2]=k */
 	elog(NOTICE, "ACORN-DBG: reading indexoid, tag[0]=%d", (int)nodeTag(linitial(cscan->custom_private)));
