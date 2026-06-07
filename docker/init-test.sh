@@ -6,19 +6,19 @@ set -euo pipefail
 WORKSPACE=${WORKSPACE:-/workspace}
 PG_CONFIG=${PG_CONFIG:-/usr/lib/postgresql/17/bin/pg_config}
 
+# Install pg_acorn .so before starting postgres so shared_preload_libraries works
+cd "$WORKSPACE"
+make PG_CONFIG="$PG_CONFIG" install
+
 # Initialize data directory if needed
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     gosu postgres initdb --locale=C --encoding=UTF8
 fi
 
-# Start server (background)
+# Start server with pg_acorn preloaded so _PG_init() runs and the hook is installed
 gosu postgres pg_ctl start -D "$PGDATA" \
-    -o "-c listen_addresses='localhost' -c shared_preload_libraries=''" \
+    -o "-c listen_addresses='localhost' -c shared_preload_libraries='pg_acorn'" \
     -w
-
-# Install pg_acorn into the cluster before CREATE EXTENSION
-cd "$WORKSPACE"
-make PG_CONFIG="$PG_CONFIG" install
 
 # Now extensions are available
 gosu postgres psql -c "CREATE EXTENSION IF NOT EXISTS vector;"

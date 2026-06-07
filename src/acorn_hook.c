@@ -30,6 +30,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -168,10 +169,13 @@ find_hnsw_index(RelOptInfo *rel)
 }
 
 /*
- * Walk the path list and check if the ORDER BY uses a vector distance op.
- * Also extracts the query expression (the non-indexed argument to the op).
+ * Check whether the query has a vector distance ORDER BY.
  *
- * Returns true if a vector ORDER BY is found; sets *query_expr.
+ * Vector distance operators (<->, <=>, <#>) are not representable as
+ * btree-style pathkeys, so root->query_pathkeys is NIL for these queries.
+ * Instead we walk root->parse->sortClause to find the distance expression.
+ *
+ * Returns true if found; sets *query_expr to the query-vector argument.
  */
 static bool
 detect_vector_orderby(PlannerInfo *root, RelOptInfo *rel,
@@ -179,47 +183,28 @@ detect_vector_orderby(PlannerInfo *root, RelOptInfo *rel,
 {
 	ListCell *lc;
 
-	foreach(lc, root->query_pathkeys)
+	foreach(lc, root->parse->sortClause)
 	{
-		PathKey *pk = (PathKey *) lfirst(lc);
-		EquivalenceMember *em;
-		Expr *expr;
-		ListCell *lc2;
+		SortGroupClause *sc = lfirst_node(SortGroupClause, lc);
+		TargetEntry		*tle;
+		Expr			*expr;
 
-		foreach(lc2, pk->pk_eclass->ec_members)
+		tle = get_sortgroupclause_tle(sc, root->parse->targetList);
+		if (!tle)
+			continue;
+		expr = tle->expr;
+
+		/* Distance operator: dist_op(indexed_col, query_const) */
+		if (IsA(expr, OpExpr))
 		{
-			em = (EquivalenceMember *) lfirst(lc2);
-			expr = em->em_expr;
-
-			/* Look for a distance operator call: dist(indexed_col, query) */
-			if (IsA(expr, OpExpr))
+			OpExpr *op = (OpExpr *) expr;
+			if (list_length(op->args) == 2)
 			{
-				OpExpr *op = (OpExpr *) expr;
-				/* Distance operators return float8; check arity */
-				if (list_length(op->args) == 2)
+				Node *arg2 = lsecond(op->args);
+				if (!IsA(arg2, Var))
 				{
-					/* Second arg is the query vector (not from the table) */
-					Node *arg2 = lsecond(op->args);
-					if (!IsA(arg2, Var))
-					{
-						*query_expr = arg2;
-						return true;
-					}
-				}
-			}
-
-			if (IsA(expr, FuncExpr))
-			{
-				/* Some distance functions are plain functions, not operators */
-				FuncExpr *fn = (FuncExpr *) expr;
-				if (list_length(fn->args) == 2)
-				{
-					Node *arg2 = lsecond(fn->args);
-					if (!IsA(arg2, Var))
-					{
-						*query_expr = arg2;
-						return true;
-					}
+					*query_expr = arg2;
+					return true;
 				}
 			}
 		}
@@ -259,8 +244,23 @@ acorn_estimate_cost(PlannerInfo *root, RelOptInfo *rel,
 	*total   = cpu_operator_cost * tuples * selectivity * log_n;
 	*rows    = clamp_row_est(tuples * selectivity);
 
-	/* Must be cheaper than seq scan to be chosen */
-	*total = Min(*total, rel->cheapest_total_path->total_cost * 0.8);
+	/*
+	 * Must be cheaper than the cheapest existing path to be chosen.
+	 * Note: set_cheapest() hasn't been called yet when the hook runs,
+	 * so rel->cheapest_total_path is NULL — walk pathlist directly.
+	 */
+	{
+		ListCell *plc;
+		double	  best = 1e30;
+		foreach(plc, rel->pathlist)
+		{
+			Path *p = (Path *) lfirst(plc);
+			if (p->total_cost < best)
+				best = p->total_cost;
+		}
+		if (best < 1e30)
+			*total = Min(*total, best * 0.8);
+	}
 }
 
 /* -----------------------------------------------------------------------
@@ -286,20 +286,37 @@ acorn_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	/* Only for base relations (not joins, subqueries, etc.) */
 	if (rel->reloptkind != RELOPT_BASEREL)
+	{
+		ereport(DEBUG1, (errmsg("acorn_hook: skipping non-base rel (reloptkind=%d)", rel->reloptkind)));
 		return;
+	}
 
 	/* Need an HNSW index */
 	hnsw_idx = find_hnsw_index(rel);
 	if (!hnsw_idx)
+	{
+		ereport(DEBUG1, (errmsg("acorn_hook: no HNSW index on rel %d", (int) rti)));
 		return;
+	}
+
+	ereport(DEBUG1, (errmsg("acorn_hook: found HNSW index on rel %d, checking ORDER BY", (int) rti)));
 
 	/* Need a vector ORDER BY */
 	if (!detect_vector_orderby(root, rel, &query_expr))
+	{
+		ereport(DEBUG1, (errmsg("acorn_hook: no vector ORDER BY detected (sortClause len=%d)",
+								list_length(root->parse->sortClause))));
 		return;
+	}
+
+	ereport(DEBUG1, (errmsg("acorn_hook: vector ORDER BY detected")));
 
 	/* Need WHERE clause quals (otherwise vanilla HNSW is already fine) */
 	if (rel->baserestrictinfo == NIL)
+	{
+		ereport(DEBUG1, (errmsg("acorn_hook: no WHERE quals, skipping")));
 		return;
+	}
 
 	/* Estimate cost */
 	acorn_estimate_cost(root, rel, hnsw_idx,
@@ -343,13 +360,30 @@ acorn_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 	cscan->scan.scanrelid		= best_path->path.parent->relid;
 	cscan->flags				= 0;
 	cscan->custom_plans			= NIL;
-	cscan->custom_exprs			= list_make1(lsecond(best_path->custom_private));
-	cscan->custom_private		= list_make2(
+	/*
+	 * Do NOT use custom_exprs for the query vector expression.
+	 * set_custom_references() calls fix_scan_list() on custom_exprs which
+	 * chases internal parse-tree pointers and errors on unrecognized nodes.
+	 * Instead, store all private data in custom_private which the planner
+	 * leaves untouched.
+	 *   [0] = OID of HNSW index (Integer)
+	 *   [1] = query vector expression (Expr*, a Const for literal vectors)
+	 *   [2] = k / LIMIT (Integer)
+	 */
+	cscan->custom_exprs			= NIL;
+	cscan->custom_private		= list_make3(
 		linitial(best_path->custom_private),	/* index OID */
+		lsecond(best_path->custom_private),		/* query expr */
 		lthird(best_path->custom_private)		/* k */
 	);
-	/* Push quals down so executor can evaluate them */
-	cscan->custom_scan_tlist	= tlist;
+	/*
+	 * NIL means "this scan returns full heap tuples of the underlying
+	 * relation" — the correct setting for a scan that calls
+	 * table_tuple_fetch_row_version and returns ss_ScanTupleSlot.
+	 * Setting it to tlist would require the scan to produce those
+	 * columns itself, causing "variable not found in subplan target list".
+	 */
+	cscan->custom_scan_tlist	= NIL;
 	cscan->methods				= &acorn_scan_methods;
 
 	/* Extract qual clauses for predicate pushdown */
@@ -381,8 +415,9 @@ acorn_begin_scan(CustomScanState *node, EState *estate, int eflags)
 	Oid		   indexoid;
 	int		   k;
 
+	/* custom_private layout: [0]=indexoid, [1]=query_expr, [2]=k */
 	indexoid = (Oid) intVal(linitial(cscan->custom_private));
-	k        = (int) intVal(lsecond(cscan->custom_private));
+	k        = (int) intVal(lthird(cscan->custom_private));
 
 	acss->index  = index_open(indexoid, AccessShareLock);
 	acss->heap   = acss->css.ss.ss_currentRelation;
@@ -411,7 +446,7 @@ static Datum
 acorn_eval_query(AcornCustomScanState *acss, EState *estate)
 {
 	CustomScan *cscan  = (CustomScan *) acss->css.ss.ps.plan;
-	Expr	   *qexpr  = (Expr *) linitial(cscan->custom_exprs);
+	Expr	   *qexpr  = (Expr *) lsecond(cscan->custom_private); /* [1] query expr */
 	ExprState  *qstate = ExecInitExpr(qexpr, &acss->css.ss.ps);
 	ExprContext *ectx  = GetPerTupleExprContext(estate);
 	bool		isnull;

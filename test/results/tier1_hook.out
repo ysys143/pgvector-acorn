@@ -26,43 +26,4 @@ SELECT id FROM items
 WHERE category = 'shoes'
 ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
 LIMIT 5;
-                           QUERY PLAN                            
------------------------------------------------------------------
- Limit
-   ->  Sort
-         Sort Key: ((embedding <-> '[0.1,0.2,0.3,0.4]'::vector))
-         ->  Seq Scan on items
-               Filter: (category = 'shoes'::text)
-(5 rows)
-
--- result must not be empty (at least 1 shoe exists)
-SELECT COUNT(*) >= 1 AS has_results
-FROM (
-    SELECT id FROM items
-    WHERE category = 'shoes'
-    ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
-    LIMIT 5
-) sub;
- has_results 
--------------
- t
-(1 row)
-
--- hook off: planner must fall back (Seq Scan or Index Scan without AcornScan)
-SET pg_acorn.enable_hook = off;
-EXPLAIN (COSTS OFF)
-SELECT id FROM items
-WHERE category = 'shoes'
-ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
-LIMIT 5;
-                           QUERY PLAN                            
------------------------------------------------------------------
- Limit
-   ->  Sort
-         Sort Key: ((embedding <-> '[0.1,0.2,0.3,0.4]'::vector))
-         ->  Seq Scan on items
-               Filter: (category = 'shoes'::text)
-(5 rows)
-
-DROP SCHEMA test_tier1 CASCADE;
-NOTICE:  drop cascades to table items
+ERROR:  unrecognized node type: 0
