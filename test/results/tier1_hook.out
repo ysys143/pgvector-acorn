@@ -28,28 +28,28 @@ WHERE category = 'shoes'
 ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
 LIMIT 5;
 NOTICE:  00000: ACORN-DBG: plan_custom_path entered, tlist len=2
-LOCATION:  acorn_plan_custom_path, acorn_hook.c:387
+LOCATION:  acorn_plan_custom_path, acorn_hook.c:394
 NOTICE:  00000: ACORN-DBG: tlist[0] expr_tag=6 resjunk=0
-LOCATION:  acorn_plan_custom_path, acorn_hook.c:394
+LOCATION:  acorn_plan_custom_path, acorn_hook.c:401
 NOTICE:  00000: ACORN-DBG: tlist[1] expr_tag=6 resjunk=0
-LOCATION:  acorn_plan_custom_path, acorn_hook.c:394
+LOCATION:  acorn_plan_custom_path, acorn_hook.c:401
 NOTICE:  00000: ACORN-DBG: begin_scan entered, custom_private len=3
-LOCATION:  acorn_begin_scan, acorn_hook.c:465
+LOCATION:  acorn_begin_scan, acorn_hook.c:472
 NOTICE:  00000: ACORN-DBG: reading indexoid, tag[0]=460
-LOCATION:  acorn_begin_scan, acorn_hook.c:469
-NOTICE:  00000: ACORN-DBG: indexoid=17414, reading k, tag[2]=460
-LOCATION:  acorn_begin_scan, acorn_hook.c:471
-NOTICE:  00000: ACORN-DBG: k=5, opening index
-LOCATION:  acorn_begin_scan, acorn_hook.c:473
-NOTICE:  00000: ACORN-DBG: index opened
 LOCATION:  acorn_begin_scan, acorn_hook.c:476
+NOTICE:  00000: ACORN-DBG: indexoid=17414, reading k, tag[2]=460
+LOCATION:  acorn_begin_scan, acorn_hook.c:478
+NOTICE:  00000: ACORN-DBG: k=5, opening index
+LOCATION:  acorn_begin_scan, acorn_hook.c:480
+NOTICE:  00000: ACORN-DBG: index opened
+LOCATION:  acorn_begin_scan, acorn_hook.c:483
 NOTICE:  00000: ACORN-DBG: begin_scan done
-LOCATION:  acorn_begin_scan, acorn_hook.c:489
+LOCATION:  acorn_begin_scan, acorn_hook.c:496
 NOTICE:  00000: ACORN-DBG: explain_scan entered
-LOCATION:  acorn_explain_scan, acorn_hook.c:604
+LOCATION:  acorn_explain_scan, acorn_hook.c:611
 NOTICE:  00000: ACORN-DBG: after PropertyText
-LOCATION:  acorn_explain_scan, acorn_hook.c:606
+LOCATION:  acorn_explain_scan, acorn_hook.c:613
 NOTICE:  00000: ACORN-DBG: explain_scan done
-LOCATION:  acorn_explain_scan, acorn_hook.c:609
+LOCATION:  acorn_explain_scan, acorn_hook.c:616
 ERROR:  XX000: unrecognized node type: 0
 LOCATION:  ExecEndNode, execProcnode.c:755

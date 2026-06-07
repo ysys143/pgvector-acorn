@@ -336,7 +336,14 @@ acorn_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.rows			= rows;
 	cpath->path.startup_cost	= startup;
 	cpath->path.total_cost		= total;
-	cpath->path.pathkeys		= root->query_pathkeys;	/* preserves ORDER BY */
+	/*
+	 * Do NOT claim root->query_pathkeys here.  The distance ORDER BY uses
+	 * amcanorderbyop = true on the HNSW index, which causes PostgreSQL to add
+	 * special index-ordering plan nodes with nodeTag = T_Invalid (0) when any
+	 * path claims those pathkeys.  Claiming NIL lets the planner insert a
+	 * plain Sort node instead, which ExecEndNode handles correctly.
+	 */
+	cpath->path.pathkeys		= NIL;
 	/*
 	 * Build a pathtarget with ONLY plain Var expressions from rel->reltarget.
 	 *
