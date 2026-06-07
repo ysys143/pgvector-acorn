@@ -337,6 +337,31 @@ acorn_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.startup_cost	= startup;
 	cpath->path.total_cost		= total;
 	cpath->path.pathkeys		= root->query_pathkeys;	/* preserves ORDER BY */
+	/*
+	 * Build a pathtarget with ONLY plain Var expressions from rel->reltarget.
+	 *
+	 * When HNSW index AM has amcanorderbyop = true, pgvector pushes the
+	 * distance operator expression (embedding <-> query) into
+	 * rel->reltarget->exprs as part of ORDER BY planning.  That pushed
+	 * expression uses an internal node form whose nodeTag = 0 (T_Invalid),
+	 * causing set_customscan_references → fix_scan_list →
+	 * expression_tree_mutator to abort with "unrecognized node type: 0".
+	 *
+	 * By filtering to only plain Vars, our tlist is always safe for
+	 * fix_scan_list.  The Sort node above us can still evaluate the distance
+	 * expression from the embedding Var in our projected output.
+	 */
+	{
+		PathTarget *pt = create_empty_pathtarget();
+		ListCell   *lc2;
+		foreach(lc2, rel->reltarget->exprs)
+		{
+			Expr *e = (Expr *) lfirst(lc2);
+			if (IsA(e, Var))
+				add_column_to_pathtarget(pt, e, 0);
+		}
+		cpath->path.pathtarget = pt;
+	}
 	cpath->flags				= 0;
 	cpath->custom_paths			= NIL;
 	cpath->custom_private		= list_make3(
