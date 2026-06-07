@@ -16,15 +16,17 @@ gosu postgres pg_ctl start -D "$PGDATA" \
     -o "-c listen_addresses='localhost' -c shared_preload_libraries=''" \
     -w
 
-# Install extensions into the running cluster
+# Install pg_acorn into the cluster before CREATE EXTENSION
+cd "$WORKSPACE"
+make PG_CONFIG="$PG_CONFIG" install
+
+# Now extensions are available
 gosu postgres psql -c "CREATE EXTENSION IF NOT EXISTS vector;"
 gosu postgres psql -c "CREATE EXTENSION IF NOT EXISTS pg_acorn;"
 
 echo "[init-test] Extensions installed. Running tests..."
 
-# Build and install pg_acorn from mounted source, then run regression tests
-cd "$WORKSPACE"
-make PG_CONFIG="$PG_CONFIG" install
+# Regression tests
 make PG_CONFIG="$PG_CONFIG" installcheck PGUSER=postgres || {
     echo "[init-test] installcheck failed — dumping regression.diffs"
     cat test/regression.diffs 2>/dev/null || true
