@@ -385,6 +385,17 @@ acorn_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 {
 	CustomScan *cscan = makeNode(CustomScan);
 	elog(NOTICE, "ACORN-DBG: plan_custom_path entered, tlist len=%d", list_length(tlist));
+	{
+		ListCell *lc2;
+		int i = 0;
+		foreach(lc2, tlist)
+		{
+			TargetEntry *te = (TargetEntry *) lfirst(lc2);
+			elog(NOTICE, "ACORN-DBG: tlist[%d] expr_tag=%d resjunk=%d",
+				 i, (int) nodeTag(te->expr), te->resjunk);
+			i++;
+		}
+	}
 
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual		= NIL;	/* quals evaluated inside executor */
@@ -552,6 +563,7 @@ static void
 acorn_end_scan(CustomScanState *node)
 {
 	AcornCustomScanState *acss = (AcornCustomScanState *) node;
+	elog(NOTICE, "ACORN-DBG: end_scan entered");
 
 	if (acss->index)
 	{
