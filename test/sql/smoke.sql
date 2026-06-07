@@ -4,7 +4,7 @@
 \set ON_ERROR_STOP on
 
 CREATE SCHEMA test_smoke;
-SET search_path = test_smoke;
+SET search_path = test_smoke, public;
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_acorn;

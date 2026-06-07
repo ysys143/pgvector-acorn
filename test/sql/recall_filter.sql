@@ -6,7 +6,7 @@
 \set ON_ERROR_STOP on
 
 CREATE SCHEMA test_recall_filter;
-SET search_path = test_recall_filter;
+SET search_path = test_recall_filter, public;
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_acorn;

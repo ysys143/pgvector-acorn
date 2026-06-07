@@ -4,7 +4,7 @@
 -- TDD: golden file starts empty; populate after implementation passes
 \set ON_ERROR_STOP on
 CREATE SCHEMA test_recall_filter;
-SET search_path = test_recall_filter;
+SET search_path = test_recall_filter, public;
 CREATE EXTENSION IF NOT EXISTS vector;
 NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
