@@ -46,4 +46,5 @@ FROM (
     ORDER BY embedding <-> '[0.1,0.2,0.3,0.4]'
     LIMIT 5
 ) sub;
-ERROR:  trying to store an on-disk heap tuple into wrong type of slot
+ERROR:  attribute 1 of type items has wrong type
+DETAIL:  Table has type integer, but query expects vector.

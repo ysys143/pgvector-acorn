@@ -455,6 +455,14 @@ acorn_create_scan_state(CustomScan *cscan)
 	 */
 	NodeSetTag(acss, T_CustomScanState);
 	acss->css.methods = &acorn_exec_methods;
+	/*
+	 * Our ExecCustomScan returns real heap tuples via
+	 * table_tuple_fetch_row_version, which stores into ss_ScanTupleSlot with
+	 * ExecStoreBufferHeapTuple.  That requires a buffer-heap slot; ExecInit-
+	 * CustomScan defaults slotOps to TTSOpsVirtual when this is left NULL,
+	 * which would fail with "wrong type of slot".
+	 */
+	acss->css.slotOps = &TTSOpsBufferHeapTuple;
 	return (Node *) acss;
 }
 
