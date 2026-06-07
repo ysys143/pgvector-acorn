@@ -394,14 +394,15 @@ acorn_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 
 	cscan->scan.plan.targetlist = tlist;
 	/*
-	 * clauses is the relation's baserestrictinfo extracted to bare Expr nodes
-	 * (the WHERE filter, e.g. category = 'shoes').  We store it as the plan
+	 * clauses is the relation's baserestrictinfo (the WHERE filter, e.g.
+	 * category = 'shoes') as RestrictInfo nodes — create_customscan_plan does
+	 * NOT extract them, so we must.  We store the bare Expr quals as the plan
 	 * qual so acorn_begin_scan can build the ACORN predicate ExprState from it.
 	 * Our ExecCustomScan applies this predicate during traversal (ACORN-1:
 	 * filter-failing nodes are excluded from results but kept as candidates),
 	 * so we never rely on ExecScan's qual machinery.
 	 */
-	cscan->scan.plan.qual		= clauses;
+	cscan->scan.plan.qual		= extract_actual_clauses(clauses, false);
 	cscan->scan.scanrelid		= best_path->path.parent->relid;
 	cscan->flags				= 0;
 	cscan->custom_plans			= NIL;
