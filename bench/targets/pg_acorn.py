@@ -3,6 +3,8 @@
 import psycopg
 import numpy as np
 
+from ._explain import explain_filtered as _explain_filtered
+
 
 class PgAcornTarget:
     def __init__(self, dsn: str, tier: int = 2, gamma: int = 1):
@@ -66,6 +68,10 @@ class PgAcornTarget:
                 (query.tolist(), k),
             )
             return [row[0] for row in cur.fetchall()]
+
+    def explain_filtered(self, query: np.ndarray, bucket_threshold: int, k: int) -> dict:
+        """Per-query page-access counts for the filtered top-k query."""
+        return _explain_filtered(self.conn, query, bucket_threshold, k)
 
     def insert_batch(self, vectors: np.ndarray, metadata: list[dict]) -> None:
         with self.conn.cursor() as cur:

@@ -14,6 +14,7 @@ import numpy as np
 SELECTIVITIES = [1, 5, 10, 40, 80]  # percent — bucket < N gives N% selectivity
 K = 10
 N_QUERIES = 100
+N_EXPLAIN = 20  # queries sampled for page-I/O (EXPLAIN BUFFERS), outside timing
 
 
 def compute_recall(result_ids: list[int], truth_ids: list[int]) -> float:
@@ -46,4 +47,29 @@ def run(target, queries: np.ndarray, ground_truth: dict) -> dict:
             "p99_ms":      float(np.percentile(latencies, 99) * 1000),
         }
 
+        # page-I/O: separate, non-timed sample pass (EXPLAIN ANALYZE executes the
+        # query, so it must stay out of the wall-clock loop above).
+        results[sel].update(_measure_page_io(target, queries, sel))
+
     return results
+
+
+def _measure_page_io(target, queries: np.ndarray, sel: int) -> dict:
+    """Sample per-query logical page accesses (shared hit + read).
+
+    Returns None-valued fields for targets without EXPLAIN support (e.g. Qdrant).
+    """
+    explain = getattr(target, "explain_filtered", None)
+    if explain is None:
+        return {"pages_total_mean": None, "pages_hit_mean": None, "pages_read_mean": None}
+
+    io = [explain(q, sel, K) for q in queries[:min(N_EXPLAIN, N_QUERIES)]]
+    io = [x for x in io if x]
+    if not io:
+        return {"pages_total_mean": None, "pages_hit_mean": None, "pages_read_mean": None}
+
+    return {
+        "pages_total_mean": float(np.mean([x["pages_total"] for x in io])),
+        "pages_hit_mean":   float(np.mean([x["pages_hit"]   for x in io])),
+        "pages_read_mean":  float(np.mean([x["pages_read"]  for x in io])),
+    }

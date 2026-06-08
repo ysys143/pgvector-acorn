@@ -45,6 +45,30 @@ def scenario_a_table(results: dict) -> str:
     return "\n".join(lines)
 
 
+def scenario_a_pages_table(results: dict) -> str:
+    """Per-query logical page accesses (shared hit + read) — the paper's
+    headline cost metric for filtered vector search in a DBMS."""
+    lines = ["## Scenario A: Page Accesses per Query (shared hit + read)\n"]
+    header = f"{'Target':<24} " + " ".join(f"{s:>7}%" for s in SELECTIVITIES)
+    lines.append(header)
+    lines.append("-" * len(header))
+    any_row = False
+    for target in TARGET_ORDER:
+        if target not in results or "a" not in results[target]:
+            continue
+        a = results[target]["a"]
+        cells = []
+        for s in SELECTIVITIES:
+            row = a.get(str(s), a.get(s, {}))
+            v = row.get("pages_total_mean")
+            cells.append(f"{v:>8.0f}" if isinstance(v, (int, float)) else "       -")
+        lines.append(f"{target:<24} " + " ".join(cells))
+        any_row = True
+    if not any_row:
+        lines.append("(no page-I/O data)")
+    return "\n".join(lines)
+
+
 def scenario_b_table(results: dict) -> str:
     lines = ["## Scenario B: Post-Filter Recall (pgvector CTE workaround)\n"]
     if "pgvector" not in results or "b" not in results["pgvector"]:
@@ -61,7 +85,7 @@ def scenario_b_table(results: dict) -> str:
 
 
 def plot_scenario_a(results: dict, outdir: Path) -> None:
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
 
     for target in TARGET_ORDER:
         if target not in results or "a" not in results[target]:
@@ -70,10 +94,16 @@ def plot_scenario_a(results: dict, outdir: Path) -> None:
         sels = [s for s in SELECTIVITIES if s in a or str(s) in a]
         recalls = [a.get(s, a.get(str(s), {})).get("recall_mean", None) for s in sels]
         qps = [a.get(s, a.get(str(s), {})).get("qps", None) for s in sels]
+        pages = [a.get(s, a.get(str(s), {})).get("pages_total_mean", None) for s in sels]
 
         color = COLORS.get(target, "gray")
         ax1.plot(sels, recalls, marker="o", label=target, color=color)
         ax2.plot(sels, qps,     marker="o", label=target, color=color)
+        # page-I/O may be absent (Qdrant) — only plot points we actually have
+        psels = [s for s, p in zip(sels, pages) if p is not None]
+        pvals = [p for p in pages if p is not None]
+        if pvals:
+            ax3.plot(psels, pvals, marker="o", label=target, color=color)
 
     ax1.set_xlabel("Filter selectivity (%)")
     ax1.set_ylabel("Recall@10")
@@ -86,6 +116,11 @@ def plot_scenario_a(results: dict, outdir: Path) -> None:
     ax2.set_ylabel("QPS")
     ax2.set_title("Throughput vs Selectivity")
     ax2.legend(fontsize=8)
+
+    ax3.set_xlabel("Filter selectivity (%)")
+    ax3.set_ylabel("Pages per query (shared hit + read)")
+    ax3.set_title("Page Accesses vs Selectivity")
+    ax3.legend(fontsize=8)
 
     fig.tight_layout()
     fig.savefig(outdir / "scenario_a.png", dpi=150)
@@ -129,6 +164,8 @@ def main() -> None:
 
     report_lines = ["# pg_acorn Benchmark Report\n"]
     report_lines.append(scenario_a_table(results))
+    report_lines.append("\n")
+    report_lines.append(scenario_a_pages_table(results))
     report_lines.append("\n")
     report_lines.append(scenario_b_table(results))
 
