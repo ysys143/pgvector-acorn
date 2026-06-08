@@ -1,0 +1,133 @@
+# pg_acorn 발전 로드맵
+
+> 작성: 2026-06-08
+> 근거 문서: `docs/sigmod2026-fvs-postgresql-analysis.md` (SIGMOD 2026 FVS-in-PG 논문 분석)
+> 목적: 현재 구현에서 출발해 논문이 지적한 격차를 어떤 순서로 메울지 정의한다.
+
+---
+
+## 0. 현재 상태 (baseline)
+
+| 구성 요소 | 상태 |
+|----------|------|
+| **Tier 1** (hook + CustomScan) | 필터 인지 ACORN-γ 탐색. WHERE 술어를 직접 봄. 전 선택도 recall 1.0 |
+| **Tier 2** (`acorn_hnsw` AM) | 멀티레이어 HNSW 빌드(이번 세션 완료) + ef 확장 반복 post-filter 스캔. recall@10 1%=1.0 |
+| **공유 탐색** (`acorn_scan.c`) | 멀티레이어 greedy descent(`:302`) + layer-0 ACORN 탐색(`:363`). **1-hop**, 필터 실패 노드는 C 유지(`:471`) |
+| **ACORN-γ** | `m_eff = m×gamma` 이웃을 빌드 시 저장(`acorn_build.c:80`), `meta->m`에 기록 |
+| **벤치마크** | scenario A–D 하네스, 합성 unit 벡터, **page-I/O 미측정** |
+
+### 논문 대비 격차 (멀티레이어 빌드 완료 후 갱신)
+
+분석 문서 Section 11의 "최우선 격차(멀티레이어 HNSW)"는 **이미 해소됨**. 남은 격차:
+
+| 격차 | 논문 근거 | 난이도 | 위험 | 적용 위치 |
+|------|----------|--------|------|----------|
+| page-I/O 미측정 | §1, §12.4 | 소 | 매우 낮음 | bench |
+| 실데이터/Qdrant/시나리오 B–D 미실행 | §6, §8 | 중 | 낮음 | bench |
+| ACORN-γ L_max 경고 없음 | §10, §12.3 | 극소 | 매우 낮음 | `acorn_build.c` |
+| ef_search C 상한 (코드에 TODO) | §11 | 소 | 낮음 | `acorn_scan.c:515` |
+| Tier 2 반복 스캔이 ef 2배마다 전체 재탐색 | (자체 측정) | 중 | 낮음 | `acorn_am.c:253` |
+| Translation Map 없음 | §5, §12.1 | 대 | 중 | `acorn_build.c`+`acorn_scan.c` |
+| 런타임 2-hop (ACORN-1) 없음 | §4, §6.1 | 대 | 중 | `acorn_scan.c` |
+| NaviX-Directed 없음 | §6.1, §8, §12.2 | 중 | 중 | `acorn_scan.c` |
+| 컬럼나/INCLUDE 컬럼 | §13 | 특대 | 높음 | 아키텍처 |
+
+---
+
+## 의존성 그래프 (로드맵 순서의 근거)
+
+```
+Phase 0 (측정·안전)  ──┬──> Phase 1 (TM) ──> Phase 2 (2-hop ─> NaviX-Directed)
+                       │         ▲                    │
+   page-I/O 계측 ───────┘         └── 효과 증명 의존 ───┘
+   실데이터 하네스                                      │
+   L_max 경고 / ef 상한 / 반복스캔 재개                 v
+                                              Phase 3 (타 알고리즘·컬럼나)
+```
+
+**왜 이 순서인가**: 논문은 "distance 계산 수는 PG end-to-end의 신뢰할 수 없는 proxy"라고 단언한다(§1). 따라서 **page-I/O 측정 없이는 TM/2-hop이 실제로 페이지 접근을 줄였는지 증명할 수 없다.** TM은 2-hop을 PG에서 실행 가능하게 만드는 전제(2-hop은 스텝당 1+M+M² 페이지, §4)이며, NaviX-Directed는 2-hop 위에서만 의미가 있다.
+
+---
+
+## Phase 0 — 측정 기반 + 안전장치 (전제 조건)
+
+목표: 이후 모든 최적화를 **증명 가능**하게 만들고, 저위험 정합성 항목을 닫는다.
+
+1. **page-I/O 계측** (`bench/`, §12.4)
+   - `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`로 `shared_hit + shared_read` 추출 → `pages_per_query` 지표.
+   - `bench/results.json`·`RESULTS.md` 리포트에 `QPS`/`recall@10`/`p99`와 **나란히 필수 컬럼으로** 추가.
+   - 산출물: 현재 ACORN-γ의 쿼리당 페이지 접근 baseline. 이후 TM/2-hop의 효과를 이 숫자로 측정.
+
+2. **실데이터 하네스 보강** (`bench/fixtures/`, `bench/targets/qdrant.py`)
+   - 합성 unit 벡터 → 실 SIFT/Cohere 임베딩. 음의 상관관계 시나리오 포함(§8.2 — 논문의 가장 가혹한 케이스).
+   - Qdrant 타깃 활성화 + 시나리오 B(post-filter 저하)/C(증분 insert)/D(상관관계) 정식 실행.
+
+3. **ACORN-γ L_max 경고** (`acorn_build.c`, §12.3) — 극소, 독립적
+   - `m_eff` 기준 `L_max = 8192/(m_eff·6) - 2` 계산, `< 10`이면 `ereport(WARNING)`.
+   - γ를 키워 페이지 천장에 부딪히면 그래프가 flat에 가까워진다는 §10 경고를 사용자에게 노출.
+
+4. **ef_search C 상한** (`acorn_scan.c:515` TODO 해소) — 소
+   - 후보 집합 C에 계수 기반 상한을 둬 초저선택도에서 무한 탐색 방지.
+
+5. **Tier 2 반복 스캔 재개** (`acorn_am.c:253`) — 중
+   - 현재 ef 2배마다 전체 traversal 재실행(1% 선택도에서 12 QPS 측정됨). 이전 상태(C/visited)에서 재개하도록 변경.
+   - 논문의 Iterative Scan(discarded queue D에서 재개, §6.2)과 같은 방향.
+
+**완료 기준**: `pages_per_query`가 모든 타깃 리포트에 존재, 실데이터로 시나리오 A–D 통과, `make docker-test`/`docker-unit` 회귀 없음.
+
+---
+
+## Phase 1 — Translation Map (2-hop의 전제)
+
+목표: `indextid → heaptid` 인메모리 해시맵으로 2-hop 술어 평가 시 인덱스 페이지 재조회 제거(§5).
+
+- **빌드 시** (`acorn_build.c`, 인덱스 완성 후): 전체 인덱스 1회 스캔으로 `HTAB` 구성. 엔트리당 ~18B (1M=18MB, 35M=630MB).
+  ```c
+  typedef struct AcornTranslationMap {
+      HTAB *indextid_to_heaptid;
+      MemoryContext mcxt;
+  } AcornTranslationMap;
+  ```
+- **쿼리 시** (`acorn_scan.c`): 필터 평가 경로에서 heaptid 해석을 TM 조회(~10ns)로 대체.
+- **검증**: Phase 0의 `pages_per_query`로 heaptid fetch 비용 하락 확인(논문 §5: 60–75% → 8–17%).
+
+> 주의: 현재 1-hop 경로는 노드를 distance 계산하며 element 튜플을 이미 읽어 heaptid가 공짜다. **TM의 실익은 2-hop이 생겨야 발생**하므로 Phase 2와 묶어 검증한다.
+
+---
+
+## Phase 2 — 2-hop ACORN-1 + NaviX-Directed (논문의 간판)
+
+목표: 런타임 2-hop 확장으로, 저장 비용 없이(γ=1) effective density 확보. pgvector 페이지 천장(§10)에 막히는 초대규모·초저선택도 영역을 연다.
+
+1. **런타임 2-hop 확장** (`acorn_scan.c`, §4·§6.1) — TM 위에서만 실행 가능.
+2. **NaviX-Directed** (§12.2): 1-hop을 거리순 정렬 → 가까운 비통과 노드의 2-hop 먼저 탐색. 논문상 ACORN 대비 1.2–1.7x.
+3. **(선택) Adaptive heuristic 전환**: Blind/Directed/Onehop-s를 탐색 상태(C/W 채움률·통과율)로 동적 선택(§6.1).
+
+### 아키텍처 제약 — Tier 1 회귀 방지
+
+이 변경들은 Tier 1이 공유하는 `acorn_scan.c`를 건드린다. **회귀 가드 필수**:
+- 가법적으로: γ=1 경로는 런타임 2-hop을 쓰고, γ>1(현재 ACORN-γ) 경로는 기존 동작 보존.
+- `no_regression.sql`(acorn==pgvector top-k) + `recall_filter` 통과, ≥40% 선택도 recall ≥0.9 유지를 머지 게이트로.
+
+**전략적 가치**: TM + 2-hop + NaviX-Directed가 들어가면 pg_acorn은 **오픈소스 PostgreSQL 최초의 제대로 된 graph-based filtered vector search**가 된다(§7). NaviX·TM은 AlloyDB 구독으로도 못 쓰는 연구 프로토타입.
+
+---
+
+## Phase 3 — 타 알고리즘 / 장기 방향
+
+- **ScaNN형 클러스터 인덱스** (§6.3): 음의 상관관계에서 유일한 승자. 별도 AM 규모의 큰 작업 — 채택 여부는 Phase 0 실데이터 결과(음상관 시나리오)를 보고 결정.
+- **컬럼나 / INCLUDE 컬럼** (§13): 필터 컬럼 사본을 인덱스에 저장(PG 11+ `INCLUDE`)해 heap double-lookup을 근본 제거. 논문이 명시한 장기 방향. 설계 스파이크부터.
+
+---
+
+## 우선순위 요약
+
+| 순위 | 항목 | 이유 |
+|------|------|------|
+| P0 | page-I/O 계측 | 다른 모든 작업의 증명 도구 |
+| P0 | L_max 경고 / ef 상한 / 반복스캔 재개 | 저위험, 즉시 정합성·성능 이득 |
+| P0 | 실데이터 + Qdrant + 시나리오 B–D | 의미 있는 측정 기반 |
+| P1 | Translation Map | 2-hop 전제 |
+| P2 | 2-hop ACORN-1 + NaviX-Directed | 논문 간판, 대규모·저선택도 개방 |
+| P3 | ScaNN / 컬럼나 | 장기, 큰 아키텍처 결정 |
+```
