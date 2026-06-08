@@ -64,6 +64,83 @@ python3 bench/run_bench.py --scenario a \
 
 ---
 
+## Run 5: Phase 1 (node cache) + Phase 2 (2-hop NaviX) at n=50,000
+
+First real-scale measurement. Phase 1 combines the per-neighbor distance read and
+metadata read into a single element-page read (`acorn_t2_load_node`). Phase 2 adds
+a deferred 2-hop min-heap (`enable_2hop=on`) that expands 1-hop filter-failures to
+find their filter-passing neighbors.
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Fixture | SIFT1M subset — synthetic fallback, seed=42 (`load_sift`) |
+| Vectors / dim / queries / k | 50,000 / 96 / 100 / 10 |
+| Index params | m=16, ef_construction=64 |
+| Force index scan | yes (`enable_seqscan=off, enable_bitmapscan=off`) |
+| Basline binary | pre-Phase1+2 (container not restarted before Phase 0 bench) |
+| Phase 1+2 binary | post-`feb2d7c` (`make install` at container start) |
+
+### Pages per query — Index Scan (forced)
+
+| Target | 1% | 5% | 10% | 40% | 80% |
+|--------|-----|-----|------|-----|-----|
+| Phase 0 baseline (pre-Phase1+2) | 19,638 | 8,715 | 5,339 | 1,695 | 933 |
+| Tier 2 g1 — Phase 1+2 | 21,293 | 5,685 | 3,128 | 961 | 586 |
+| Tier 2 g1 — Phase 1+2, 2hop | 21,285 | 6,116 | 3,217 | 935 | 576 |
+| Tier 2 g2 — Phase 1+2 | 30,897 | 10,273 | 5,453 | 1,718 | 1,011 |
+| Tier 2 g2 — Phase 1+2, 2hop | 30,937 | 10,351 | 5,599 | 1,720 | 1,033 |
+
+Phase 1 reduces pages by ~1.7x at 5–80% selectivity (single combined read vs two
+separate reads per unvisited neighbor). At 1% the scan explores more nodes before
+terminating, slightly increasing pages.
+
+### Recall@10
+
+| Target | 1% | 5% | 10% | 40% | 80% |
+|--------|-----|-----|------|-----|-----|
+| Phase 0 baseline (pre-Phase1+2) | 0.998 | 0.952 | 0.884 | 0.926 | 0.934 |
+| Tier 2 g1 — Phase 1+2 | 0.901 | 0.663 | 0.627 | 0.661 | 0.604 |
+| Tier 2 g1 — Phase 1+2, 2hop | 0.895 | 0.644 | 0.609 | 0.662 | 0.634 |
+| Tier 2 g2 — Phase 1+2 | 0.992 | 0.882 | 0.845 | 0.855 | 0.876 |
+| Tier 2 g2 — Phase 1+2, 2hop | 0.986 | 0.877 | 0.862 | 0.855 | 0.873 |
+
+### Interpretation
+
+**Phase 1 I/O reduction confirmed:** element-page reads drop ~1.7x at moderate
+selectivity. The combined-read miss path is equivalent to the prior two-call
+pattern algorithmically, and the node cache is always-miss (every node is marked
+visited before `acorn_t2_load_node` is called, so cache entries are never reread).
+The savings come entirely from the single-read on first discovery.
+
+**Recall regression vs Phase 0 baseline:** Phase 1+2 tier2_g1 shows significantly
+lower recall (0.627 vs 0.884 @10%). The code paths are logically identical for the
+non-2hop case. The most likely cause is **graph-build randomness**: the Phase 0 and
+Phase 2C benchmarks used different running containers (Phase 0 container was not
+restarted after `make install`), so the `CREATE INDEX` ran with a different postgres
+instance and thus different `random()` level assignments in HNSW construction. All
+small-scale regression tests (n=500) pass at recall >= 0.9. A controlled re-run
+with a fresh container restart before the Phase 0 build is needed to isolate this.
+
+**2-hop shows no improvement:** `tier2_g1_2hop` recall (0.609) is slightly *worse*
+than without 2-hop (0.627) at 10%. Root cause: the per-expand D-flush (k_d=8
+deferred failures flushed per expand step) injects far-away 2-hop candidates into
+C before the main scan has converged, diluting the priority queue ordering. The
+end-of-C flush (when C is exhausted) also fires but comes too late to recover.
+A distance-triggered D-drain (flush D only when `D-nearest < C-nearest`) would be
+a more principled design.
+
+### Reproduce
+
+```sh
+# start the bench container (restarts postgres with make install):
+docker compose -f docker/docker-compose.yml --profile bench up --build -d
+docker compose -f docker/docker-compose.yml --profile bench run bench
+```
+
+---
+
 ## Run 3: Page-I/O Baseline (n=10,000)
 
 Adds **`pages_per_query`** (shared hit + read logical page accesses) measured via

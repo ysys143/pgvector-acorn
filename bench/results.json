@@ -2,52 +2,52 @@
   "pgvector": {
     "a": {
       "1": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 21.666951556542493,
-        "p99_ms": 265.6656258483417,
-        "pages_total_mean": 27420.25,
-        "pages_hit_mean": 27420.25,
+        "recall_mean": 0.035,
+        "recall_min": 0.0,
+        "qps": 218.46531310136723,
+        "p99_ms": 32.92560732341473,
+        "pages_total_mean": 1454.65,
+        "pages_hit_mean": 1454.65,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       },
       "5": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 96.95060250454716,
-        "p99_ms": 277.3835087951738,
-        "pages_total_mean": 12790.8,
-        "pages_hit_mean": 12790.8,
+        "recall_mean": 0.19700000000000004,
+        "recall_min": 0.0,
+        "qps": 204.5921159165201,
+        "p99_ms": 76.90446433378439,
+        "pages_total_mean": 1454.65,
+        "pages_hit_mean": 1454.65,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       },
       "10": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 54.91780122959345,
-        "p99_ms": 241.95078022778029,
-        "pages_total_mean": 7893.5,
-        "pages_hit_mean": 7893.5,
+        "recall_mean": 0.405,
+        "recall_min": 0.0,
+        "qps": 193.55130661321712,
+        "p99_ms": 108.81440029013943,
+        "pages_total_mean": 1454.65,
+        "pages_hit_mean": 1454.65,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       },
       "40": {
-        "recall_mean": 0.9880000000000001,
-        "recall_min": 0.9,
-        "qps": 1470.1877745996644,
-        "p99_ms": 2.597213085973635,
-        "pages_total_mean": 1253.6,
-        "pages_hit_mean": 1253.6,
+        "recall_mean": 0.7429999999999999,
+        "recall_min": 0.3,
+        "qps": 206.44065387165725,
+        "p99_ms": 128.39379141805713,
+        "pages_total_mean": 1437.4,
+        "pages_hit_mean": 1437.4,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "80": {
-        "recall_mean": 0.982,
-        "recall_min": 0.9,
-        "qps": 187.80819781578901,
-        "p99_ms": 216.78606904344613,
-        "pages_total_mean": 1239.9,
-        "pages_hit_mean": 1239.9,
+        "recall_mean": 0.7739999999999999,
+        "recall_min": 0.4,
+        "qps": 156.82467034268538,
+        "p99_ms": 110.10020694811892,
+        "pages_total_mean": 1426.75,
+        "pages_hit_mean": 1426.75,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       }
@@ -56,106 +56,106 @@
   "pg_acorn_tier1_g1": {
     "a": {
       "1": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 21.559552550758678,
-        "p99_ms": 290.42565414449194,
-        "pages_total_mean": 27348.4,
-        "pages_hit_mean": 27348.4,
+        "recall_mean": 0.036000000000000004,
+        "recall_min": 0.0,
+        "qps": 177.37137884717117,
+        "p99_ms": 119.3309382582091,
+        "pages_total_mean": 1456.8,
+        "pages_hit_mean": 1456.8,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       },
       "5": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 87.49257370951696,
-        "p99_ms": 294.4015437259804,
-        "pages_total_mean": 12677.9,
-        "pages_hit_mean": 12677.9,
+        "recall_mean": 0.20400000000000001,
+        "recall_min": 0.0,
+        "qps": 199.26397400587743,
+        "p99_ms": 19.654763003346854,
+        "pages_total_mean": 1456.8,
+        "pages_hit_mean": 1456.8,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       },
       "10": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 185.36952891178376,
-        "p99_ms": 183.58822127920507,
-        "pages_total_mean": 7905.3,
-        "pages_hit_mean": 7905.3,
+        "recall_mean": 0.401,
+        "recall_min": 0.1,
+        "qps": 251.2552989327036,
+        "p99_ms": 35.98169761826293,
+        "pages_total_mean": 1456.8,
+        "pages_hit_mean": 1456.8,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       },
       "40": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 177.41935917412056,
-        "p99_ms": 234.3791332026008,
-        "pages_total_mean": 2523.9,
-        "pages_hit_mean": 2523.9,
+        "recall_mean": 0.7530000000000001,
+        "recall_min": 0.4,
+        "qps": 142.37075081413718,
+        "p99_ms": 132.49665721552483,
+        "pages_total_mean": 1441.55,
+        "pages_hit_mean": 1441.55,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       },
       "80": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 301.7084392235429,
-        "p99_ms": 142.26630265475208,
-        "pages_total_mean": 1385.65,
-        "pages_hit_mean": 1385.65,
+        "recall_mean": 0.7730000000000001,
+        "recall_min": 0.3,
+        "qps": 202.15173897961557,
+        "p99_ms": 110.10962851694829,
+        "pages_total_mean": 1428.9,
+        "pages_hit_mean": 1428.9,
         "pages_read_mean": 0.0,
-        "plan": "Custom Scan"
+        "plan": "Index Scan"
       }
     }
   },
   "pg_acorn_tier2_g1": {
     "a": {
       "1": {
-        "recall_mean": 0.998,
-        "recall_min": 0.9,
-        "qps": 29.466282440811888,
-        "p99_ms": 285.63580192509096,
-        "pages_total_mean": 19638.35,
-        "pages_hit_mean": 19638.35,
+        "recall_mean": 0.9010000000000002,
+        "recall_min": 0.6,
+        "qps": 5.655344113157592,
+        "p99_ms": 411.4296759339062,
+        "pages_total_mean": 21292.85,
+        "pages_hit_mean": 21292.85,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "5": {
-        "recall_mean": 0.9519999999999998,
-        "recall_min": 0.8,
-        "qps": 76.34802798716537,
-        "p99_ms": 216.99237320339304,
-        "pages_total_mean": 8715.0,
-        "pages_hit_mean": 8715.0,
+        "recall_mean": 0.6630000000000001,
+        "recall_min": 0.4,
+        "qps": 29.517687551962172,
+        "p99_ms": 268.4890245739377,
+        "pages_total_mean": 5685.25,
+        "pages_hit_mean": 5685.25,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "10": {
-        "recall_mean": 0.8839999999999999,
-        "recall_min": 0.7,
-        "qps": 249.34636500741308,
-        "p99_ms": 145.86267424281633,
-        "pages_total_mean": 5338.65,
-        "pages_hit_mean": 5338.65,
+        "recall_mean": 0.627,
+        "recall_min": 0.2,
+        "qps": 72.24543355782426,
+        "p99_ms": 182.31733583495992,
+        "pages_total_mean": 3128.25,
+        "pages_hit_mean": 3128.25,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "40": {
-        "recall_mean": 0.926,
-        "recall_min": 0.7,
-        "qps": 1302.473029982942,
-        "p99_ms": 9.113152136560512,
-        "pages_total_mean": 1694.75,
-        "pages_hit_mean": 1694.75,
+        "recall_mean": 0.6609999999999999,
+        "recall_min": 0.0,
+        "qps": 153.75934341091425,
+        "p99_ms": 173.33236011443705,
+        "pages_total_mean": 961.35,
+        "pages_hit_mean": 961.35,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "80": {
-        "recall_mean": 0.934,
-        "recall_min": 0.7,
-        "qps": 663.065611372909,
-        "p99_ms": 52.7371170395052,
-        "pages_total_mean": 933.2,
-        "pages_hit_mean": 933.2,
+        "recall_mean": 0.604,
+        "recall_min": 0.0,
+        "qps": 270.6030200157033,
+        "p99_ms": 5.1090168510576435,
+        "pages_total_mean": 586.15,
+        "pages_hit_mean": 586.15,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       }
@@ -164,52 +164,160 @@
   "pg_acorn_tier2_g2": {
     "a": {
       "1": {
-        "recall_mean": 1.0,
-        "recall_min": 1.0,
-        "qps": 17.411059290395837,
-        "p99_ms": 372.0653664600103,
-        "pages_total_mean": 21853.15,
-        "pages_hit_mean": 21853.15,
+        "recall_mean": 0.992,
+        "recall_min": 0.9,
+        "qps": 4.156581016106554,
+        "p99_ms": 544.8234512237834,
+        "pages_total_mean": 30896.9,
+        "pages_hit_mean": 30896.9,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "5": {
-        "recall_mean": 0.992,
-        "recall_min": 0.9,
-        "qps": 127.27755070162917,
-        "p99_ms": 265.5312745238188,
-        "pages_total_mean": 12649.25,
-        "pages_hit_mean": 12649.25,
+        "recall_mean": 0.8819999999999999,
+        "recall_min": 0.6,
+        "qps": 16.11875153073762,
+        "p99_ms": 244.57151579321405,
+        "pages_total_mean": 10273.25,
+        "pages_hit_mean": 10273.25,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "10": {
-        "recall_mean": 0.988,
-        "recall_min": 0.9,
-        "qps": 66.03125141331208,
-        "p99_ms": 248.20185051881708,
-        "pages_total_mean": 8588.25,
-        "pages_hit_mean": 8588.25,
+        "recall_mean": 0.8450000000000002,
+        "recall_min": 0.6,
+        "qps": 36.31314539168883,
+        "p99_ms": 257.6687097304969,
+        "pages_total_mean": 5453.45,
+        "pages_hit_mean": 5453.45,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "40": {
-        "recall_mean": 0.9839999999999999,
-        "recall_min": 0.8,
-        "qps": 123.63508821707852,
-        "p99_ms": 271.94774088449725,
-        "pages_total_mean": 3024.6,
-        "pages_hit_mean": 3024.6,
+        "recall_mean": 0.855,
+        "recall_min": 0.4,
+        "qps": 210.88532057571032,
+        "p99_ms": 29.17279241257456,
+        "pages_total_mean": 1717.7,
+        "pages_hit_mean": 1717.7,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       },
       "80": {
-        "recall_mean": 0.9839999999999999,
-        "recall_min": 0.9,
-        "qps": 291.1685206899557,
-        "p99_ms": 129.8789070954077,
-        "pages_total_mean": 1702.1,
-        "pages_hit_mean": 1702.1,
+        "recall_mean": 0.8759999999999999,
+        "recall_min": 0.5,
+        "qps": 386.93572051217393,
+        "p99_ms": 5.5826135515241875,
+        "pages_total_mean": 1010.5,
+        "pages_hit_mean": 1010.5,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      }
+    }
+  },
+  "pg_acorn_tier2_g1_2hop": {
+    "a": {
+      "1": {
+        "recall_mean": 0.895,
+        "recall_min": 0.6,
+        "qps": 7.836241857271751,
+        "p99_ms": 299.47684826445766,
+        "pages_total_mean": 21284.55,
+        "pages_hit_mean": 21284.55,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "5": {
+        "recall_mean": 0.644,
+        "recall_min": 0.3,
+        "qps": 43.47916939372093,
+        "p99_ms": 306.10764930024743,
+        "pages_total_mean": 6115.8,
+        "pages_hit_mean": 6115.8,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "10": {
+        "recall_mean": 0.609,
+        "recall_min": 0.1,
+        "qps": 78.4461238832773,
+        "p99_ms": 163.95313197397644,
+        "pages_total_mean": 3217.25,
+        "pages_hit_mean": 3217.25,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "40": {
+        "recall_mean": 0.6619999999999999,
+        "recall_min": 0.2,
+        "qps": 247.80215776026725,
+        "p99_ms": 23.721151939827262,
+        "pages_total_mean": 934.8,
+        "pages_hit_mean": 934.8,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "80": {
+        "recall_mean": 0.6339999999999999,
+        "recall_min": 0.0,
+        "qps": 169.39388431131616,
+        "p99_ms": 125.73505003470945,
+        "pages_total_mean": 575.65,
+        "pages_hit_mean": 575.65,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      }
+    }
+  },
+  "pg_acorn_tier2_g2_2hop": {
+    "a": {
+      "1": {
+        "recall_mean": 0.9860000000000001,
+        "recall_min": 0.8,
+        "qps": 2.898976380505045,
+        "p99_ms": 790.9437527076817,
+        "pages_total_mean": 30936.75,
+        "pages_hit_mean": 30936.75,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "5": {
+        "recall_mean": 0.877,
+        "recall_min": 0.6,
+        "qps": 12.168343012184362,
+        "p99_ms": 439.90867322892893,
+        "pages_total_mean": 10350.85,
+        "pages_hit_mean": 10350.85,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "10": {
+        "recall_mean": 0.862,
+        "recall_min": 0.6,
+        "qps": 33.90094268579755,
+        "p99_ms": 352.32703445013624,
+        "pages_total_mean": 5599.45,
+        "pages_hit_mean": 5599.45,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "40": {
+        "recall_mean": 0.8550000000000001,
+        "recall_min": 0.5,
+        "qps": 86.34693213319761,
+        "p99_ms": 181.33831597398975,
+        "pages_total_mean": 1719.7,
+        "pages_hit_mean": 1719.7,
+        "pages_read_mean": 0.0,
+        "plan": "Index Scan"
+      },
+      "80": {
+        "recall_mean": 0.8730000000000002,
+        "recall_min": 0.5,
+        "qps": 251.20083707985273,
+        "p99_ms": 14.023771181238128,
+        "pages_total_mean": 1032.75,
+        "pages_hit_mean": 1032.75,
         "pages_read_mean": 0.0,
         "plan": "Index Scan"
       }
