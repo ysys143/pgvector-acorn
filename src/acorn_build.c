@@ -120,7 +120,7 @@ acorn_assign_level(int m_eff, unsigned short rand_state[3])
 		return 0;
 
 	do {
-		r = pg_erand48(rand_state);
+		r = erand48(rand_state);
 	} while (r == 0.0);
 
 	level = (int) floor(-log(r) / log((double) m_eff));
