@@ -27,7 +27,6 @@
 #include "acorn_scan.h"
 #include "hnsw_compat.h"
 #include "acorn_t2_page.h"
-#include "access/stratnum.h"
 
 /* -----------------------------------------------------------------------
  * Internal element reference
@@ -888,24 +887,15 @@ acorn_t2_eval_filter(ScanKey keys, int nkeys, int64 stored_val)
 
 	for (i = 0; i < nkeys; i++)
 	{
-		int32 cmp = DatumGetInt32(
+		/*
+		 * sk_func is the operator's own predicate (e.g. int4lt for <),
+		 * which returns a boolean Datum directly — not a comparison integer.
+		 */
+		if (!DatumGetBool(
 			FunctionCall2Coll(&keys[i].sk_func,
 							   keys[i].sk_collation,
 							   (Datum) stored_val,
-							   keys[i].sk_argument));
-		bool  passes;
-
-		switch (keys[i].sk_strategy)
-		{
-			case BTLessStrategyNumber:			passes = (cmp < 0);  break;
-			case BTLessEqualStrategyNumber:		passes = (cmp <= 0); break;
-			case BTEqualStrategyNumber:			passes = (cmp == 0); break;
-			case BTGreaterEqualStrategyNumber:	passes = (cmp >= 0); break;
-			case BTGreaterStrategyNumber:		passes = (cmp > 0);  break;
-			default:							passes = false;		 break;
-		}
-
-		if (!passes)
+							   keys[i].sk_argument)))
 			return false;
 	}
 	return true;
