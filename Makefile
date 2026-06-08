@@ -34,8 +34,8 @@ include $(PGXS)
 src/pg_acorn.o:   src/acorn_hook.h src/acorn_am.h
 src/acorn_hook.o: src/acorn_hook.h src/acorn_scan.h
 src/acorn_am.o:   src/acorn_am.h   src/acorn_scan.h src/acorn_cost.h
-src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h
-src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h
+src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h src/acorn_t2_page.h
+src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h src/acorn_t2_page.h
 src/acorn_cost.o:  src/acorn_cost.h src/acorn_am.h
 
 # Unit tests — standalone C binaries, no PostgreSQL dependency.
