@@ -1,13 +1,18 @@
 /*
  * acorn_cost.c — amcostestimate for acorn_hnsw (Tier 2)
  *
- * An ORDER-BY-only index: returns +infinity without an ORDER BY (it only
- * answers nearest-k).  Cost is charged per RETURNED tuple by graph-node
- * expansion (see ACORN_PAGES_PER_TUPLE), because the WHERE predicate is a heap
- * Filter, not an index qual — so a low-selectivity filter that forces many
- * ordered tuples to be emitted is correctly expensive.  This yields the right
- * index-vs-seqscan crossover: seq scan wins on small tables / low selectivity,
- * the index wins at high selectivity on large tables.
+ * Two modes:
+ *
+ * Pure ORDER BY (no index quals): cost is per RETURNED tuple; the WHERE
+ * predicate is a heap Filter, so low selectivity forces many emitted tuples.
+ * Seq scan wins on small tables / low selectivity; index wins at high
+ * selectivity on large tables.
+ *
+ * In-filter (index quals present): ACORN-gamma evaluates the scalar predicate
+ * inside the graph traversal.  Filter-failing nodes stay in the candidate set
+ * for connectivity; only passing nodes go to the result set.  Expansion count
+ * is bounded by ef_search / selectivity (not N * selectivity), so cost grows
+ * mildly as selectivity drops rather than linearly.  No heap fetch needed.
  */
 
 #include "postgres.h"
@@ -24,13 +29,14 @@
 #include "acorn_am.h"
 #include "acorn_cost.h"
 
-/*
- * Random page fetches charged per returned (emitted) tuple: emitting the next
- * nearest neighbour expands one graph node — reading its neighbour list and a
- * handful of neighbour vectors.  This is the dominant ACORN scan cost and is
- * paid per result, so it governs the index-vs-seqscan crossover.
- */
-#define ACORN_PAGES_PER_TUPLE	16.0
+/* Pure ORDER BY: pages charged per returned (emitted) tuple */
+#define ACORN_PAGES_PER_TUPLE		16.0
+
+/* In-filter: pages per expanded graph node (element page + neighbor page) */
+#define ACORN_T2_PAGES_PER_NODE		2.0
+
+/* In-filter: typical ef_search value used to bound expansion count */
+#define ACORN_T2_EF_SEARCH_EST		40.0
 
 void
 acorn_hnsw_costestimate(PlannerInfo *root,
@@ -70,21 +76,37 @@ acorn_hnsw_costestimate(PlannerInfo *root,
 	if (n_tuples < 1)
 		n_tuples = 1;
 
-	/*
-	 * ACORN/HNSW cost model.  Unlike an ordinary index, the dominant cost is
-	 * paid *per returned tuple*: emitting the next nearest neighbour expands a
-	 * graph node, reading its neighbour list plus several neighbour vectors
-	 * (~ACORN_PAGES_PER_TUPLE random page fetches).  Because the WHERE predicate
-	 * is a heap Filter (not an index qual), a low-selectivity filter forces the
-	 * executor to pull ~k/selectivity ordered tuples before its LIMIT is met, so
-	 * this per-tuple price makes the index correctly expensive at low
-	 * selectivity / small tables (seq scan wins) and cheap only at high
-	 * selectivity on large tables (index wins).  Startup is the greedy descent
-	 * to the base-layer entry point (~log N page reads).
-	 */
-	costs.indexStartupCost = log(Max(n_tuples, 2.0)) * spc_rand_cost;
-	costs.indexTotalCost = costs.indexStartupCost
-		+ n_tuples * ACORN_PAGES_PER_TUPLE * spc_rand_cost;
+	if (path->indexclauses != NIL)
+	{
+		/*
+		 * In-filter mode: scalar qual evaluated inside graph traversal.
+		 * Expansion count is bounded by ef_search / selectivity (not
+		 * N * selectivity) because filter-failing nodes are kept in the
+		 * candidate set for connectivity and do not become results.
+		 */
+		Selectivity sel = costs.indexSelectivity;
+		double		N_total = Max((double) path->indexinfo->tuples, 1.0);
+		double		n_expand;
+
+		if (sel <= 0.0)
+			sel = 0.001;
+		n_expand = Min(ACORN_T2_EF_SEARCH_EST / sel, N_total);
+
+		costs.indexStartupCost = log(Max(N_total, 2.0)) * spc_rand_cost;
+		costs.indexTotalCost = costs.indexStartupCost
+			+ n_expand * ACORN_T2_PAGES_PER_NODE * spc_rand_cost;
+	}
+	else
+	{
+		/*
+		 * Pure ORDER BY: no scalar qual; WHERE predicate is a heap Filter.
+		 * Cost scales with returned tuples — low-selectivity filters force
+		 * many emitted tuples before the LIMIT is satisfied.
+		 */
+		costs.indexStartupCost = log(Max(n_tuples, 2.0)) * spc_rand_cost;
+		costs.indexTotalCost = costs.indexStartupCost
+			+ n_tuples * ACORN_PAGES_PER_TUPLE * spc_rand_cost;
+	}
 
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;
