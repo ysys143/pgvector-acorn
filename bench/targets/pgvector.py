@@ -4,6 +4,7 @@ import psycopg
 import numpy as np
 
 from ._explain import explain_filtered as _explain_filtered
+from ._bulk import copy_load as _copy_load
 
 
 class PgvectorTarget:
@@ -24,10 +25,7 @@ class PgvectorTarget:
                     embedding vector({dim})
                 )
             """)
-            cur.executemany(
-                "INSERT INTO bench_items (bucket, embedding) VALUES (%s, %s)",
-                [(m["bucket"], v.tolist()) for v, m in zip(vectors, metadata)],
-            )
+            _copy_load(cur, vectors, metadata)
             cur.execute("""
                 CREATE INDEX ON bench_items
                 USING hnsw (embedding vector_cosine_ops)

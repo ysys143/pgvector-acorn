@@ -13,3 +13,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# large benchmark datasets (SIFT1M etc.) — never commit
+bench/fixtures/data/
