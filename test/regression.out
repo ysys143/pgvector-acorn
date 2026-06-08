@@ -1,6 +1,0 @@
-# using postmaster on Unix socket, default port
-ok 1         - smoke                                      42 ms
-ok 2         - tier1_hook                                443 ms
-ok 3         - tier2_am                                  490 ms
-ok 4         - no_regression                             832 ms
-ok 5         - recall_filter                            2498 ms
