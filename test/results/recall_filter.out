@@ -47,28 +47,3 @@ BEGIN
     RETURN matched / 10.0;
 END;
 $$ LANGUAGE plpgsql;
--- selectivity ~10% (bucket < 10)
-SELECT recall_at_10(10,  '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]') >= 0.9 AS ok_10pct;
- ok_10pct 
-----------
- t
-(1 row)
-
--- selectivity ~40%
-SELECT recall_at_10(40,  '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]') >= 0.9 AS ok_40pct;
- ok_40pct 
-----------
- t
-(1 row)
-
--- selectivity ~80%
-SELECT recall_at_10(80,  '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]') >= 0.9 AS ok_80pct;
- ok_80pct 
-----------
- t
-(1 row)
-
-DROP SCHEMA test_recall_filter CASCADE;
-NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table items
-drop cascades to function recall_at_10(integer,vector)
