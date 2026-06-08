@@ -4,20 +4,20 @@
 
 Target                        1%      5%     10%     40%     80%
 ----------------------------------------------------------------
-pgvector                  1.000  1.000  1.000  0.976  0.966
+pgvector                  1.000  1.000  1.000  0.982  0.978
 pg_acorn_tier1_g1         1.000  1.000  1.000  1.000  1.000
-pg_acorn_tier2_g1         0.996  0.960  0.888  0.914  0.908
-pg_acorn_tier2_g2         1.000  0.992  0.988  0.984  0.986
+pg_acorn_tier2_g1         0.998  0.952  0.884  0.932  0.942
+pg_acorn_tier2_g2         1.000  0.992  0.988  0.970  0.966
 
 
 ## Scenario A: Page Accesses per Query (shared hit + read)
 
 Target                         1%       5%      10%      40%      80%
 ---------------------------------------------------------------------
-pgvector                    27359    12747     7872     1251     1237
-pg_acorn_tier1_g1           27410    12733     7901     2508     1393
-pg_acorn_tier2_g1           19642     8536     5295     1758      974
-pg_acorn_tier2_g2           21847    12652     8581     3018     1698
+pgvector                    27341    12801     7957     1250     1236
+pg_acorn_tier1_g1           27360    12700     7897     2528     1410
+pg_acorn_tier2_g1           22001    11083     7667     2386     2373
+pg_acorn_tier2_g2             371    16837    12781     4210     4196
 
 
 ## Scenario B: Post-Filter Recall (pgvector CTE workaround)

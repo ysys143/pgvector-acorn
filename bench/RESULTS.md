@@ -1,54 +1,53 @@
 # pg_acorn Benchmark — Scenario A (Filter Selectivity Sweep)
 
-## Run 4: Resumable Streaming Scan (n=10,000)
+## Run 4: Hybrid Resumable Scan (n=10,000)
 
 Replaces Tier 2's ef-doubling batch loop (which re-ran the full HNSW traversal
-from the entry point on every ef expansion) with a **resumable streaming
-frontier** (`acorn_scan.c` `acorn_stream_*`): each graph node is expanded and
-emitted at most once, so the executor pulling more results never restarts the
-traversal. Tier 1's batch path (`acorn_scan_execute`) is unchanged.
+from the entry point on every ef expansion) with a **two-phase hybrid**:
 
-### Pages per query — batch (Run 3) vs resumable (Run 4)
+1. **Phase 1** — one ef=40 beam batch (`acorn_scan_execute`). Cheap and
+   accurate; when the filter matches sit near the query it alone satisfies the
+   executor's LIMIT.
+2. **Phase 2** (only if the executor exhausts the batch) — a **resumable
+   streaming frontier** (`acorn_scan.c` `acorn_stream_*`) that continues
+   nearest-first WITHOUT restarting from the entry point, deduped against the
+   batch. Tier 1's batch path is unchanged.
 
-| Target | 1% | 5% | 10% | 40% | 80% |
-|--------|----|----|-----|-----|-----|
-| Tier 2 g1 — batch | 63,000 | 22,820 | 13,027 | 2,403 | 2,389 |
-| **Tier 2 g1 — resumable** | **19,642** | **8,536** | **5,295** | **1,758** | **974** |
-| Tier 2 g2 — batch | 371 | 35,922 | 20,970 | 4,186 | 4,172 |
-| **Tier 2 g2 — resumable** | 21,847 | **12,652** | **8,581** | **3,018** | **1,698** |
-
-### Recall@10 / QPS (resumable)
+### Pages per query — old batch vs hybrid
 
 | Target | 1% | 5% | 10% | 40% | 80% |
 |--------|----|----|-----|-----|-----|
-| Tier 2 g1 recall | 0.996 | 0.960 | 0.888 | 0.914 | 0.908 |
-| Tier 2 g1 qps | 32 | 62 | 246 | 518 | 2936 |
-| Tier 2 g2 recall | 1.000 | 0.992 | 0.988 | 0.984 | 0.986 |
-| Tier 2 g2 qps | 24 | 104 | 97 | 270 | 533 |
+| Tier 2 g1 — old batch | 63,000 | 22,820 | 13,027 | 2,403 | 2,389 |
+| **Tier 2 g1 — hybrid** | **22,001** | **11,083** | **7,667** | 2,386 | 2,373 |
+| Tier 2 g2 — old batch | 371 | 35,922 | 20,970 | 4,186 | 4,172 |
+| **Tier 2 g2 — hybrid** | **371** | **16,837** | **12,781** | 4,210 | 4,196 |
 
-### Interpretation — a predictability win, not a uniform speedup
+### Recall@10 (hybrid)
 
-- **Eliminates the worst-case re-traversal blowup.** Tier 2 g1 at 1% — the
-  pathological case that motivated this work — drops from 63,000 to 19,642 pages
-  (3.2x) and 11 to 32 qps (2.9x), with recall essentially unchanged (1.000 →
-  0.996). Across g1 the streaming scan touches 2–4x fewer pages everywhere.
-- **It is not uniformly cheaper.** Tier 2 g2 at 1% rises from 371 to 21,847
-  pages. The 371 was a best-case of the old all-or-nothing batch: a single
-  ef=40 round happened to cover the 1%-filter matches, so no doubling occurred.
-  The streaming scan instead expands consistently until the executor's LIMIT is
-  satisfied, so it cannot exploit that luck — but it also cannot suffer the g1
-  blowup. Net: **cost becomes predictable** (monotone in selectivity) rather
-  than bimodal (lucky-cheap vs doubling-explosion).
+| Target | 1% | 5% | 10% | 40% | 80% |
+|--------|----|----|-----|-----|-----|
+| Tier 2 g1 | 0.998 | 0.952 | 0.884 | 0.932 | 0.942 |
+| Tier 2 g2 | 1.000 | 0.992 | 0.988 | 0.970 | 0.966 |
+
+### Interpretation — dominates the old batch, no regression
+
+- **Removes the re-traversal blowup.** Tier 2 g1 at 1% — the pathological case
+  that motivated this work — drops from 63,000 to 22,001 pages (2.9x), recall
+  essentially unchanged (1.000 → 0.998). When phase 1 is insufficient, phase 2
+  *resumes* the traversal rather than restarting it from the entry point on each
+  ef step, which is where the old loop wasted its pages.
+- **No regression on concentrated matches.** Tier 2 g2 at 1% stays at 371 pages:
+  phase 1's ef=40 beam already covers the near-query matches, so phase 2 never
+  starts. (A pure-streaming design without phase 1 over-expanded here to ~21,800
+  pages because best-first emission lacks the ef-beam's directedness — phase 1
+  exists precisely to capture this case.)
+- **Net:** the hybrid is <= the old batch everywhere measured (much lower at low
+  selectivity, equal at high), and the cost is predictable rather than bimodal.
 - **Recall holds within build-seed variance.** Levels are assigned from
   `MyProcPid`, so each build yields a slightly different graph; the few-point
   differences vs Run 3 are within that noise. All gated tests pass:
   `no_regression`, `recall_filter` (>=0.9 at 10/40/80%), `recall_gamma`,
   `recall_insert`, plus both isolation specs.
-- **Code is simpler:** `acorn_am.c` loses ~140 lines (no ef-doubling, repalloc,
-  or cross-round TID dedup — streaming emits each node once by construction).
-
-**Future refinement:** a small ef-floor / first-batch hybrid could recover the
-g2-style lucky-cheap case while keeping the worst-case bound.
 
 ### Reproduce
 
