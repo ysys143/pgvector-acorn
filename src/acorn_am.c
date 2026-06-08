@@ -20,7 +20,6 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
-#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -83,41 +82,16 @@ acorn_validate(Oid opclassoid)
  * ----------------------------------------------------------------------- */
 
 /*
- * Hash-table entry deduplicating heap TIDs returned by the batch round against
- * those later emitted by the streaming continuation.  The dummy byte satisfies
- * dynahash's requirement that entrysize > keysize.
- */
-typedef struct AcornSeenEntry
-{
-	ItemPointerData heaptid;
-	char			dummy;
-} AcornSeenEntry;
-
-/*
- * Tier 2 hybrid scan.  Phase 1: a proven ef=ACORN_DEFAULT_EF_SEARCH beam batch
- * (acorn_scan_execute) — cheap, and at low selectivity with the filter matches
- * concentrated near the query it alone satisfies the executor's LIMIT.  Phase 2
- * (only if the batch is exhausted while the executor still pulls): a resumable
- * streaming frontier (acorn_stream_*) that continues nearest-first WITHOUT
- * re-running the traversal from the entry point, deduped against the batch via
- * `seen`.  This avoids both the old ef-doubling re-traversal blowup (phase 2
- * never restarts) and pure-streaming over-expansion on concentrated matches
- * (phase 1 handles those).
+ * Tier 2 streams results from a persistent ACORN frontier (acorn_scan.c
+ * acorn_stream_*): one heap TID per amgettuple in approximate nearest-first
+ * order.  Each graph node is expanded/emitted at most once, so the executor
+ * pulling past the initial candidates never re-runs the traversal.
  */
 typedef struct AcornScanOpaqueData
 {
 	bool			 first;
 	Datum			 query;			/* detoasted query vector (lives in tmpCtx) */
-
-	/* Phase 1: batch beam search */
-	ItemPointerData *batch;			/* top-ef TIDs (in tmpCtx) */
-	int				 batch_count;
-	int				 batch_pos;
-
-	/* Phase 2: streaming continuation (lazily started) */
 	AcornStreamScan *stream;		/* persistent frontier (lives in tmpCtx) */
-	HTAB			*seen;			/* TIDs already returned (in tmpCtx) */
-
 	MemoryContext	 tmpCtx;
 } AcornScanOpaqueData;
 typedef AcornScanOpaqueData *AcornScanOpaque;
@@ -128,15 +102,11 @@ acorn_beginscan(Relation index, int nkeys, int norderbys)
 	IndexScanDesc	scan = RelationGetIndexScan(index, nkeys, norderbys);
 	AcornScanOpaque so   = palloc0(sizeof(AcornScanOpaqueData));
 
-	so->first       = true;
-	so->query       = (Datum) 0;
-	so->batch       = NULL;
-	so->batch_count = 0;
-	so->batch_pos   = 0;
-	so->stream      = NULL;
-	so->seen        = NULL;
-	so->tmpCtx      = AllocSetContextCreate(CurrentMemoryContext,
-											"acorn scan", ALLOCSET_DEFAULT_SIZES);
+	so->first  = true;
+	so->query  = (Datum) 0;
+	so->stream = NULL;
+	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
+									   "acorn scan", ALLOCSET_DEFAULT_SIZES);
 
 	scan->opaque = so;
 	return scan;
@@ -148,13 +118,9 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
 	AcornScanOpaque so = (AcornScanOpaque) scan->opaque;
 
-	so->first       = true;
-	so->query       = (Datum) 0;
-	so->batch       = NULL;
-	so->batch_count = 0;
-	so->batch_pos   = 0;
-	so->stream      = NULL;
-	so->seen        = NULL;
+	so->first  = true;
+	so->query  = (Datum) 0;
+	so->stream = NULL;
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -164,37 +130,23 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 				scan->numberOfOrderBys * sizeof(ScanKeyData));
 }
 
-/* Emit one heap TID to the executor and report success. */
-static inline bool
-acorn_emit(IndexScanDesc scan, ItemPointerData tid)
-{
-	scan->xs_heaptid        = tid;
-	scan->xs_recheck        = false;
-	scan->xs_recheckorderby = false;
-	return true;
-}
-
 /*
- * acorn_gettuple — hybrid two-phase scan.
+ * acorn_gettuple — iterative scan with ef expansion.
  *
- * Phase 1 (first call): one ef=ACORN_DEFAULT_EF_SEARCH beam batch via
- * acorn_scan_execute().  Cheap and accurate; when the filter matches are
- * concentrated near the query (low selectivity, correlated data) this batch
- * alone satisfies the executor's LIMIT, so phase 2 never runs.
+ * On the first call, search with ef = ACORN_DEFAULT_EF_SEARCH (40) and
+ * buffer the results.  Return heap TIDs one at a time to the executor,
+ * which post-filters on the WHERE predicate.  When the buffer is exhausted
+ * before the executor stops asking, double ef and search again, skipping TIDs
+ * already returned (tracked in so->seen).  Stop when ef >= ACORN_EF_SEARCH_MAX
+ * or an expansion produces no new TIDs.
  *
- * Phase 2 (only if the executor exhausts the batch and keeps pulling): a
- * resumable streaming frontier (acorn_stream_*) that continues nearest-first
- * WITHOUT restarting the traversal, deduplicated against the batch via `seen`.
- * Stops when the graph is exhausted.
- *
- * The executor post-filters on the WHERE predicate, so this AM evaluates none.
+ * This lifts Tier 2 recall at low selectivity: at 1% selectivity with k=10
+ * the executor needs ~1000 candidates, requiring ~5 doublings from ef=40.
  */
 static bool
 acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	AcornScanOpaque so = (AcornScanOpaque) scan->opaque;
-	MemoryContext	oldCtx;
-	ItemPointerData tid;
 
 	Assert(ScanDirectionIsForward(dir));
 
@@ -210,69 +162,31 @@ acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 		return false;
 	}
 
-	/* Phase 1 setup: detoast query and run the ef-beam batch once */
+	/* First call: detoast query and start the streaming frontier */
 	if (so->first)
 	{
-		AcornScanState st;
-
-		oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+		MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 
 		so->query = PointerGetDatum(
 			PG_DETOAST_DATUM(scan->orderByData->sk_argument));
-
-		so->batch = palloc(sizeof(ItemPointerData) * ACORN_DEFAULT_EF_SEARCH);
-		st.ef_search = ACORN_DEFAULT_EF_SEARCH;
-		st.k         = ACORN_DEFAULT_EF_SEARCH;
-		st.predicate = NULL;
-		st.econtext  = NULL;
-		so->batch_count = acorn_scan_execute(&st, scan->indexRelation, NULL,
-											 so->query, scan->xs_snapshot,
-											 so->batch);
-		so->batch_pos = 0;
+		so->stream = acorn_stream_begin(scan->indexRelation, so->query,
+										scan->xs_snapshot, so->tmpCtx);
 		so->first = false;
 
 		MemoryContextSwitchTo(oldCtx);
 	}
 
-	/* Phase 1: drain the batch (already sorted nearest-first) */
-	if (so->batch_pos < so->batch_count)
-		return acorn_emit(scan, so->batch[so->batch_pos++]);
-
-	/* Phase 2: streaming continuation — start it lazily, seeding `seen` */
-	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
-
-	if (so->stream == NULL)
 	{
-		HASHCTL hctl;
+		ItemPointerData tid;
 
-		memset(&hctl, 0, sizeof(hctl));
-		hctl.keysize   = sizeof(ItemPointerData);
-		hctl.entrysize = sizeof(AcornSeenEntry);
-		hctl.hcxt      = so->tmpCtx;
-		so->seen = hash_create("acorn_seen", 64, &hctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		if (!acorn_stream_next(so->stream, &tid))
+			return false;
 
-		for (int i = 0; i < so->batch_count; i++)
-			hash_search(so->seen, &so->batch[i], HASH_ENTER, NULL);
-
-		so->stream = acorn_stream_begin(scan->indexRelation, so->query,
-										scan->xs_snapshot, so->tmpCtx);
+		scan->xs_heaptid        = tid;
+		scan->xs_recheck        = false;
+		scan->xs_recheckorderby = false;
+		return true;
 	}
-
-	while (acorn_stream_next(so->stream, &tid))
-	{
-		bool found;
-
-		hash_search(so->seen, &tid, HASH_ENTER, &found);
-		if (found)
-			continue;				/* already returned by the batch or earlier */
-
-		MemoryContextSwitchTo(oldCtx);
-		return acorn_emit(scan, tid);
-	}
-
-	MemoryContextSwitchTo(oldCtx);
-	return false;
 }
 
 static void

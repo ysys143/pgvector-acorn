@@ -23,27 +23,3 @@ INSERT INTO items (bucket, embedding) SELECT
 FROM generate_series(1, 2000) i;
 CREATE INDEX items_acorn ON items USING acorn_hnsw (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64, acorn_gamma = 1);
--- helper: compute recall@10 for a given selectivity bucket threshold
--- brute force = seq scan with filter; acorn = acorn_hnsw with filter
-CREATE OR REPLACE FUNCTION recall_at_10(threshold int, query vector)
-RETURNS numeric AS $$
-DECLARE
-    matched int;
-BEGIN
-    WITH
-    brute AS (
-        SELECT id FROM items
-        WHERE bucket < threshold
-        ORDER BY embedding <-> query
-        LIMIT 10
-    ),
-    acorn_r AS (
-        SELECT id FROM items
-        WHERE bucket < threshold
-        ORDER BY embedding <-> query
-        LIMIT 10
-    )
-    SELECT count(*) INTO matched FROM acorn_r JOIN brute USING (id);
-    RETURN matched / 10.0;
-END;
-$$ LANGUAGE plpgsql;
