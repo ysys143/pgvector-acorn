@@ -39,10 +39,10 @@ class PgAcornTarget:
                 """)
                 cur.execute("SET pg_acorn.enable_hook = on")
             else:
-                # Tier 2: acorn_hnsw AM with gamma
+                # Tier 2: acorn_hnsw AM with multicol index (embedding + bucket in-filter)
                 cur.execute(f"""
                     CREATE INDEX ON bench_items
-                    USING acorn_hnsw (embedding vector_cosine_ops)
+                    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
                     WITH (m = 16, ef_construction = 64, acorn_gamma = {self.gamma})
                 """)
 

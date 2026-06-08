@@ -15,6 +15,7 @@ REGRESS = \
 	smoke \
 	tier1_hook \
 	tier2_am \
+	tier2_infilter \
 	no_regression \
 	recall_filter \
 	recall_gamma \
