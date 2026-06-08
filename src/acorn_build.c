@@ -354,6 +354,15 @@ acorn_read_element(Relation index, ForkNumber forkNum, ItemPointer tid,
 /*
  * Add element E (e_blk,e_off) as a neighbor of N (n_tid).  If N's layer-0
  * slots are full, replace N's furthest neighbor when E is closer (retry).
+ *
+ * IMPORTANT: we must never read another element/neighbor page while holding a
+ * lock on N's neighbor page — element and neighbor tuples share pages, so that
+ * would self-deadlock on the buffer LWLock.  So this runs in two phases:
+ *   1. read N's neighbor tuple (SHARE, copy + release), then read whatever
+ *      vectors we need (SHARE, released) to pick the target slot;
+ *   2. take EXCLUSIVE on N's neighbor page only to write the single slot.
+ * Build/insert is serialized per index, so the snapshot from phase 1 is still
+ * valid in phase 2.
  */
 static void
 acorn_add_reverse_edge(Relation index, ForkNumber forkNum, ItemPointer n_tid,
@@ -368,27 +377,31 @@ acorn_add_reverse_edge(Relation index, ForkNumber forkNum, ItemPointer n_tid,
 	Page			page;
 	HnswNeighborTuple ntup;
 	ItemPointerData *tids;
+	ItemPointerData	tids_copy[HNSW_MAX_NEIGHBORS];
 	int				len = 0;
 	int				target = -1;
 
+	/* --- read N's element (vector + neighbor location) --- */
 	acorn_read_element(index, forkNum, n_tid, &n_nbr_blk, &n_nbr_off, &n_vec);
 
+	/* --- phase 1a: copy N's neighbor slots under a SHARE lock --- */
 	buf = ReadBufferExtended(index, forkNum, n_nbr_blk, RBM_NORMAL, NULL);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, n_nbr_off));
 	tids = HnswNeighborTupleGetTids(ntup);
+	memcpy(tids_copy, tids, layer0_m * sizeof(ItemPointerData));
+	UnlockReleaseBuffer(buf);
 
 	/* Slots fill contiguously, so the first invalid slot is the length. */
 	for (len = 0; len < layer0_m; len++)
 	{
-		if (!ItemPointerIsValid(&tids[len]))
+		if (!ItemPointerIsValid(&tids_copy[len]))
 			break;
 		/* Already connected? */
-		if (ItemPointerGetBlockNumber(&tids[len]) == e_blk &&
-			ItemPointerGetOffsetNumber(&tids[len]) == e_off)
+		if (ItemPointerGetBlockNumber(&tids_copy[len]) == e_blk &&
+			ItemPointerGetOffsetNumber(&tids_copy[len]) == e_off)
 		{
-			UnlockReleaseBuffer(buf);
 			pfree(DatumGetPointer(n_vec));
 			return;
 		}
@@ -401,7 +414,7 @@ acorn_add_reverse_edge(Relation index, ForkNumber forkNum, ItemPointer n_tid,
 	}
 	else
 	{
-		/* Full: find furthest neighbor of N; replace if E is closer */
+		/* --- phase 1b: full — find furthest neighbor (no page lock held) --- */
 		double	furthest_d = -DBL_MAX;
 		int		furthest_j = -1;
 		double	dEN = acorn_dist(proc, n_vec, e_value);
@@ -411,7 +424,7 @@ acorn_add_reverse_edge(Relation index, ForkNumber forkNum, ItemPointer n_tid,
 			Datum	vj;
 			double	d;
 
-			acorn_read_element(index, forkNum, &tids[j], NULL, NULL, &vj);
+			acorn_read_element(index, forkNum, &tids_copy[j], NULL, NULL, &vj);
 			d = acorn_dist(proc, n_vec, vj);
 			pfree(DatumGetPointer(vj));
 			if (d > furthest_d)
@@ -425,14 +438,20 @@ acorn_add_reverse_edge(Relation index, ForkNumber forkNum, ItemPointer n_tid,
 			target = furthest_j;
 	}
 
-	if (target >= 0)
-	{
-		ItemPointerSet(&tids[target], e_blk, e_off);
-		MarkBufferDirty(buf);
-	}
-
-	UnlockReleaseBuffer(buf);
 	pfree(DatumGetPointer(n_vec));
+
+	if (target < 0)
+		return;					/* E is not closer than any existing neighbor */
+
+	/* --- phase 2: write the chosen slot under EXCLUSIVE --- */
+	buf = ReadBufferExtended(index, forkNum, n_nbr_blk, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, n_nbr_off));
+	tids = HnswNeighborTupleGetTids(ntup);
+	ItemPointerSet(&tids[target], e_blk, e_off);
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
 }
 
 /* -----------------------------------------------------------------------
