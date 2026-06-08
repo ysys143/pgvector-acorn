@@ -29,6 +29,21 @@ def brute_force(target, query: np.ndarray, bucket_threshold: int, k: int) -> lis
 def run(target, queries: np.ndarray, ground_truth: dict) -> dict:
     results = {}
 
+    # Force the vector index: with a small table at low selectivity the planner
+    # may pick a seq scan, which makes pages_per_query (and recall) reflect the
+    # scan, not the index. Forcing it keeps every target on its index for an
+    # apples-to-apples comparison. Ground truth uses a separate connection.
+    force = getattr(target, "force_index_scan", None)
+    if force:
+        force(True)
+    try:
+        return _run_inner(target, queries, ground_truth, results)
+    finally:
+        if force:
+            force(False)
+
+
+def _run_inner(target, queries: np.ndarray, ground_truth: dict, results: dict) -> dict:
     for sel in SELECTIVITIES:
         recalls, latencies = [], []
 
@@ -61,15 +76,19 @@ def _measure_page_io(target, queries: np.ndarray, sel: int) -> dict:
     """
     explain = getattr(target, "explain_filtered", None)
     if explain is None:
-        return {"pages_total_mean": None, "pages_hit_mean": None, "pages_read_mean": None}
+        return {"pages_total_mean": None, "pages_hit_mean": None,
+                "pages_read_mean": None, "plan": None}
 
     io = [explain(q, sel, K) for q in queries[:min(N_EXPLAIN, N_QUERIES)]]
     io = [x for x in io if x]
     if not io:
-        return {"pages_total_mean": None, "pages_hit_mean": None, "pages_read_mean": None}
+        return {"pages_total_mean": None, "pages_hit_mean": None,
+                "pages_read_mean": None, "plan": None}
 
+    plans = sorted({x.get("plan", "?") for x in io})
     return {
         "pages_total_mean": float(np.mean([x["pages_total"] for x in io])),
         "pages_hit_mean":   float(np.mean([x["pages_hit"]   for x in io])),
         "pages_read_mean":  float(np.mean([x["pages_read"]  for x in io])),
+        "plan": ",".join(plans),   # scan node(s) actually used (should be index)
     }

@@ -32,9 +32,30 @@ def sum_shared_blocks(plan_json) -> dict:
     return {"pages_hit": hit, "pages_read": read, "pages_total": hit + read}
 
 
+def scan_node_type(plan_json) -> str:
+    """Return the node type that scans the relation (e.g. "Index Scan",
+    "Seq Scan", "Custom Scan"), so callers can detect when the planner bypassed
+    the vector index — which makes a page-access comparison meaningless.
+    """
+    if isinstance(plan_json, str):
+        plan_json = json.loads(plan_json)
+
+    found = []
+
+    def walk(node):
+        nt = node.get("Node Type", "")
+        if "Scan" in nt:
+            found.append(nt)
+        for child in node.get("Plans", []):
+            walk(child)
+
+    walk(plan_json[0].get("Plan", {}))
+    return found[0] if found else plan_json[0].get("Plan", {}).get("Node Type", "?")
+
+
 def explain_filtered(conn, query, bucket_threshold: int, k: int) -> dict:
     """Run the filtered top-k query under EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
-    and return its per-query page-access counts.
+    and return its per-query page-access counts plus the scan node type.
 
     Uses the same SQL as ``query_filtered`` so the measured plan matches the
     timed query exactly.
@@ -51,4 +72,6 @@ def explain_filtered(conn, query, bucket_threshold: int, k: int) -> dict:
             (bucket_threshold, query.tolist(), k),
         )
         plan_json = cur.fetchone()[0]
-    return sum_shared_blocks(plan_json)
+    out = sum_shared_blocks(plan_json)
+    out["plan"] = scan_node_type(plan_json)
+    return out

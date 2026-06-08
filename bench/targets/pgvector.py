@@ -56,8 +56,19 @@ class PgvectorTarget:
             return [row[0] for row in cur.fetchall()]
 
     def explain_filtered(self, query: np.ndarray, bucket_threshold: int, k: int) -> dict:
-        """Per-query page-access counts for the filtered top-k query."""
+        """Per-query page-access counts + scan node type for the filtered query."""
         return _explain_filtered(self.conn, query, bucket_threshold, k)
+
+    def force_index_scan(self, on: bool) -> None:
+        """Disable seq/bitmap scans so the planner uses the vector index — page
+        counts and recall only compare meaningfully when the same plan is used."""
+        with self.conn.cursor() as cur:
+            if on:
+                cur.execute("SET enable_seqscan = off")
+                cur.execute("SET enable_bitmapscan = off")
+            else:
+                cur.execute("RESET enable_seqscan")
+                cur.execute("RESET enable_bitmapscan")
 
     def insert_batch(self, vectors: np.ndarray, metadata: list[dict]) -> None:
         with self.conn.cursor() as cur:
