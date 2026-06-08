@@ -138,10 +138,13 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
 	AcornScanOpaque so = (AcornScanOpaque) scan->opaque;
 
-	so->first = true;
-	so->count = 0;
-	so->pos   = 0;
-	so->tids  = NULL;
+	so->first  = true;
+	so->done   = false;
+	so->ef     = ACORN_DEFAULT_EF_SEARCH;
+	so->count  = 0;
+	so->pos    = 0;
+	so->tids   = NULL;
+	so->seen   = NULL;
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -151,6 +154,19 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 				scan->numberOfOrderBys * sizeof(ScanKeyData));
 }
 
+/*
+ * acorn_gettuple — iterative scan with ef expansion.
+ *
+ * On the first call, search with ef = ACORN_DEFAULT_EF_SEARCH (40) and
+ * buffer the results.  Return heap TIDs one at a time to the executor,
+ * which post-filters on the WHERE predicate.  When the buffer is exhausted
+ * before the executor stops asking, double ef and search again, skipping TIDs
+ * already returned (tracked in so->seen).  Stop when ef >= ACORN_EF_SEARCH_MAX
+ * or an expansion produces no new TIDs.
+ *
+ * This lifts Tier 2 recall at low selectivity: at 1% selectivity with k=10
+ * the executor needs ~1000 candidates, requiring ~5 doublings from ef=40.
+ */
 static bool
 acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
@@ -158,53 +174,105 @@ acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	Assert(ScanDirectionIsForward(dir));
 
+	if (scan->orderByData == NULL)
+		elog(ERROR, "cannot scan acorn_hnsw index without ORDER BY");
+	if (!IsMVCCSnapshot(scan->xs_snapshot))
+		elog(ERROR, "non-MVCC snapshots are not supported with acorn_hnsw");
+
+	/* NULL order-by value yields no rows */
+	if (scan->orderByData->sk_flags & SK_ISNULL)
+	{
+		so->first = false;
+		return false;
+	}
+
+	/* First call: detoast query, allocate seen set, run initial search */
 	if (so->first)
 	{
-		MemoryContext	oldCtx;
-		Datum			query;
+		MemoryContext	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 		AcornScanState	st;
+		HASHCTL			hctl;
 
-		if (scan->orderByData == NULL)
-			elog(ERROR, "cannot scan acorn_hnsw index without ORDER BY");
-		if (!IsMVCCSnapshot(scan->xs_snapshot))
-			elog(ERROR, "non-MVCC snapshots are not supported with acorn_hnsw");
+		so->query = PointerGetDatum(
+			PG_DETOAST_DATUM(scan->orderByData->sk_argument));
 
-		/* NULL order-by value yields no rows */
-		if (scan->orderByData->sk_flags & SK_ISNULL)
-		{
-			so->first = false;
-			so->count = 0;
-			return false;
-		}
-
-		oldCtx = MemoryContextSwitchTo(so->tmpCtx);
-
-		/* Detoast query vector; stored vectors are not normalized, so neither is this */
-		query = PointerGetDatum(PG_DETOAST_DATUM(scan->orderByData->sk_argument));
-
-		st.ef_search = so->ef;
-		st.k         = so->ef;
-		st.predicate = NULL;	/* index AM does not see the WHERE filter */
-		st.econtext  = NULL;
+		memset(&hctl, 0, sizeof(hctl));
+		hctl.keysize   = sizeof(ItemPointerData);
+		hctl.entrysize = sizeof(AcornSeenEntry);
+		so->seen = hash_create("acorn_seen", 64, &hctl,
+							   HASH_ELEM | HASH_BLOBS);
 
 		so->tids  = palloc(sizeof(ItemPointerData) * so->ef);
+		st.ef_search = so->ef;
+		st.k         = so->ef;
+		st.predicate = NULL;
+		st.econtext  = NULL;
 		so->count = acorn_scan_execute(&st, scan->indexRelation, NULL,
-									   query, scan->xs_snapshot, so->tids);
-		so->pos = 0;
+									   so->query, scan->xs_snapshot, so->tids);
+		so->pos   = 0;
 		so->first = false;
 
 		MemoryContextSwitchTo(oldCtx);
 	}
 
-	if (so->pos < so->count)
+	for (;;)
 	{
-		scan->xs_heaptid = so->tids[so->pos++];
-		scan->xs_recheck = false;
-		scan->xs_recheckorderby = false;
-		return true;
-	}
+		/* Return the next TID that has not been returned before */
+		while (so->pos < so->count)
+		{
+			ItemPointerData tid = so->tids[so->pos++];
+			bool			found;
 
-	return false;
+			hash_search(so->seen, &tid, HASH_FIND, &found);
+			if (!found)
+			{
+				hash_search(so->seen, &tid, HASH_ENTER, &found);
+				scan->xs_heaptid        = tid;
+				scan->xs_recheck        = false;
+				scan->xs_recheckorderby = false;
+				return true;
+			}
+		}
+
+		/* Buffer exhausted: try expanding ef */
+		if (so->done || so->ef >= ACORN_EF_SEARCH_MAX)
+			return false;
+
+		{
+			MemoryContext	oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+			AcornScanState	st;
+			bool			any_new = false;
+
+			so->ef    = Min(so->ef * 2, ACORN_EF_SEARCH_MAX);
+			so->tids  = repalloc(so->tids, sizeof(ItemPointerData) * so->ef);
+
+			st.ef_search = so->ef;
+			st.k         = so->ef;
+			st.predicate = NULL;
+			st.econtext  = NULL;
+			so->count = acorn_scan_execute(&st, scan->indexRelation, NULL,
+										   so->query, scan->xs_snapshot,
+										   so->tids);
+			so->pos = 0;
+
+			/* Check if expansion produced at least one TID we haven't seen */
+			for (int i = 0; i < so->count; i++)
+			{
+				bool found;
+				hash_search(so->seen, &so->tids[i], HASH_FIND, &found);
+				if (!found)
+				{
+					any_new = true;
+					break;
+				}
+			}
+
+			if (!any_new)
+				so->done = true;
+
+			MemoryContextSwitchTo(oldCtx);
+		}
+	}
 }
 
 static void
