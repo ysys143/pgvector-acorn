@@ -1,11 +1,13 @@
 /*
  * acorn_cost.c — amcostestimate for acorn_hnsw (Tier 2)
  *
- * Mirrors pgvector's hnswcostestimate shape: an ORDER-BY-only index whose cost
- * is a small fraction of a full scan (proportional to the O(log N) graph
- * probes), so the planner prefers it over a seq scan when a vector ORDER BY is
- * present.  Returns +infinity when there is no ORDER BY (the index is useless
- * without it).
+ * An ORDER-BY-only index: returns +infinity without an ORDER BY (it only
+ * answers nearest-k).  Cost is charged per RETURNED tuple by graph-node
+ * expansion (see ACORN_PAGES_PER_TUPLE), because the WHERE predicate is a heap
+ * Filter, not an index qual — so a low-selectivity filter that forces many
+ * ordered tuples to be emitted is correctly expensive.  This yields the right
+ * index-vs-seqscan crossover: seq scan wins on small tables / low selectivity,
+ * the index wins at high selectivity on large tables.
  */
 
 #include "postgres.h"
@@ -22,6 +24,14 @@
 #include "acorn_am.h"
 #include "acorn_cost.h"
 
+/*
+ * Random page fetches charged per returned (emitted) tuple: emitting the next
+ * nearest neighbour expands one graph node — reading its neighbour list and a
+ * handful of neighbour vectors.  This is the dominant ACORN scan cost and is
+ * paid per result, so it governs the index-vs-seqscan crossover.
+ */
+#define ACORN_PAGES_PER_TUPLE	16.0
+
 void
 acorn_hnsw_costestimate(PlannerInfo *root,
 						IndexPath *path,
@@ -33,7 +43,9 @@ acorn_hnsw_costestimate(PlannerInfo *root,
 						double *indexPages)
 {
 	GenericCosts costs;
-	double		ratio;
+	double		spc_seq_cost;
+	double		spc_rand_cost;
+	double		n_tuples;
 
 	/* Never use the index without an ORDER BY (it only answers nearest-k) */
 	if (path->indexorderbys == NULL)
@@ -49,19 +61,30 @@ acorn_hnsw_costestimate(PlannerInfo *root,
 	MemSet(&costs, 0, sizeof(costs));
 	genericcostestimate(root, path, loop_count, &costs);
 
-	/*
-	 * HNSW visits roughly O(log N) nodes, a small fraction of the index.  Use
-	 * a conservative fraction so the index beats a seq scan but the planner
-	 * still accounts for graph traversal work.
-	 */
-	if (path->indexinfo->tuples > 1)
-		ratio = log(path->indexinfo->tuples) / path->indexinfo->tuples;
-	else
-		ratio = 1;
-	if (ratio > 1)
-		ratio = 1;
+	get_tablespace_page_costs(path->indexinfo->reltablespace,
+							  &spc_rand_cost, &spc_seq_cost);
 
-	costs.indexStartupCost = costs.indexTotalCost * ratio;
+	n_tuples = costs.numIndexTuples;
+	if (n_tuples < 1)
+		n_tuples = path->indexinfo->tuples;
+	if (n_tuples < 1)
+		n_tuples = 1;
+
+	/*
+	 * ACORN/HNSW cost model.  Unlike an ordinary index, the dominant cost is
+	 * paid *per returned tuple*: emitting the next nearest neighbour expands a
+	 * graph node, reading its neighbour list plus several neighbour vectors
+	 * (~ACORN_PAGES_PER_TUPLE random page fetches).  Because the WHERE predicate
+	 * is a heap Filter (not an index qual), a low-selectivity filter forces the
+	 * executor to pull ~k/selectivity ordered tuples before its LIMIT is met, so
+	 * this per-tuple price makes the index correctly expensive at low
+	 * selectivity / small tables (seq scan wins) and cheap only at high
+	 * selectivity on large tables (index wins).  Startup is the greedy descent
+	 * to the base-layer entry point (~log N page reads).
+	 */
+	costs.indexStartupCost = log(Max(n_tuples, 2.0)) * spc_rand_cost;
+	costs.indexTotalCost = costs.indexStartupCost
+		+ n_tuples * ACORN_PAGES_PER_TUPLE * spc_rand_cost;
 
 	*indexStartupCost = costs.indexStartupCost;
 	*indexTotalCost = costs.indexTotalCost;

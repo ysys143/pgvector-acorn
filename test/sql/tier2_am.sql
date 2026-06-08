@@ -24,6 +24,11 @@ FROM generate_series(1, 200) i;
 CREATE INDEX items_acorn_idx ON items USING acorn_hnsw (embedding vector_cosine_ops)
   WITH (m = 8, ef_construction = 32, acorn_gamma = 1);
 
+-- Force the index: on a 200-row table a seq scan is (correctly) cheaper, so we
+-- disable it to exercise and assert the acorn_hnsw Index Scan path itself.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
 -- planner must use Index Scan on acorn_hnsw (not Seq Scan)
 EXPLAIN (COSTS OFF)
 SELECT id FROM items
@@ -47,5 +52,8 @@ CREATE INDEX items_acorn_g2 ON items USING acorn_hnsw (embedding vector_cosine_o
 SELECT indexname FROM pg_indexes
 WHERE tablename = 'items' AND indexdef LIKE '%acorn_hnsw%'
 ORDER BY indexname;
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
 
 DROP SCHEMA test_tier2 CASCADE;

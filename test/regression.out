@@ -1,0 +1,2 @@
+# using postmaster on Unix socket, default port
+ok 1         - smoke                                     464 ms
