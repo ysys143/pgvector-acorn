@@ -13,18 +13,18 @@ services:
     volumes:
       - ..:/workspace
       - pgdata:/var/lib/postgresql/data
+      - ../docker/bench-initdb.d:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 3s
-      retries: 10
-    command: >
+      retries: 15
+    entrypoint: >
       bash -c "
-        docker-entrypoint.sh postgres &
-        sleep 5
-        psql -U postgres -c 'CREATE EXTENSION IF NOT EXISTS vector;'
-        psql -U postgres -c 'CREATE EXTENSION IF NOT EXISTS pg_acorn;'
-        wait
+        cd /workspace &&
+        make PG_CONFIG=$$PG_CONFIG install &&
+        exec docker-entrypoint.sh postgres
+          -c shared_preload_libraries='pg_acorn'
       "
 
   qdrant:
@@ -47,7 +47,7 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - ..:/workspace
     working_dir: /workspace

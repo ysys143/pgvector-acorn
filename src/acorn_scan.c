@@ -27,6 +27,7 @@
 #include "acorn_scan.h"
 #include "hnsw_compat.h"
 #include "acorn_t2_page.h"
+#include "pg_acorn.h"
 
 /* -----------------------------------------------------------------------
  * Internal element reference
@@ -813,6 +814,40 @@ acorn_stream_next(AcornStreamScan *s, ItemPointerData *heaptid_out)
  * filter-passing nodes go to both C and R (candidate + result).
  * ----------------------------------------------------------------------- */
 
+/* Per-query element metadata cache (Phase 1).
+ * Stores heaptid, filter_val, nbr_tid, deleted per visited node.
+ * Eliminates the double element-page read previously in acorn_t2_stream_expand.
+ * Vectors are NOT cached (too large); only scalar metadata is stored. */
+typedef struct AcornT2CacheEntry
+{
+	ItemPointerData indextid;	/* HTAB key (blkno, offno) */
+	ItemPointerData heaptid;
+	int64			filter_val;
+	BlockNumber		nbr_blkno;	/* neighbor-list page of this node (for 2-hop) */
+	OffsetNumber	nbr_offno;
+	bool			deleted;
+} AcornT2CacheEntry;
+
+/* Persistent in-filter streaming frontier for Tier 2. */
+struct AcornT2StreamScan
+{
+	Relation		index;
+	FmgrInfo		dist_proc;
+	Datum			query;
+	int				m;
+	pairingheap	   *C;			/* candidates to expand (min-heap) */
+	pairingheap	   *R;			/* discovered passing nodes, awaiting emit */
+	HTAB		   *visited;
+	MemoryContext	mcxt;
+	bool			exhausted;
+	ScanKey			keys;		/* filter ScanKeys (lives in caller's memory) */
+	int				nkeys;
+	HTAB		   *node_cache;	/* AcornT2CacheEntry keyed by indextid (Phase 1) */
+	bool			enable_2hop;/* snapshot of pg_acorn.enable_2hop at scan start */
+	pairingheap	   *D;			/* deferred 1-hop failures sorted by distance (NaviX) */
+	int				k_d;		/* max 2-hop expansions flushed per expand step */
+};
+
 /*
  * Load a Tier-2 element tuple.  Mirrors acorn_load_element but casts to
  * AcornT2ElementTuple and also returns filter_val (may be NULL).
@@ -872,6 +907,85 @@ acorn_t2_distance(Relation index, BlockNumber blkno, OffsetNumber offno,
 
 	UnlockReleaseBuffer(buf);
 	return DatumGetFloat8(result);
+}
+
+/*
+ * Combined distance + metadata load for T2 scan nodes (Phase 1).
+ *
+ * On cache miss: reads the element page once and extracts both the distance
+ * (from the inline vector) and all metadata (heaptid, filter_val, nbr_tid,
+ * deleted), then stores metadata in node_cache.
+ *
+ * On cache hit: metadata comes from cache; the page is still read for the
+ * vector (distance recompute) but no separate load_element call is needed.
+ *
+ * Net effect: halves element-page I/O per expansion compared to the previous
+ * acorn_t2_distance() + acorn_t2_load_element() two-call pattern.
+ */
+static double
+acorn_t2_load_node(AcornT2StreamScan *s,
+				   BlockNumber blkno, OffsetNumber offno,
+				   ItemPointerData *heaptid_out,
+				   bool            *deleted_out,
+				   int64           *filter_val_out,
+				   BlockNumber     *nbr_blkno_out,
+				   OffsetNumber    *nbr_offno_out)
+{
+	ItemPointerData		tid;
+	AcornT2CacheEntry  *ce;
+	bool				found;
+	double				dist;
+
+	ItemPointerSet(&tid, blkno, offno);
+	ce = hash_search(s->node_cache, &tid, HASH_FIND, &found);
+
+	if (found)
+	{
+		*heaptid_out    = ce->heaptid;
+		*deleted_out    = ce->deleted;
+		*filter_val_out = ce->filter_val;
+		*nbr_blkno_out  = ce->nbr_blkno;
+		*nbr_offno_out  = ce->nbr_offno;
+		/* vector not cached — read page for distance only */
+		dist = acorn_t2_distance(s->index, blkno, offno, s->query, &s->dist_proc);
+		return dist;
+	}
+
+	/* Cache miss: single page read for both distance and metadata */
+	{
+		Buffer				buf;
+		Page				page;
+		AcornT2ElementTuple etup;
+
+		buf  = ReadBuffer(s->index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		etup = (AcornT2ElementTuple)
+			   PageGetItem(page, PageGetItemId(page, offno));
+
+		dist = DatumGetFloat8(
+			FunctionCall2(&s->dist_proc,
+						  PointerGetDatum(AcornT2ElementTupleGetVector(etup)),
+						  s->query));
+
+		*heaptid_out    = etup->heaptids[0];
+		*deleted_out    = (etup->deleted != 0);
+		*filter_val_out = etup->filter_val;
+		*nbr_blkno_out  = ItemPointerGetBlockNumber(&etup->neighbortid);
+		*nbr_offno_out  = ItemPointerGetOffsetNumber(&etup->neighbortid);
+
+		UnlockReleaseBuffer(buf);
+	}
+
+	/* Populate cache with metadata for future lookups */
+	ce = hash_search(s->node_cache, &tid, HASH_ENTER, &found);
+	ce->heaptid    = *heaptid_out;
+	ce->filter_val = *filter_val_out;
+	ce->nbr_blkno  = *nbr_blkno_out;
+	ce->nbr_offno  = *nbr_offno_out;
+	ce->deleted    = *deleted_out;
+
+	return dist;
 }
 
 /*
@@ -961,21 +1075,75 @@ acorn_t2_greedy_descent(Relation index, int m,
 	}
 }
 
-/* Persistent in-filter streaming frontier for Tier 2. */
-struct AcornT2StreamScan
+/*
+ * Expand 2-hop neighbors of a 1-hop filter-failure node (Phase 2A/2B).
+ *
+ * fail_nbr_blkno/offno: the neighbor-list page of the failing node — already
+ * known from acorn_t2_load_node(), so no extra element page read is needed.
+ *
+ * Buffer safety: every ReadBuffer is immediately UnlockReleased before the
+ * next, preventing self-deadlock on shared buffers.
+ */
+static void
+acorn_t2_expand_2hop(AcornT2StreamScan *s,
+					 BlockNumber fail_nbr_blkno, OffsetNumber fail_nbr_offno)
 {
-	Relation		index;
-	FmgrInfo		dist_proc;
-	Datum			query;
-	int				m;
-	pairingheap	   *C;			/* candidates to expand (min-heap) */
-	pairingheap	   *R;			/* discovered passing nodes, awaiting emit */
-	HTAB		   *visited;
-	MemoryContext	mcxt;
-	bool			exhausted;
-	ScanKey			keys;		/* filter ScanKeys (lives in caller's memory) */
-	int				nkeys;
-};
+	ItemPointerData hop2_neighbors[HNSW_MAX_NEIGHBORS];
+	int				n2_count;
+
+	n2_count = acorn_get_neighbors(s->index,
+								   fail_nbr_blkno, fail_nbr_offno,
+								   0, 0, s->m,
+								   hop2_neighbors, HNSW_MAX_NEIGHBORS);
+
+	for (int j = 0; j < n2_count; j++)
+	{
+		BlockNumber		h2blkno;
+		OffsetNumber	h2offno;
+		double			h2d;
+		ItemPointerData h2heaptid;
+		bool			h2deleted;
+		int64			h2fval;
+		BlockNumber		h2_nbr_blkno;
+		OffsetNumber	h2_nbr_offno;
+		AcornPQNode	   *cn;
+
+		if (!ItemPointerIsValid(&hop2_neighbors[j]))
+			continue;
+		if (is_visited(s->visited, &hop2_neighbors[j]))
+			continue;
+		mark_visited(s->visited, &hop2_neighbors[j]);
+
+		h2blkno = ItemPointerGetBlockNumber(&hop2_neighbors[j]);
+		h2offno = ItemPointerGetOffsetNumber(&hop2_neighbors[j]);
+
+		h2d = acorn_t2_load_node(s, h2blkno, h2offno,
+								  &h2heaptid, &h2deleted,
+								  &h2fval,
+								  &h2_nbr_blkno, &h2_nbr_offno);
+
+		/* Always add to C — ACORN invariant at 2-hop level */
+		cn = palloc(sizeof(AcornPQNode));
+		ItemPointerCopy(&hop2_neighbors[j], &cn->elem.indextid);
+		ItemPointerSetInvalid(&cn->elem.heaptid);
+		cn->elem.distance = h2d;
+		pairingheap_add(s->C, &cn->ph_node);
+
+		if (h2deleted)
+			continue;
+
+		if (acorn_t2_eval_filter(s->keys, s->nkeys, h2fval))
+		{
+			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+
+			ItemPointerCopy(&hop2_neighbors[j], &rn->elem.indextid);
+			ItemPointerCopy(&h2heaptid, &rn->elem.heaptid);
+			rn->elem.distance = h2d;
+			pairingheap_add(s->R, &rn->ph_node);
+		}
+		/* 2-hop failure: C only — no further recursion (capped at 2-hop) */
+	}
+}
 
 /*
  * Expand one T2 candidate: add unvisited layer-0 neighbors to C; add to R
@@ -1011,12 +1179,10 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		OffsetNumber	noffno;
 		double			nd;
 		ItemPointerData nheaptid;
-		int				nlevel;
 		bool			ndeleted;
 		BlockNumber		n_nbr_blkno;
 		OffsetNumber	n_nbr_offno;
 		int64			nfilter_val;
-		Buffer			nbuf;
 		AcornPQNode	   *cn;
 
 		if (!ItemPointerIsValid(&neighbors[i]))
@@ -1027,8 +1193,11 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 
 		nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
 		noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
-		nd     = acorn_t2_distance(s->index, nblkno, noffno,
-								   s->query, &s->dist_proc);
+
+		/* Phase 1: single page read for distance + metadata (no double-read) */
+		nd = acorn_t2_load_node(s, nblkno, noffno,
+								 &nheaptid, &ndeleted, &nfilter_val,
+								 &n_nbr_blkno, &n_nbr_offno);
 
 		/* Always add to C — ACORN invariant: preserve connectivity */
 		cn = palloc(sizeof(AcornPQNode));
@@ -1037,23 +1206,47 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		cn->elem.distance = nd;
 		pairingheap_add(s->C, &cn->ph_node);
 
-		/* Load heaptid, deleted flag, and stored filter value */
-		nbuf = acorn_t2_load_element(s->index, nblkno, noffno,
-									  &nheaptid, &nlevel, &ndeleted,
-									  &n_nbr_blkno, &n_nbr_offno, &nfilter_val);
-		UnlockReleaseBuffer(nbuf);
-
 		if (ndeleted)
 			continue;
 
-		/* Add to R only when filter passes — no heap fetch needed */
 		if (acorn_t2_eval_filter(s->keys, s->nkeys, nfilter_val))
 		{
 			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+
 			ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
 			ItemPointerCopy(&nheaptid, &rn->elem.heaptid);
 			rn->elem.distance = nd;
 			pairingheap_add(s->R, &rn->ph_node);
+		}
+		else if (s->enable_2hop && s->D != NULL)
+		{
+			/* Phase 2B (NaviX-Directed): defer to D, sorted by distance */
+			AcornPQNode *dn = palloc(sizeof(AcornPQNode));
+
+			ItemPointerCopy(&neighbors[i], &dn->elem.indextid);
+			/* Repurpose heaptid slot to carry the failure's nbr page coords */
+			ItemPointerSet(&dn->elem.heaptid,
+						   (BlockNumber) n_nbr_blkno,
+						   (OffsetNumber) n_nbr_offno);
+			dn->elem.distance = nd;
+			pairingheap_add(s->D, &dn->ph_node);
+		}
+	}
+
+	/* NaviX flush: expand the k_d closest deferred 1-hop failures */
+	if (s->enable_2hop && s->D != NULL)
+	{
+		int expanded = 0;
+
+		while (expanded < s->k_d && !pairingheap_is_empty(s->D))
+		{
+			AcornPQNode *dn  = (AcornPQNode *) pairingheap_remove_first(s->D);
+			BlockNumber  nb  = ItemPointerGetBlockNumber(&dn->elem.heaptid);
+			OffsetNumber no  = ItemPointerGetOffsetNumber(&dn->elem.heaptid);
+
+			pfree(dn);
+			acorn_t2_expand_2hop(s, nb, no);
+			expanded++;
 		}
 	}
 }
@@ -1103,27 +1296,41 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->visited = hash_create("acorn_t2_stream_visited", 512, &info,
 							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
+	/* Phase 1: node metadata cache — eliminates double element-page reads */
+	memset(&info, 0, sizeof(info));
+	info.keysize   = sizeof(ItemPointerData);
+	info.entrysize = sizeof(AcornT2CacheEntry);
+	info.hcxt      = mcxt;
+	s->node_cache = hash_create("acorn_t2_node_cache", 1024, &info,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Phase 2: 2-hop NaviX-Directed expansion (only useful with a filter) */
+	s->enable_2hop = (nkeys > 0) && acorn_enable_2hop;
+	s->D           = NULL;
+	s->k_d         = 0;
+	if (s->enable_2hop)
+	{
+		s->D   = pairingheap_allocate(pq_cmp_min, NULL);
+		s->k_d = Max(m / 2, 4);
+	}
+
 	/* Seed the frontier with the base-layer entry point */
 	{
 		ItemPointerData entry_tid;
 		ItemPointerData heaptid;
-		int				lvl;
 		bool			deleted;
 		BlockNumber		nb;
 		OffsetNumber	no;
 		int64			fval;
-		Buffer			eb;
 		double			d;
 		AcornPQNode	   *cn;
 
 		ItemPointerSet(&entry_tid, entry_blkno, entry_offno);
 		mark_visited(s->visited, &entry_tid);
 
-		d  = acorn_t2_distance(index, entry_blkno, entry_offno,
-							   query, &s->dist_proc);
-		eb = acorn_t2_load_element(index, entry_blkno, entry_offno,
-								    &heaptid, &lvl, &deleted, &nb, &no, &fval);
-		UnlockReleaseBuffer(eb);
+		/* Phase 1: combined load (single page read for entry point) */
+		d = acorn_t2_load_node(s, entry_blkno, entry_offno,
+							   &heaptid, &deleted, &fval, &nb, &no);
 
 		cn = palloc(sizeof(AcornPQNode));
 		ItemPointerCopy(&entry_tid, &cn->elem.indextid);
@@ -1134,6 +1341,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		if (!deleted && acorn_t2_eval_filter(keys, nkeys, fval))
 		{
 			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+
 			ItemPointerCopy(&entry_tid, &rn->elem.indextid);
 			ItemPointerCopy(&heaptid, &rn->elem.heaptid);
 			rn->elem.distance = d;
@@ -1168,6 +1376,22 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			AcornElem	 ce = cn->elem;
 			pfree(cn);
 			acorn_t2_stream_expand(s, &ce);
+			continue;
+		}
+
+		/* NaviX Phase 2B: C exhausted but deferred failures remain — flush D */
+		if (pairingheap_is_empty(s->C) && s->D != NULL &&
+			!pairingheap_is_empty(s->D))
+		{
+			while (!pairingheap_is_empty(s->D))
+			{
+				AcornPQNode *dn  = (AcornPQNode *) pairingheap_remove_first(s->D);
+				BlockNumber  nb  = ItemPointerGetBlockNumber(&dn->elem.heaptid);
+				OffsetNumber no  = ItemPointerGetOffsetNumber(&dn->elem.heaptid);
+
+				pfree(dn);
+				acorn_t2_expand_2hop(s, nb, no);
+			}
 			continue;
 		}
 
