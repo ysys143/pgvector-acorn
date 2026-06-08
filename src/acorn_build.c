@@ -964,11 +964,30 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	int				m_eff = acorn_m_eff(index);
 	int				efc   = acorn_opt_ef_construction(index);
 	int				dims  = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
+	int				m_req = acorn_opt_m(index);
+	int				gamma = acorn_opt_gamma(index);
 	AcornBuildState bs;
 	double			reltuples = 0;
 
 	if (dims < 0)
 		dims = 0;
+
+	/*
+	 * ACORN-gamma page-budget guard (paper §10/§12.3).  pgvector's neighbor
+	 * tuple must fit one 8KB page: (level+2) * m_eff * sizeof(ItemPointerData).
+	 * Levels are already capped at ACORN_MAX_LEVEL, so the page never
+	 * overflows; the surprising effect a user actually hits is m_eff being
+	 * silently clamped to HNSW_MAX_M when m*gamma exceeds it — meaning the
+	 * requested gamma is not fully applied.  Warn so the user can lower gamma
+	 * or m rather than wonder why recall/latency does not change with gamma.
+	 */
+	if (m_req * gamma > HNSW_MAX_M)
+		ereport(WARNING,
+				(errmsg("acorn_gamma=%d with m=%d requests %d neighbors per node, "
+						"clamped to m_eff=%d (HNSW page limit %d)",
+						gamma, m_req, m_req * gamma, m_eff, HNSW_MAX_M),
+				 errhint("Lower acorn_gamma or m so that m*gamma <= %d to apply gamma fully.",
+						 HNSW_MAX_M)));
 
 	acorn_create_meta_page(index, forkNum, m_eff, efc, dims);
 
