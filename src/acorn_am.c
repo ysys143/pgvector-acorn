@@ -13,6 +13,7 @@
 #include <float.h>
 
 #include "access/amapi.h"
+#include "access/generic_xlog.h"
 #include "access/genam.h"
 #include "access/relscan.h"
 #include "access/reloptions.h"
@@ -220,20 +221,31 @@ acorn_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	/* Block 0 is the metapage — skip it */
 	for (blkno = 1; blkno < nblocks; blkno++)
 	{
-		Buffer		 buf;
-		Page		 page;
-		OffsetNumber off, maxoff;
-		bool		 page_modified = false;
+		Buffer			  buf;
+		Page			  page;
+		OffsetNumber	  off, maxoff;
+		bool			  page_modified = false;
+		bool			  needs_wal = RelationNeedsWAL(info->index);
+		GenericXLogState *state = NULL;
 
 		CHECK_FOR_INTERRUPTS();
 
-		buf  = ReadBufferExtended(info->index, MAIN_FORKNUM, blkno,
-								  RBM_NORMAL, info->strategy);
+		buf = ReadBufferExtended(info->index, MAIN_FORKNUM, blkno,
+								 RBM_NORMAL, info->strategy);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buf);
+
+		if (needs_wal)
+		{
+			state = GenericXLogStart(info->index);
+			page  = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+		}
+		else
+			page = BufferGetPage(buf);
 
 		if (!HnswPageIsValid(page))
 		{
+			if (state)
+				GenericXLogAbort(state);
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
@@ -255,10 +267,7 @@ acorn_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				continue;
 
 			if (etup->deleted)
-			{
-				stats->tuples_removed++;
 				continue;
-			}
 
 			/* Element is dead when every valid heaptid passes the callback */
 			any_live = false;
@@ -282,7 +291,15 @@ acorn_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		}
 
 		if (page_modified)
-			MarkBufferDirty(buf);
+		{
+			if (state)
+				GenericXLogFinish(state);
+			else
+				MarkBufferDirty(buf);
+		}
+		else if (state)
+			GenericXLogAbort(state);
+
 		UnlockReleaseBuffer(buf);
 	}
 

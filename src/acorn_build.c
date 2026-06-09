@@ -26,6 +26,7 @@
 #include <math.h>
 
 #include "access/amapi.h"
+#include "access/generic_xlog.h"
 #include "access/genam.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -216,15 +217,24 @@ acorn_index_m(Relation index)
  */
 static void
 acorn_maybe_update_entry(Relation index, BlockNumber blkno, OffsetNumber offno,
-						 int level)
+						 int level, bool use_wal)
 {
-	Buffer		 buf;
-	Page		 page;
-	HnswMetaPage metap;
+	Buffer			  buf;
+	Page			  page;
+	HnswMetaPage	  metap;
+	GenericXLogState *state = NULL;
 
-	buf   = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	page  = BufferGetPage(buf);
+
+	if (use_wal)
+	{
+		state = GenericXLogStart(index);
+		page  = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+	}
+	else
+		page = BufferGetPage(buf);
+
 	metap = HnswPageGetMeta(page);
 
 	if (!BlockNumberIsValid(metap->entryBlkno) || level > (int) metap->entryLevel)
@@ -232,8 +242,14 @@ acorn_maybe_update_entry(Relation index, BlockNumber blkno, OffsetNumber offno,
 		metap->entryBlkno = blkno;
 		metap->entryOffno = offno;
 		metap->entryLevel = (int16) level;
-		MarkBufferDirty(buf);
+		if (state)
+			GenericXLogFinish(state);
+		else
+			MarkBufferDirty(buf);
 	}
+	else if (state)
+		GenericXLogAbort(state);
+
 	UnlockReleaseBuffer(buf);
 }
 
@@ -243,44 +259,69 @@ acorn_maybe_update_entry(Relation index, BlockNumber blkno, OffsetNumber offno,
  */
 static void
 acorn_append_tuple(Relation index, ForkNumber forkNum, Item tup, Size size,
-				   BlockNumber *blkno_out, OffsetNumber *off_out)
+				   BlockNumber *blkno_out, OffsetNumber *off_out, bool use_wal)
 {
-	BlockNumber  nblocks = RelationGetNumberOfBlocksInFork(index, forkNum);
-	Buffer		 buf;
-	Page		 page;
-	OffsetNumber off;
+	BlockNumber		  nblocks = RelationGetNumberOfBlocksInFork(index, forkNum);
+	Buffer			  buf;
+	Page			  page;
+	OffsetNumber	  off;
+	GenericXLogState *state;
 
 	/* block 0 is the meta page; data starts at block 1 */
 	if (nblocks > 1)
 	{
-		buf  = ReadBufferExtended(index, forkNum, nblocks - 1, RBM_NORMAL, NULL);
+		buf = ReadBufferExtended(index, forkNum, nblocks - 1, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		page = BufferGetPage(buf);
+
+		if (use_wal)
+		{
+			state = GenericXLogStart(index);
+			page  = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+		}
+		else
+			page = BufferGetPage(buf);
 
 		if (PageGetFreeSpace(page) >= size)
 		{
 			off = PageAddItem(page, tup, size, InvalidOffsetNumber, false, false);
 			if (off == InvalidOffsetNumber)
 				elog(ERROR, "acorn_hnsw: failed to add index tuple");
-			MarkBufferDirty(buf);
+			if (use_wal)
+				GenericXLogFinish(state);
+			else
+				MarkBufferDirty(buf);
 			*blkno_out = nblocks - 1;
 			*off_out   = off;
 			UnlockReleaseBuffer(buf);
 			return;
 		}
+		if (use_wal)
+			GenericXLogAbort(state);
 		UnlockReleaseBuffer(buf);
 	}
 
 	LockRelationForExtension(index, ExclusiveLock);
 	buf = acorn_new_buffer(index, forkNum);
 	UnlockRelationForExtension(index, ExclusiveLock);
-	page = BufferGetPage(buf);
+
+	if (use_wal)
+	{
+		state = GenericXLogStart(index);
+		page  = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+	}
+	else
+		page = BufferGetPage(buf);
+
 	acorn_init_page(buf, page);
 
 	off = PageAddItem(page, tup, size, InvalidOffsetNumber, false, false);
 	if (off == InvalidOffsetNumber)
 		elog(ERROR, "acorn_hnsw: tuple too large for page");
-	MarkBufferDirty(buf);
+
+	if (use_wal)
+		GenericXLogFinish(state);
+	else
+		MarkBufferDirty(buf);
 	*blkno_out = BufferGetBlockNumber(buf);
 	*off_out   = off;
 	UnlockReleaseBuffer(buf);
@@ -946,7 +987,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 		ntup->count   = (uint16) ((node->level + 2) * m_eff);
 
 		acorn_append_tuple(index, forkNum, (Item) ntup, ntup_sz,
-						   &blkno_out, &off_out);
+						   &blkno_out, &off_out, false);
 		Assert(blkno_out == node->nbr_blkno && off_out == node->nbr_offno);
 		pfree(ntup);
 	}
@@ -970,7 +1011,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 			   DatumGetPointer(node->vec), node->vsize);
 
 		acorn_append_tuple(index, forkNum, (Item) etup, etup_sz,
-						   &blkno_out, &off_out);
+						   &blkno_out, &off_out, false);
 		Assert(blkno_out == node->elem_blkno && off_out == node->elem_offno);
 		pfree(etup);
 	}
@@ -1016,7 +1057,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	{
 		AcornMemNode *ep = &mb->nodes[mb->entry_id];
 		acorn_maybe_update_entry(index, ep->elem_blkno, ep->elem_offno,
-								  ep->level);
+								  ep->level, false);
 	}
 }
 
@@ -1350,13 +1391,29 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 		return;		/* E is not closer than any existing neighbor */
 
 	/* --- Phase 2: write the chosen slot under EXCLUSIVE --- */
-	buf  = ReadBufferExtended(index, forkNum, n_nbr_blk, RBM_NORMAL, NULL);
+	buf = ReadBufferExtended(index, forkNum, n_nbr_blk, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	page = BufferGetPage(buf);
-	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, n_nbr_off));
-	tids = HnswNeighborTupleGetTids(ntup);
-	ItemPointerSet(&tids[start + target], e_blk, e_off);
-	MarkBufferDirty(buf);
+
+	if (RelationNeedsWAL(index))
+	{
+		GenericXLogState *state;
+
+		state = GenericXLogStart(index);
+		page  = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+		ntup  = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, n_nbr_off));
+		tids  = HnswNeighborTupleGetTids(ntup);
+		ItemPointerSet(&tids[start + target], e_blk, e_off);
+		GenericXLogFinish(state);
+	}
+	else
+	{
+		page = BufferGetPage(buf);
+		ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, n_nbr_off));
+		tids = HnswNeighborTupleGetTids(ntup);
+		ItemPointerSet(&tids[start + target], e_blk, e_off);
+		MarkBufferDirty(buf);
+	}
+
 	UnlockReleaseBuffer(buf);
 }
 
@@ -1462,7 +1519,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	}
 
 	/* Step 5: write neighbor tuple to disk */
-	acorn_append_tuple(index, forkNum, (Item) ntup, ntupSize, &n_blk, &n_off);
+	acorn_append_tuple(index, forkNum, (Item) ntup, ntupSize, &n_blk, &n_off,
+					   RelationNeedsWAL(index));
 
 	/* Step 6: write element tuple (level, heaptids, neighbortid, filter_val, vector) */
 	etup              = palloc0(etupSize);
@@ -1478,10 +1536,11 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	etup->filter_val  = filter_val;
 	memcpy(AcornT2ElementTupleGetVector(etup), DatumGetPointer(value), vsize);
 
-	acorn_append_tuple(index, forkNum, (Item) etup, etupSize, &e_blk, &e_off);
+	acorn_append_tuple(index, forkNum, (Item) etup, etupSize, &e_blk, &e_off,
+					   RelationNeedsWAL(index));
 
 	/* Step 7: update meta entry point if this element has the highest level */
-	acorn_maybe_update_entry(index, e_blk, e_off, l_new);
+	acorn_maybe_update_entry(index, e_blk, e_off, l_new, RelationNeedsWAL(index));
 
 	/* Step 8: add reverse edges at each layer with fixed-slot retry */
 	if (has_entry)
