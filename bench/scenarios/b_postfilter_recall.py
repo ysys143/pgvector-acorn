@@ -27,7 +27,7 @@ def run_cte(conn: psycopg.Connection, query: np.ndarray,
             WITH candidates AS (
                 SELECT id, bucket
                 FROM bench_items
-                ORDER BY embedding <-> %s
+                ORDER BY embedding <-> %s::vector
                 LIMIT %s
             )
             SELECT id FROM candidates
