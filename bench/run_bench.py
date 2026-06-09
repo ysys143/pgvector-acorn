@@ -121,7 +121,7 @@ def main() -> None:
                     cur.execute("SET enable_indexscan=off; SET enable_bitmapscan=off")
                     cur.execute(
                         "SELECT id FROM bench_items WHERE bucket<%s "
-                        "ORDER BY embedding<->%s LIMIT 10",
+                        "ORDER BY embedding<->%s::vector LIMIT 10",
                         (sel, q.tolist()),
                     )
                     ids = [r[0] for r in cur.fetchall()]
