@@ -19,13 +19,13 @@ services:
       interval: 5s
       timeout: 3s
       retries: 15
-    entrypoint: >
-      bash -c "
+    entrypoint:
+      - bash
+      - -c
+      - |
         cd /workspace &&
         make PG_CONFIG=$$PG_CONFIG install &&
-        exec docker-entrypoint.sh postgres
-          -c shared_preload_libraries='pg_acorn'
-      "
+        exec docker-entrypoint.sh postgres -c shared_preload_libraries=pg_acorn
 
   qdrant:
     image: qdrant/qdrant:v1.16.0

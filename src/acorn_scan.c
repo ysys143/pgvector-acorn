@@ -845,7 +845,6 @@ struct AcornT2StreamScan
 	HTAB		   *node_cache;	/* AcornT2CacheEntry keyed by indextid (Phase 1) */
 	bool			enable_2hop;/* snapshot of pg_acorn.enable_2hop at scan start */
 	pairingheap	   *D;			/* deferred 1-hop failures sorted by distance (NaviX) */
-	int				k_d;		/* max 2-hop expansions flushed per expand step */
 };
 
 /*
@@ -1233,22 +1232,6 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		}
 	}
 
-	/* NaviX flush: expand the k_d closest deferred 1-hop failures */
-	if (s->enable_2hop && s->D != NULL)
-	{
-		int expanded = 0;
-
-		while (expanded < s->k_d && !pairingheap_is_empty(s->D))
-		{
-			AcornPQNode *dn  = (AcornPQNode *) pairingheap_remove_first(s->D);
-			BlockNumber  nb  = ItemPointerGetBlockNumber(&dn->elem.heaptid);
-			OffsetNumber no  = ItemPointerGetOffsetNumber(&dn->elem.heaptid);
-
-			pfree(dn);
-			acorn_t2_expand_2hop(s, nb, no);
-			expanded++;
-		}
-	}
 }
 
 AcornT2StreamScan *
@@ -1307,12 +1290,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	/* Phase 2: 2-hop NaviX-Directed expansion (only useful with a filter) */
 	s->enable_2hop = (nkeys > 0) && acorn_enable_2hop;
 	s->D           = NULL;
-	s->k_d         = 0;
 	if (s->enable_2hop)
-	{
-		s->D   = pairingheap_allocate(pq_cmp_min, NULL);
-		s->k_d = Max(m / 2, 4);
-	}
+		s->D = pairingheap_allocate(pq_cmp_min, NULL);
 
 	/* Seed the frontier with the base-layer entry point */
 	{
@@ -1369,6 +1348,30 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			: ((AcornPQNode *) pairingheap_first(s->R))->elem.distance;
 		double c_dist = pairingheap_is_empty(s->C) ? DBL_MAX
 			: ((AcornPQNode *) pairingheap_first(s->C))->elem.distance;
+
+		/*
+		 * Distance-triggered D drain: inject one 2-hop expansion when the
+		 * closest deferred failure is nearer than the C frontier.  This
+		 * avoids contaminating C with distant 2-hop candidates before the
+		 * main scan has converged.  One node per iteration keeps the loop
+		 * re-evaluating c_dist after each expansion.
+		 */
+		if (s->D != NULL && !pairingheap_is_empty(s->D))
+		{
+			double d_dist =
+				((AcornPQNode *) pairingheap_first(s->D))->elem.distance;
+
+			if (d_dist < c_dist)
+			{
+				AcornPQNode *dn  = (AcornPQNode *) pairingheap_remove_first(s->D);
+				BlockNumber  nb  = ItemPointerGetBlockNumber(&dn->elem.heaptid);
+				OffsetNumber no  = ItemPointerGetOffsetNumber(&dn->elem.heaptid);
+
+				pfree(dn);
+				acorn_t2_expand_2hop(s, nb, no);
+				continue;
+			}
+		}
 
 		if (!pairingheap_is_empty(s->C) && c_dist <= r_dist)
 		{
