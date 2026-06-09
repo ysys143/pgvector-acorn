@@ -814,20 +814,6 @@ acorn_stream_next(AcornStreamScan *s, ItemPointerData *heaptid_out)
  * filter-passing nodes go to both C and R (candidate + result).
  * ----------------------------------------------------------------------- */
 
-/* Per-query element metadata cache (Phase 1).
- * Stores heaptid, filter_val, nbr_tid, deleted per visited node.
- * Eliminates the double element-page read previously in acorn_t2_stream_expand.
- * Vectors are NOT cached (too large); only scalar metadata is stored. */
-typedef struct AcornT2CacheEntry
-{
-	ItemPointerData indextid;	/* HTAB key (blkno, offno) */
-	ItemPointerData heaptid;
-	int64			filter_val;
-	BlockNumber		nbr_blkno;	/* neighbor-list page of this node (for 2-hop) */
-	OffsetNumber	nbr_offno;
-	bool			deleted;
-} AcornT2CacheEntry;
-
 /* Persistent in-filter streaming frontier for Tier 2. */
 struct AcornT2StreamScan
 {
@@ -842,7 +828,6 @@ struct AcornT2StreamScan
 	bool			exhausted;
 	ScanKey			keys;		/* filter ScanKeys (lives in caller's memory) */
 	int				nkeys;
-	HTAB		   *node_cache;	/* AcornT2CacheEntry keyed by indextid (Phase 1) */
 	bool			enable_2hop;/* snapshot of pg_acorn.enable_2hop at scan start */
 	pairingheap	   *D;			/* deferred 1-hop failures sorted by distance (NaviX) */
 };
@@ -909,17 +894,9 @@ acorn_t2_distance(Relation index, BlockNumber blkno, OffsetNumber offno,
 }
 
 /*
- * Combined distance + metadata load for T2 scan nodes (Phase 1).
- *
- * On cache miss: reads the element page once and extracts both the distance
- * (from the inline vector) and all metadata (heaptid, filter_val, nbr_tid,
- * deleted), then stores metadata in node_cache.
- *
- * On cache hit: metadata comes from cache; the page is still read for the
- * vector (distance recompute) but no separate load_element call is needed.
- *
- * Net effect: halves element-page I/O per expansion compared to the previous
- * acorn_t2_distance() + acorn_t2_load_element() two-call pattern.
+ * Single page read for T2 scan nodes: extracts distance (from inline vector)
+ * and all metadata (heaptid, filter_val, nbr_tid, deleted) in one buffer pin.
+ * Halves element-page I/O vs the previous two-call pattern.
  */
 static double
 acorn_t2_load_node(AcornT2StreamScan *s,
@@ -930,60 +907,29 @@ acorn_t2_load_node(AcornT2StreamScan *s,
 				   BlockNumber     *nbr_blkno_out,
 				   OffsetNumber    *nbr_offno_out)
 {
-	ItemPointerData		tid;
-	AcornT2CacheEntry  *ce;
-	bool				found;
+	Buffer				buf;
+	Page				page;
+	AcornT2ElementTuple etup;
 	double				dist;
 
-	ItemPointerSet(&tid, blkno, offno);
-	ce = hash_search(s->node_cache, &tid, HASH_FIND, &found);
+	buf  = ReadBuffer(s->index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	etup = (AcornT2ElementTuple)
+		   PageGetItem(page, PageGetItemId(page, offno));
 
-	if (found)
-	{
-		*heaptid_out    = ce->heaptid;
-		*deleted_out    = ce->deleted;
-		*filter_val_out = ce->filter_val;
-		*nbr_blkno_out  = ce->nbr_blkno;
-		*nbr_offno_out  = ce->nbr_offno;
-		/* vector not cached — read page for distance only */
-		dist = acorn_t2_distance(s->index, blkno, offno, s->query, &s->dist_proc);
-		return dist;
-	}
+	dist = DatumGetFloat8(
+		FunctionCall2(&s->dist_proc,
+					  PointerGetDatum(AcornT2ElementTupleGetVector(etup)),
+					  s->query));
 
-	/* Cache miss: single page read for both distance and metadata */
-	{
-		Buffer				buf;
-		Page				page;
-		AcornT2ElementTuple etup;
+	*heaptid_out    = etup->heaptids[0];
+	*deleted_out    = (etup->deleted != 0);
+	*filter_val_out = etup->filter_val;
+	*nbr_blkno_out  = ItemPointerGetBlockNumber(&etup->neighbortid);
+	*nbr_offno_out  = ItemPointerGetOffsetNumber(&etup->neighbortid);
 
-		buf  = ReadBuffer(s->index, blkno);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		etup = (AcornT2ElementTuple)
-			   PageGetItem(page, PageGetItemId(page, offno));
-
-		dist = DatumGetFloat8(
-			FunctionCall2(&s->dist_proc,
-						  PointerGetDatum(AcornT2ElementTupleGetVector(etup)),
-						  s->query));
-
-		*heaptid_out    = etup->heaptids[0];
-		*deleted_out    = (etup->deleted != 0);
-		*filter_val_out = etup->filter_val;
-		*nbr_blkno_out  = ItemPointerGetBlockNumber(&etup->neighbortid);
-		*nbr_offno_out  = ItemPointerGetOffsetNumber(&etup->neighbortid);
-
-		UnlockReleaseBuffer(buf);
-	}
-
-	/* Populate cache with metadata for future lookups */
-	ce = hash_search(s->node_cache, &tid, HASH_ENTER, &found);
-	ce->heaptid    = *heaptid_out;
-	ce->filter_val = *filter_val_out;
-	ce->nbr_blkno  = *nbr_blkno_out;
-	ce->nbr_offno  = *nbr_offno_out;
-	ce->deleted    = *deleted_out;
-
+	UnlockReleaseBuffer(buf);
 	return dist;
 }
 
@@ -1278,14 +1224,6 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	info.hcxt      = mcxt;
 	s->visited = hash_create("acorn_t2_stream_visited", 512, &info,
 							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-
-	/* Phase 1: node metadata cache — eliminates double element-page reads */
-	memset(&info, 0, sizeof(info));
-	info.keysize   = sizeof(ItemPointerData);
-	info.entrysize = sizeof(AcornT2CacheEntry);
-	info.hcxt      = mcxt;
-	s->node_cache = hash_create("acorn_t2_node_cache", 1024, &info,
-								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/* Phase 2: 2-hop NaviX-Directed expansion (only useful with a filter) */
 	s->enable_2hop = (nkeys > 0) && acorn_enable_2hop;
