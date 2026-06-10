@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from targets.pgvector import PgvectorTarget
 from targets.pg_acorn import PgAcornTarget
 from targets.qdrant import QdrantTarget
+from targets.prefilter import PrefilterExactTarget
 import scenarios.a_selectivity_sweep as a_selectivity_sweep
 import scenarios.b_postfilter_recall as b_postfilter_recall
 import scenarios.c_incremental_recall as c_incremental_recall
@@ -86,6 +87,7 @@ def main() -> None:
     # ef_search is now a runtime knob swept per query (scenario A), so the 2-hop
     # no-op variants are dropped. gamma is the build-time recall knob — sweep it.
     targets = [
+        PrefilterExactTarget(args.dsn),   # exact baseline (recall 1.0); the bar to beat
         PgvectorTarget(args.dsn),
         PgAcornTarget(args.dsn, tier=1, gamma=1),
         PgAcornTarget(args.dsn, tier=2, gamma=1),
