@@ -77,7 +77,21 @@ style) without raising gamma:
 ```sql
 CREATE INDEX ON items USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
   WITH (m = 16, ef_construction = 64, acorn_payload_edges = true);
+SET pg_acorn.member_first = on;  -- spend ef_search on filter-passing nodes first
 ```
+
+`pg_acorn.member_first` (bool, default `off`): scan-side companion to payload
+edges.  The ACORN scan keeps filter-failing nodes expandable for
+connectivity; with member_first the ef_search budget prefers passing
+candidates, so once the traversal touches one partition member the
+same-partition edges let it drain the predicate subgraph directly
+(measured: recall 1.0 at ef_search=100, ~2 ms median on a 20k/128d 1%
+filter, vs 0.94 at ef_search=400 and ~24 ms without).
+
+Note on drivers: bind small integer filter constants carefully — the
+operator family includes cross-type (int2/int8) comparisons so quals like
+`bucket < $1::smallint` (psycopg's default int binding) still push down as
+index conditions.
 
 ## Installation
 
