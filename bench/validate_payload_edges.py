@@ -12,8 +12,12 @@ index configurations:
 
 at selectivity 1% (bucket < 1) and 40% (bucket < 40).
 
+Latency is reported as MEDIAN and p90 per query (NOT sum-based QPS): the
+Docker VM has a fat latency tail (p99 can be 100x the median) that dominates
+QPS = N/sum(latency) and has produced misleading comparisons before.
+
 Target: payload_edges=on reaches recall >= 0.95 at materially lower ef /
-higher QPS than off.
+lower median latency than off.
 
 DSN comes from argv[1] or PG_ACORN_DSN (default: local socket, as inside the
 self-contained test container).  Do NOT point this at the reserved
@@ -35,6 +39,7 @@ EFS = [40, 100, 200, 400]
 SELS = [1, 40]                       # bucket < sel  =>  ~sel% selectivity
 CONFIGS = [
     ("g2_off", 2, "false"),
+    ("g4_off", 4, "false"),   # the bench's current recall-plateau config
     ("g1_on",  1, "true"),
     ("g2_on",  2, "true"),
 ]
@@ -100,25 +105,29 @@ for name, gamma, payload in CONFIGS:
     for sel in SELS:
         truths = [exact_truth(q, sel, K) for q in queries]
         for ef in EFS:
-            recalls, t0 = [], time.perf_counter()
+            recalls, lats = [], []
             with conn.cursor() as cur:
                 cur.execute("SET enable_seqscan = off")
                 cur.execute(f"SET pg_acorn.ef_search = {ef}")
                 for q, truth in zip(queries, truths):
+                    t0 = time.perf_counter()
                     cur.execute(
                         "SELECT id FROM pe_items WHERE bucket < %s "
                         "ORDER BY embedding <=> %s::vector LIMIT %s",
                         (sel, qstr(q), K))
                     ids = {r[0] for r in cur.fetchall()}
+                    lats.append((time.perf_counter() - t0) * 1000.0)
                     recalls.append(len(ids & truth) / K)
-            qps = NQ / (time.perf_counter() - t0)
             rec = float(np.mean(recalls))
-            results.append((name, sel, ef, rec, qps))
+            med = float(np.median(lats))
+            p90 = float(np.percentile(lats, 90))
+            results.append((name, sel, ef, rec, med, p90))
             print(f"  {name:7s} sel={sel:>2}%  ef={ef:>4}  "
-                  f"recall={rec:.3f}  qps={qps:.1f}", flush=True)
+                  f"recall={rec:.3f}  med={med:.2f}ms  p90={p90:.2f}ms",
+                  flush=True)
 
-print("\n=== summary (recall / qps) ===")
-hdr = "config   sel%  " + "  ".join(f"ef={e:<14}" for e in EFS)
+print("\n=== summary (recall / median ms / p90 ms) ===")
+hdr = "config   sel%  " + "  ".join(f"ef={e:<22}" for e in EFS)
 print(hdr)
 for name, _, _ in CONFIGS:
     for sel in SELS:
@@ -126,7 +135,7 @@ for name, _, _ in CONFIGS:
         for ef in EFS:
             row = next(r for r in results
                        if r[0] == name and r[1] == sel and r[2] == ef)
-            cells.append(f"{row[3]:.3f}/{row[4]:7.1f}   ")
+            cells.append(f"{row[3]:.3f}/{row[4]:6.2f}/{row[5]:7.2f}   ")
         print(f"{name:8s} {sel:>3}   " + "".join(cells))
 
 with conn.cursor() as cur:
