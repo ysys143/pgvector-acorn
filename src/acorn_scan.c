@@ -323,6 +323,57 @@ acorn_resolve_direct_dist(Relation index)
 }
 
 /*
+ * Single page read for tier1 (pgvector-format) scan nodes: computes the
+ * distance from the inline vector and extracts heaptid / level / deleted /
+ * neighbor-tuple TID under one buffer pin.  Replaces the previous
+ * acorn_distance + acorn_load_element pair, which pinned and locked the
+ * SAME element page twice per neighbor.
+ */
+static double
+acorn_load_node(Relation index, BlockNumber blkno, OffsetNumber offno,
+				Datum query, FmgrInfo *dist_proc, AcornDistFn dist_direct,
+				ItemPointerData *heaptid_out, int *level_out,
+				bool *deleted_out,
+				BlockNumber *nbr_blkno_out, OffsetNumber *nbr_offno_out)
+{
+	Buffer				buf;
+	Page				page;
+	HnswElementTuple	etup;
+	void			   *vec;
+	double				dist;
+
+	buf  = ReadBuffer(index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+	vec  = HnswElementTupleGetVector(etup);
+
+	if (dist_direct)
+	{
+		AcornPgVector *v = (AcornPgVector *) vec;
+		AcornPgVector *q = (AcornPgVector *) DatumGetPointer(query);
+
+		if (likely(v->dim == q->dim))
+			dist = dist_direct((int) v->dim, v->x, q->x);
+		else
+			dist = DatumGetFloat8(
+				FunctionCall2(dist_proc, PointerGetDatum(vec), query));
+	}
+	else
+		dist = DatumGetFloat8(
+			FunctionCall2(dist_proc, PointerGetDatum(vec), query));
+
+	*heaptid_out   = etup->heaptids[0];
+	*level_out     = (int) etup->level;
+	*deleted_out   = (etup->deleted != 0);
+	*nbr_blkno_out = ItemPointerGetBlockNumber(&etup->neighbortid);
+	*nbr_offno_out = ItemPointerGetOffsetNumber(&etup->neighbortid);
+
+	UnlockReleaseBuffer(buf);
+	return dist;
+}
+
+/*
  * Evaluate predicate on the heap tuple identified by heaptid.
  * Returns true if the row passes the filter (or if predicate is NULL).
  */
@@ -422,7 +473,7 @@ acorn_greedy_descent(Relation index, int m,
 static int
 acorn_layer0_search(Relation index, Relation heap, int m,
 					BlockNumber entry_blkno, OffsetNumber entry_offno,
-					Datum query, FmgrInfo *dist_proc,
+					Datum query, FmgrInfo *dist_proc, AcornDistFn dist_direct,
 					Snapshot snapshot,
 					ExprState *predicate, ExprContext *econtext,
 					int k, int ef_search,
@@ -525,7 +576,25 @@ acorn_layer0_search(Relation index, Relation heap, int m,
 
 			nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
 			noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
-			nd     = acorn_distance(index, nblkno, noffno, query, dist_proc);
+
+			if (acorn_scan_single_read)
+			{
+				/* One pin: distance + heaptid/deleted from the same page */
+				nd = acorn_load_node(index, nblkno, noffno,
+									 query, dist_proc, dist_direct,
+									 &nheaptid, &nlevel, &ndeleted,
+									 &n_nbr_blkno, &n_nbr_offno);
+			}
+			else
+			{
+				nd = acorn_distance(index, nblkno, noffno, query, dist_proc);
+
+				/* Load heaptid to evaluate predicate (second pin, same page) */
+				nbuf = acorn_load_element(index, nblkno, noffno,
+										  &nheaptid, &nlevel, &ndeleted,
+										  &n_nbr_blkno, &n_nbr_offno);
+				UnlockReleaseBuffer(nbuf);
+			}
 
 			/* Always add to C (ACORN-1: preserve connectivity) */
 			nc = palloc(sizeof(AcornPQNode));
@@ -533,12 +602,6 @@ acorn_layer0_search(Relation index, Relation heap, int m,
 			nc->elem.distance = nd;
 			ItemPointerSetInvalid(&nc->elem.heaptid);
 			pairingheap_add(C, &nc->ph_node);
-
-			/* Load heaptid to evaluate predicate */
-			nbuf = acorn_load_element(index, nblkno, noffno,
-									  &nheaptid, &nlevel, &ndeleted,
-									  &n_nbr_blkno, &n_nbr_offno);
-			UnlockReleaseBuffer(nbuf);
 
 			if (ndeleted)
 				continue;
@@ -607,12 +670,15 @@ acorn_scan_execute(AcornScanState *state, Relation index, Relation heap,
 				   ItemPointerData *result_tids_out)
 {
 	FmgrInfo		dist_proc;
+	AcornDistFn		dist_direct;
 	BlockNumber		entry_blkno;
 	OffsetNumber	entry_offno;
 	int				entry_level;
 	int				m;
 
 	acorn_load_dist_proc(index, &dist_proc);
+	dist_direct = acorn_scan_direct_dist
+		? acorn_resolve_direct_dist(index) : NULL;
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
 		return 0;			/* empty index */
@@ -624,7 +690,7 @@ acorn_scan_execute(AcornScanState *state, Relation index, Relation heap,
 
 	return acorn_layer0_search(index, heap, m,
 							   entry_blkno, entry_offno,
-							   query, &dist_proc,
+							   query, &dist_proc, dist_direct,
 							   snapshot,
 							   state->predicate, state->econtext,
 							   state->k, state->ef_search,
@@ -692,7 +758,6 @@ acorn_stream_expand(AcornStreamScan *s, const AcornElem *ce)
 		bool			ndeleted;
 		BlockNumber		n_nbr_blkno;
 		OffsetNumber	n_nbr_offno;
-		Buffer			nbuf;
 		AcornPQNode	   *cn;
 
 		if (!ItemPointerIsValid(&neighbors[i]))
@@ -703,7 +768,13 @@ acorn_stream_expand(AcornStreamScan *s, const AcornElem *ce)
 
 		nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
 		noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
-		nd     = acorn_distance(s->index, nblkno, noffno, s->query, &s->dist_proc);
+
+		/* One pin: distance + heaptid/deleted from the same page (was an
+		 * acorn_distance + acorn_load_element pair pinning the page twice) */
+		nd = acorn_load_node(s->index, nblkno, noffno,
+							 s->query, &s->dist_proc, NULL,
+							 &nheaptid, &nlevel, &ndeleted,
+							 &n_nbr_blkno, &n_nbr_offno);
 
 		/* Always a candidate for expansion (preserve connectivity) */
 		cn = palloc(sizeof(AcornPQNode));
@@ -711,12 +782,6 @@ acorn_stream_expand(AcornStreamScan *s, const AcornElem *ce)
 		ItemPointerSetInvalid(&cn->elem.heaptid);
 		cn->elem.distance = nd;
 		pairingheap_add(s->C, &cn->ph_node);
-
-		/* Emit only live nodes — load heaptid + deleted flag */
-		nbuf = acorn_load_element(s->index, nblkno, noffno,
-								  &nheaptid, &nlevel, &ndeleted,
-								  &n_nbr_blkno, &n_nbr_offno);
-		UnlockReleaseBuffer(nbuf);
 
 		if (!ndeleted)
 		{
