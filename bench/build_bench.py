@@ -91,6 +91,12 @@ def main():
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--diversify", action="store_true",
                     help="also time the diversify=on build")
+    ap.add_argument("--ab-reps", type=int, default=1,
+                    help="interleave fmgr/direct builds this many times "
+                         "(A B A B ...) so machine-load drift hits both")
+    ap.add_argument("--ab-only", action="store_true",
+                    help="run only the interleaved A/B timing; skip "
+                         "diversify timing and determinism checks")
     ap.add_argument("--out", default="bench/results_build_bench.json")
     args = ap.parse_args()
 
@@ -113,14 +119,29 @@ def main():
 
         res = {"meta": vars(args), "builds": {}}
 
-        # V1 A/B: fmgr vs direct kernels (diversify off = pre-Y2 baseline)
-        res["builds"]["fmgr"] = build(cur, direct=False, seed=12345,
-                                      diversify=False, n_label="A fmgr")
-        res["builds"]["direct"] = build(cur, direct=True, seed=12345,
-                                        diversify=False, n_label="B direct")
-        res["speedup"] = round(res["builds"]["fmgr"]
-                               / res["builds"]["direct"], 2)
-        print(f"[V1] speedup fmgr/direct = {res['speedup']}x", flush=True)
+        # V1 A/B: fmgr vs direct kernels (diversify off = pre-Y2 baseline),
+        # interleaved A B A B ... so machine-load drift hits both variants.
+        fmgr_times, direct_times = [], []
+        for rep in range(args.ab_reps):
+            fmgr_times.append(build(cur, direct=False, seed=12345,
+                                    diversify=False,
+                                    n_label=f"A{rep+1} fmgr"))
+            direct_times.append(build(cur, direct=True, seed=12345,
+                                      diversify=False,
+                                      n_label=f"B{rep+1} direct"))
+        res["builds"]["fmgr"] = fmgr_times
+        res["builds"]["direct"] = direct_times
+        res["speedup"] = round(float(np.median(fmgr_times))
+                               / float(np.median(direct_times)), 2)
+        print(f"[V1] fmgr {sorted(fmgr_times)} vs direct "
+              f"{sorted(direct_times)} -> median speedup = {res['speedup']}x",
+              flush=True)
+
+        if args.ab_only:
+            with open(args.out, "w") as f:
+                json.dump(res, f, indent=1)
+            print(f"[done] -> {args.out}", flush=True)
+            return
 
         if args.diversify:
             res["builds"]["direct_diversify"] = build(
