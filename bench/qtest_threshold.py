@@ -34,11 +34,15 @@ def exact_truth(q, thresh, k):
 
 def setup(full_scan_threshold):
     client.delete(f"/collections/{COLL}")
-    client.put(f"/collections/{COLL}", json={
+    time.sleep(1)  # delete is async; avoid racing the create
+    resp = client.put(f"/collections/{COLL}", json={
         "vectors": {"size": DIM, "distance": "Cosine"},
         "hnsw_config": {"m": 16, "ef_construct": 64,
                         "full_scan_threshold": full_scan_threshold},
-    }).raise_for_status()
+    })
+    if resp.status_code >= 400:
+        print(f"  [create {full_scan_threshold} -> {resp.status_code}] {resp.text}", flush=True)
+        resp.raise_for_status()
     client.put(f"/collections/{COLL}/index",
                json={"field_name": "bucket", "field_schema": "integer"}).raise_for_status()
     pts = [{"id": i + 1, "vector": vecs[i].tolist(), "payload": {"bucket": int(buckets[i])}}
@@ -63,7 +67,7 @@ def measure(sel_pct):
     return float(np.mean(recalls)), NQ / (time.perf_counter() - t0)
 
 
-for fst in (10000, 1):
+for fst in (10000, 10):
     setup(fst)
     print(f"--- full_scan_threshold={fst} ---", flush=True)
     for sel in (1, 25):
