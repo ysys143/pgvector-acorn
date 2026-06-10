@@ -130,10 +130,17 @@ for name, gamma, payload in CONFIGS:
                     cur.execute(f"SET pg_acorn.member_first = {mf}")
                     for q, truth in zip(queries, truths):
                         t0 = time.perf_counter()
+                        # NOTE: the selectivity constant MUST be inlined.
+                        # A bound int parameter is sent as smallint by
+                        # psycopg, making the qual `bucket < $1::smallint`
+                        # — a cross-type operator NOT in int4_acorn_ops —
+                        # so the planner cannot push it down and the scan
+                        # silently degrades to the unfiltered post-filter
+                        # path (nkeys = 0).
                         cur.execute(
-                            "SELECT id FROM pe_items WHERE bucket < %s "
+                            f"SELECT id FROM pe_items WHERE bucket < {int(sel)} "
                             "ORDER BY embedding <=> %s::vector LIMIT %s",
-                            (sel, qstr(q), K))
+                            (qstr(q), K))
                         ids = {r[0] for r in cur.fetchall()}
                         lats.append((time.perf_counter() - t0) * 1000.0)
                         recalls.append(len(ids & truth) / K)
