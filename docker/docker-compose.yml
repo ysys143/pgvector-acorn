@@ -25,10 +25,20 @@ services:
       - |
         cd /workspace &&
         make PG_CONFIG=$$PG_CONFIG install &&
-        exec docker-entrypoint.sh postgres -c shared_preload_libraries=pg_acorn
+        exec docker-entrypoint.sh postgres \
+          -c shared_preload_libraries=pg_acorn \
+          -c shared_buffers=${PG_SHARED_BUFFERS:-2GB} \
+          -c work_mem=${PG_WORK_MEM:-64MB} \
+          -c jit=${PG_JIT:-off} \
+          -c max_parallel_workers_per_gather=${PG_MPWG:-0} \
+          -c effective_io_concurrency=${PG_EIC:-0} \
+          -c track_io_timing=${PG_TRACK_IO:-on}
 
   qdrant:
     image: qdrant/qdrant:v1.16.0
+    environment:
+      # 0 = auto (one thread per CPU); 1 = single-threaded search (FAIR-1T)
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: ${QDRANT_MAX_SEARCH_THREADS:-1}
     ports:
       - "6333:6333"
     volumes:
