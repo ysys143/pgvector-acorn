@@ -68,6 +68,30 @@ CREATE OPERATOR CLASS text_acorn_ops
     OPERATOR 5 > (text, text),
     FUNCTION 1 bttextcmp(text, text);
 
+-- Cross-type comparisons for int4_acorn_ops.
+--
+-- Drivers using the extended protocol often bind small integer constants as
+-- int2 or int8 (psycopg sends Python ints as smallint when they fit).
+-- Without family membership for the cross-type operators, a qual like
+-- `bucket < $1::smallint` cannot be pushed down as an index cond and the
+-- scan silently degrades to the unfiltered post-filter path.  The AM
+-- evaluates ScanKeys via the operator's own proc (int42lt etc.), so no C
+-- changes are needed.
+
+ALTER OPERATOR FAMILY int4_acorn_ops USING acorn_hnsw ADD
+    OPERATOR 1 < (int4, int2),
+    OPERATOR 2 <= (int4, int2),
+    OPERATOR 3 = (int4, int2),
+    OPERATOR 4 >= (int4, int2),
+    OPERATOR 5 > (int4, int2),
+    OPERATOR 1 < (int4, int8),
+    OPERATOR 2 <= (int4, int8),
+    OPERATOR 3 = (int4, int8),
+    OPERATOR 4 >= (int4, int8),
+    OPERATOR 5 > (int4, int8),
+    FUNCTION 1 (int4, int2) btint42cmp(int4, int2),
+    FUNCTION 1 (int4, int8) btint48cmp(int4, int8);
+
 -- GUCs (loaded via _PG_init, declared here for documentation)
 -- pg_acorn.enable_hook     boolean  default true   (Tier 1 hook)
 -- pg_acorn.default_gamma   integer  default 1      (ACORN-1 by default)

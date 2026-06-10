@@ -1,0 +1,218 @@
+-- tier2_payload_edges.sql: payload-aware neighbor edges for acorn_hnsw.
+--
+-- New reloption acorn_payload_edges (bool, default false).  When on, each
+-- node's layer-0 neighbor slots are split: half global nearest (standard
+-- HNSW) and half nearest among nodes sharing the same payload partition
+-- (hash(filter_val) % 256; identity for small ints, so partition == value
+-- here).  This makes the sparse predicate subgraph navigable at low
+-- selectivity without raising gamma.
+--
+-- REAL recall test: exact seqscan ground truth (truth_* tables), then
+-- overlap with the index result.  NOT the tautological recall_* CTE pattern.
+--
+-- Fixture: 2000 uniform random vectors (well-connected graph -> recall is
+-- stable across the PID-seeded level sequences), bucket = i % 50, so
+-- bucket = 0 selects a 2% sparse subgraph and bucket < 3 a 6% one.
+-- Identical data in items_off / items_on isolates the reloption effect.
+\set ON_ERROR_STOP on
+\set q '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'
+CREATE SCHEMA test_t2_payload;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+SET search_path = test_t2_payload, public;
+SELECT setseed(0.42);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE items_off (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+INSERT INTO items_off (bucket, embedding)
+SELECT (i % 50),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 2000) i;
+-- Identical data for the payload-edges index.
+CREATE TABLE items_on AS SELECT * FROM items_off;
+-- (a) reloption accepted; index builds with payload edges off and on.
+CREATE INDEX items_off_idx ON items_off
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 1);
+CREATE INDEX items_on_idx ON items_on
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 1, acorn_payload_edges = true);
+SELECT reloptions FROM pg_class WHERE relname = 'items_on_idx';
+                            reloptions                            
+------------------------------------------------------------------
+ {m=16,ef_construction=64,acorn_gamma=1,acorn_payload_edges=true}
+(1 row)
+
+-- (b) filter correctness with payload edges on: every returned row satisfies
+-- the qual, for both equality and range.
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 100;
+SELECT bool_and(bucket = 0) AS eq_filter_correct, count(*) = 10 AS eq_full_k
+FROM (SELECT bucket FROM items_on WHERE bucket = 0
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ eq_filter_correct | eq_full_k 
+-------------------+-----------
+ t                 | t
+(1 row)
+
+SELECT bool_and(bucket < 3) AS range_filter_correct, count(*) = 10 AS range_full_k
+FROM (SELECT bucket FROM items_on WHERE bucket < 3
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ range_filter_correct | range_full_k 
+----------------------+--------------
+ t                    | t
+(1 row)
+
+RESET enable_seqscan;
+-- Exact ground truth via seqscan (REAL recall, not tautological).
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE truth_eq AS
+    SELECT id FROM items_off WHERE bucket = 0
+    ORDER BY embedding <=> :'q'::vector LIMIT 10;
+CREATE TABLE truth_range AS
+    SELECT id FROM items_off WHERE bucket < 3
+    ORDER BY embedding <=> :'q'::vector LIMIT 10;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+-- recall@10 for a given table / qual / truth table at a given ef_search.
+CREATE OR REPLACE FUNCTION acorn_recall(tbl text, qual text, truth_tbl text, ef int)
+RETURNS numeric AS $$
+DECLARE
+    matched int;
+BEGIN
+    EXECUTE format('SET pg_acorn.ef_search = %s', ef);
+    SET enable_seqscan = off;
+    EXECUTE format(
+        'WITH r AS (SELECT id FROM %I WHERE %s
+                    ORDER BY embedding <=> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector
+                    LIMIT 10)
+         SELECT count(*) FROM r JOIN %I t USING (id)', tbl, qual, truth_tbl)
+        INTO matched;
+    RESET enable_seqscan;
+    RETURN matched / 10.0;
+END;
+$$ LANGUAGE plpgsql;
+-- (c) REAL recall: payload edges on >= off on identical data at equal
+-- ef_search, for equality and range quals.
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 100)
+    >= acorn_recall('items_off', 'bucket = 0', 'truth_eq', 100) AS eq_ge_ef100;
+ eq_ge_ef100 
+-------------
+ t
+(1 row)
+
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 400)
+    >= acorn_recall('items_off', 'bucket = 0', 'truth_eq', 400) AS eq_ge_ef400;
+ eq_ge_ef400 
+-------------
+ t
+(1 row)
+
+SELECT acorn_recall('items_on', 'bucket < 3', 'truth_range', 100)
+    >= acorn_recall('items_off', 'bucket < 3', 'truth_range', 100) AS range_ge_ef100;
+ range_ge_ef100 
+----------------
+ t
+(1 row)
+
+SELECT acorn_recall('items_on', 'bucket < 3', 'truth_range', 400)
+    >= acorn_recall('items_off', 'bucket < 3', 'truth_range', 400) AS range_ge_ef400;
+ range_ge_ef400 
+----------------
+ t
+(1 row)
+
+-- Strict improvement on the sparse equality qual at a moderate budget
+-- (observed 0.6 vs 0.3 across all level-sequence seeds on this fixture),
+-- plus an absolute floor for the payload-on index.
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 100)
+    >  acorn_recall('items_off', 'bucket = 0', 'truth_eq', 100) AS eq_gt_ef100;
+ eq_gt_ef100 
+-------------
+ t
+(1 row)
+
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 100) >= 0.5 AS eq_recall_floor;
+ eq_recall_floor 
+-----------------
+ t
+(1 row)
+
+-- member-first scan policy (pg_acorn.member_first): spend the ef_search
+-- budget on filter-passing candidates first.  Pairs with payload edges:
+-- once the traversal touches one partition member, the same-partition edges
+-- let the budget drain the predicate subgraph instead of the (mostly
+-- failing) global neighborhood.  Observed stable on this fixture:
+-- eq recall@ef40 = 0.6 with member_first vs 0.1 without.
+SHOW pg_acorn.member_first;
+ pg_acorn.member_first 
+-----------------------
+ off
+(1 row)
+
+SET pg_acorn.member_first = on;
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 100;
+SELECT bool_and(bucket = 0) AS mf_eq_filter_correct, count(*) = 10 AS mf_eq_full_k
+FROM (SELECT bucket FROM items_on WHERE bucket = 0
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ mf_eq_filter_correct | mf_eq_full_k 
+----------------------+--------------
+ t                    | t
+(1 row)
+
+RESET enable_seqscan;
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 40) >= 0.5 AS mf_eq40_floor;
+ mf_eq40_floor 
+---------------
+ t
+(1 row)
+
+SET pg_acorn.member_first = off;
+SELECT acorn_recall('items_on', 'bucket = 0', 'truth_eq', 40) <= 0.3 AS nomf_eq40_low;
+ nomf_eq40_low 
+---------------
+ t
+(1 row)
+
+RESET pg_acorn.member_first;
+-- (d) insert path: aminsert with payload edges on stays correct.
+INSERT INTO items_on (bucket, embedding)
+SELECT (i % 50),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 100) i;
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 100;
+SELECT bool_and(bucket = 0) AS insert_eq_filter_correct, count(*) = 10 AS insert_eq_full_k
+FROM (SELECT bucket FROM items_on WHERE bucket = 0
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ insert_eq_filter_correct | insert_eq_full_k 
+--------------------------+------------------
+ t                        | t
+(1 row)
+
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+DROP SCHEMA test_t2_payload CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table items_off
+drop cascades to table items_on
+drop cascades to table truth_eq
+drop cascades to table truth_range
+drop cascades to function acorn_recall(text,text,text,integer)

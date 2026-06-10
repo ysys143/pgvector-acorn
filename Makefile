@@ -18,6 +18,7 @@ REGRESS = \
 	tier2_infilter \
 	tier2_2hop \
 	tier2_ef_search \
+	tier2_payload_edges \
 	no_regression \
 	recall_filter \
 	recall_gamma \
