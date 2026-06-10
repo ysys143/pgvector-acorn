@@ -34,6 +34,13 @@ import psycopg
 DSN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
     "PG_ACORN_DSN", "postgresql://postgres@localhost/postgres")
 
+# CORR=high: buckets derived from the dominant 10-dim block (spatially
+# correlated; same-value nodes are already close, so payload edges are
+# partly redundant with geometry).  CORR=low: buckets independent of the
+# vector (the diag_ef_ceiling adversarial case where the predicate subgraph
+# is navigable only through payload edges).
+CORR = os.environ.get("CORR", "high")
+
 N, DIM, NQ, K = 20000, 128, 30, 10
 EFS = [40, 100, 200, 400]
 SELS = [1, 40]                       # bucket < sel  =>  ~sel% selectivity
@@ -49,17 +56,20 @@ rng = np.random.default_rng(0)
 raw = rng.standard_normal((N, DIM)).astype(np.float32)
 vecs = raw / np.linalg.norm(raw, axis=1, keepdims=True)
 
-blocks = DIM // 10                                   # 12 blocks for dim=128
-block_norms = np.array([
-    np.linalg.norm(vecs[:, i * 10:(i + 1) * 10], axis=1)
-    for i in range(blocks)
-]).T                                                  # (n, blocks)
-dominant_block = np.argmax(block_norms, axis=1)       # 0..blocks-1
-span = 100 // blocks                                  # 8
-# base bucket from the dominant block (spatial correlation) + uniform spread
-# inside the block's range so bucket < k yields ~k% selectivity for any k.
-buckets = dominant_block * span + rng.integers(0, span, size=N)
-buckets = np.clip(buckets, 0, 99).astype(int)
+if CORR == "low":
+    buckets = rng.integers(0, 100, size=N)            # bucket independent of vector
+else:
+    blocks = DIM // 10                                # 12 blocks for dim=128
+    block_norms = np.array([
+        np.linalg.norm(vecs[:, i * 10:(i + 1) * 10], axis=1)
+        for i in range(blocks)
+    ]).T                                              # (n, blocks)
+    dominant_block = np.argmax(block_norms, axis=1)   # 0..blocks-1
+    span = 100 // blocks                              # 8
+    # base bucket from the dominant block (spatial correlation) + uniform
+    # spread inside the block's range so bucket < k yields ~k% selectivity.
+    buckets = dominant_block * span + rng.integers(0, span, size=N)
+    buckets = np.clip(buckets, 0, 99).astype(int)
 
 queries = vecs[rng.choice(N, NQ, replace=False)]
 
