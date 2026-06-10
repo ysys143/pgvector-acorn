@@ -90,12 +90,14 @@ class PgAcornTarget:
 
     def set_ef_search(self, n: int) -> None:
         """Runtime recall/latency knob. Tier 2 reads pg_acorn.ef_search (bounded
-        streaming scan); Tier 1 rides the standard HNSW hook via hnsw.ef_search."""
+        streaming scan); Tier 1 rides the standard HNSW hook via hnsw.ef_search.
+        SET cannot bind parameters, so inline the integer-validated value."""
+        ef = int(n)
         with self.conn.cursor() as cur:
             if self.tier == 2:
-                cur.execute("SET pg_acorn.ef_search = %s", (n,))
+                cur.execute(f"SET pg_acorn.ef_search = {ef}")
             else:
-                cur.execute("SET hnsw.ef_search = %s", (n,))
+                cur.execute(f"SET hnsw.ef_search = {ef}")
 
     def insert_batch(self, vectors: np.ndarray, metadata: list[dict]) -> None:
         with self.conn.cursor() as cur:

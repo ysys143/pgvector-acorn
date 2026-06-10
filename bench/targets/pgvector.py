@@ -69,9 +69,11 @@ class PgvectorTarget:
                 cur.execute("RESET enable_bitmapscan")
 
     def set_ef_search(self, n: int) -> None:
-        """Runtime recall/latency knob: HNSW dynamic candidate list size."""
+        """Runtime recall/latency knob: HNSW dynamic candidate list size.
+        SET is a utility statement and cannot bind parameters, so inline the
+        (integer-validated) value."""
         with self.conn.cursor() as cur:
-            cur.execute("SET hnsw.ef_search = %s", (n,))
+            cur.execute(f"SET hnsw.ef_search = {int(n)}")
 
     def insert_batch(self, vectors: np.ndarray, metadata: list[dict]) -> None:
         with self.conn.cursor() as cur:
