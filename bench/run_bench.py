@@ -108,77 +108,90 @@ def main() -> None:
 
     for target in targets:
         print(f"\n[{target.name}] setting up...")
-        target.setup(vectors, metadata)
+        pgvector_ref = None
+        try:
+            target.setup(vectors, metadata)
 
-        pgvector_ref = PgvectorTarget(args.dsn)
+            pgvector_ref = PgvectorTarget(args.dsn)
 
-        if truth is None:
-            truth = build_ground_truth(
-                pgvector_ref, queries,
-                selectivities=a_selectivity_sweep.SELECTIVITIES,
-                k=a_selectivity_sweep.K,
-            )
-        target_results: dict = {}
+            if truth is None:
+                truth = build_ground_truth(
+                    pgvector_ref, queries,
+                    selectivities=a_selectivity_sweep.SELECTIVITIES,
+                    k=a_selectivity_sweep.K,
+                )
+            target_results: dict = {}
 
-        if "a" in run_scenarios:
-            print(f"[{target.name}] scenario A: selectivity sweep")
-            target_results["a"] = a_selectivity_sweep.run(target, queries, truth)
+            if "a" in run_scenarios:
+                print(f"[{target.name}] scenario A: selectivity sweep")
+                target_results["a"] = a_selectivity_sweep.run(target, queries, truth)
 
-        if "b" in run_scenarios and target.name == "pgvector":
-            print(f"[{target.name}] scenario B: post-filter recall")
-            target_results["b"] = b_postfilter_recall.run(
-                pgvector_ref.conn, queries, truth
-            )
+            if "b" in run_scenarios and target.name == "pgvector":
+                print(f"[{target.name}] scenario B: post-filter recall")
+                target_results["b"] = b_postfilter_recall.run(
+                    pgvector_ref.conn, queries, truth
+                )
 
-        if "c" in run_scenarios and target.name != "qdrant":
-            print(f"[{target.name}] scenario C: incremental insert recall")
-            inc_vectors, inc_meta = load_sift(n=args.n_vectors // 5, dim=args.dim)
+            if "c" in run_scenarios and target.name != "qdrant":
+                print(f"[{target.name}] scenario C: incremental insert recall")
+                inc_vectors, inc_meta = load_sift(n=args.n_vectors // 5, dim=args.dim)
 
-            def brute_truth(q, sel):
-                with pgvector_ref.conn.cursor() as cur:
-                    cur.execute("SET enable_indexscan=off; SET enable_bitmapscan=off")
-                    cur.execute(
-                        "SELECT id FROM bench_items WHERE bucket<%s "
-                        "ORDER BY embedding<->%s::vector LIMIT 10",
-                        (sel, q.tolist()),
-                    )
-                    ids = [r[0] for r in cur.fetchall()]
-                    cur.execute("RESET enable_indexscan; RESET enable_bitmapscan")
-                    return ids
+                def brute_truth(q, sel):
+                    with pgvector_ref.conn.cursor() as cur:
+                        cur.execute("SET enable_indexscan=off; SET enable_bitmapscan=off")
+                        cur.execute(
+                            "SELECT id FROM bench_items WHERE bucket<%s "
+                            "ORDER BY embedding<->%s::vector LIMIT 10",
+                            (sel, q.tolist()),
+                        )
+                        ids = [r[0] for r in cur.fetchall()]
+                        cur.execute("RESET enable_indexscan; RESET enable_bitmapscan")
+                        return ids
 
-            target_results["c"] = c_incremental_recall.run(
-                target, queries, inc_vectors, inc_meta, brute_truth
-            )
+                target_results["c"] = c_incremental_recall.run(
+                    target, queries, inc_vectors, inc_meta, brute_truth
+                )
 
-        if "d" in run_scenarios:
-            print(f"[{target.name}] scenario D: correlation")
-            syn_low, syn_low_meta = load_synthetic(
-                n=args.n_vectors, dim=args.dim, correlation="low"
-            )
-            syn_high, syn_high_meta = load_synthetic(
-                n=args.n_vectors, dim=args.dim, correlation="high"
-            )
-            target.teardown()
-            target.setup(syn_low, syn_low_meta)
-            truth_low = build_ground_truth(
-                pgvector_ref, queries[:d_correlation.N_QUERIES],
-                [d_correlation.SELECTIVITY], d_correlation.K,
-            )
-            r_low = d_correlation.run(target, queries, truth_low, "low")
+            if "d" in run_scenarios:
+                print(f"[{target.name}] scenario D: correlation")
+                syn_low, syn_low_meta = load_synthetic(
+                    n=args.n_vectors, dim=args.dim, correlation="low"
+                )
+                syn_high, syn_high_meta = load_synthetic(
+                    n=args.n_vectors, dim=args.dim, correlation="high"
+                )
+                target.teardown()
+                target.setup(syn_low, syn_low_meta)
+                truth_low = build_ground_truth(
+                    pgvector_ref, queries[:d_correlation.N_QUERIES],
+                    [d_correlation.SELECTIVITY], d_correlation.K,
+                )
+                r_low = d_correlation.run(target, queries, truth_low, "low")
 
-            target.teardown()
-            target.setup(syn_high, syn_high_meta)
-            truth_high = build_ground_truth(
-                pgvector_ref, queries[:d_correlation.N_QUERIES],
-                [d_correlation.SELECTIVITY], d_correlation.K,
-            )
-            r_high = d_correlation.run(target, queries, truth_high, "high")
-            target_results["d"] = {"low": r_low, "high": r_high}
+                target.teardown()
+                target.setup(syn_high, syn_high_meta)
+                truth_high = build_ground_truth(
+                    pgvector_ref, queries[:d_correlation.N_QUERIES],
+                    [d_correlation.SELECTIVITY], d_correlation.K,
+                )
+                r_high = d_correlation.run(target, queries, truth_high, "high")
+                target_results["d"] = {"low": r_low, "high": r_high}
 
-        all_results[target.name] = target_results
-        target.teardown()
-        target.close()
-        pgvector_ref.close()
+            all_results[target.name] = target_results
+            # Incremental checkpoint: persist after each target so a later
+            # target's failure never discards completed results.
+            Path(args.output).write_text(json.dumps(all_results, indent=2))
+            print(f"[{target.name}] done — checkpointed to {args.output}")
+        except Exception as e:
+            print(f"[{target.name}] FAILED: {e!r} — skipping, keeping prior results")
+        finally:
+            try:
+                target.teardown()
+            except Exception:
+                pass
+            target.close()
+            if pgvector_ref is not None:
+                pgvector_ref.close()
 
     Path(args.output).write_text(json.dumps(all_results, indent=2))
     print(f"\nResults written to {args.output}")
