@@ -1,0 +1,1223 @@
+{
+ "meta": {
+  "n": 20000,
+  "dim": 128,
+  "nq": 10,
+  "k": 10,
+  "sels": [
+   1,
+   5,
+   20
+  ],
+  "efs_acorn": [
+   40,
+   100
+  ],
+  "efs_pgvector": [
+   40,
+   100
+  ],
+  "metric": "cosine",
+  "correlation": "high (dominant-block)",
+  "max_scan_tuples": 40000,
+  "stages_this_run": [
+   "prefilter",
+   "postfilter",
+   "free",
+   "acorn_g1",
+   "acorn_g2"
+  ],
+  "started_utc": "2026-06-10T17:22:50Z",
+  "sel_counts": {
+   "1": {
+    "rows": 214,
+    "frac_pct": 1.07
+   },
+   "5": {
+    "rows": 1037,
+    "frac_pct": 5.18
+   },
+   "20": {
+    "rows": 4248,
+    "frac_pct": 21.24
+   }
+  },
+  "pg_settings": {
+   "shared_buffers": "2GB",
+   "work_mem": "64MB",
+   "jit": "off",
+   "max_parallel_workers_per_gather": "0",
+   "effective_io_concurrency": "0",
+   "track_io_timing": "on",
+   "server_version": "17.10 (Debian 17.10-1.pgdg12+1)"
+  },
+  "pg_acorn_gucs": 10,
+  "pgvector_version": "0.8.0",
+  "builds": {
+   "btree": {
+    "seconds": 0.1,
+    "size_mb": 0.2
+   },
+   "pgvector_hnsw": {
+    "seconds": 23.5,
+    "size_mb": 15.9
+   },
+   "btree_rebuild": {
+    "seconds": 0.0,
+    "size_mb": 0.2
+   },
+   "acorn_g1": {
+    "seconds": 38.2,
+    "size_mb": 16.1
+   },
+   "acorn_g2": {
+    "seconds": 68.9,
+    "size_mb": 19.9
+   }
+  },
+  "plan_checks": {
+   "pg_prefilter/sel1": {
+    "ok": true,
+    "node": "Bitmap Heap Scan on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 1)"
+    ]
+   },
+   "pg_prefilter/sel5": {
+    "ok": true,
+    "node": "Bitmap Heap Scan on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 5)"
+    ]
+   },
+   "pg_prefilter/sel20": {
+    "ok": true,
+    "node": "Bitmap Heap Scan on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 20)"
+    ]
+   },
+   "pgv_post_relaxed/sel1": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: (bucket < 1)"
+    ]
+   },
+   "pgv_post_relaxed/sel5": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: (bucket < 5)"
+    ]
+   },
+   "pgv_post_relaxed/sel20": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: (bucket < 20)"
+    ]
+   },
+   "pgv_post_strict/sel1": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: (bucket < 1)"
+    ]
+   },
+   "pgv_post_strict/sel5": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: (bucket < 5)"
+    ]
+   },
+   "pgv_post_strict/sel20": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: (bucket < 20)"
+    ]
+   },
+   "pgv_free/sel1": {
+    "ok": true,
+    "node": "Bitmap Heap Scan on tv_items",
+    "uses_hnsw": false,
+    "cond_or_filter": [
+     "Recheck Cond: (bucket < 1)",
+     "Index Cond: (bucket < 1)"
+    ]
+   },
+   "pgv_free/sel5": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "uses_hnsw": true,
+    "cond_or_filter": [
+     "Filter: (bucket < 5)"
+    ]
+   },
+   "pgv_free/sel20": {
+    "ok": true,
+    "node": "Index Scan using tv_hnsw_idx on tv_items",
+    "uses_hnsw": true,
+    "cond_or_filter": [
+     "Filter: (bucket < 20)"
+    ]
+   },
+   "acorn_g1_infilter/sel1": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 1)"
+    ]
+   },
+   "acorn_g1_infilter/sel5": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 5)"
+    ]
+   },
+   "acorn_g1_infilter/sel20": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 20)"
+    ]
+   },
+   "acorn_g2_infilter/sel1": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 1)"
+    ]
+   },
+   "acorn_g2_infilter/sel5": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 5)"
+    ]
+   },
+   "acorn_g2_infilter/sel20": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Index Cond: (bucket < 20)"
+    ]
+   },
+   "acorn_g2_postfilter/sel1": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: ((bucket + 0) < 1)"
+    ]
+   },
+   "acorn_g2_postfilter/sel5": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: ((bucket + 0) < 5)"
+    ]
+   },
+   "acorn_g2_postfilter/sel20": {
+    "ok": true,
+    "node": "Index Scan using tv_acorn_idx on tv_items",
+    "cond_or_filter": [
+     "Filter: ((bucket + 0) < 20)"
+    ]
+   }
+  },
+  "finished_utc": "2026-06-10T17:25:19Z"
+ },
+ "ops": [
+  {
+   "engine": "pg_prefilter",
+   "sel": 1,
+   "ef": null,
+   "recall": 1.0,
+   "med_ms": 0.425792473834008,
+   "p90_ms": 0.5524007370695472,
+   "plan_node": "Bitmap Heap Scan on tv_items",
+   "buffers_per_query": 192.0,
+   "buffers_hit": 192.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    0.573,
+    0.55,
+    0.502,
+    0.494,
+    0.423,
+    0.428,
+    0.424,
+    0.369,
+    0.367,
+    0.357
+   ]
+  },
+  {
+   "engine": "pg_prefilter",
+   "sel": 5,
+   "ef": null,
+   "recall": 1.0,
+   "med_ms": 1.2368974275887012,
+   "p90_ms": 1.4747597393579779,
+   "plan_node": "Bitmap Heap Scan on tv_items",
+   "buffers_per_query": 743.0,
+   "buffers_hit": 743.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.876,
+    1.387,
+    1.241,
+    1.137,
+    1.233,
+    1.129,
+    1.43,
+    1.268,
+    1.023,
+    0.894
+   ]
+  },
+  {
+   "engine": "pg_prefilter",
+   "sel": 20,
+   "ef": null,
+   "recall": 1.0,
+   "med_ms": 3.0155039858072996,
+   "p90_ms": 69.21597083564843,
+   "plan_node": "Bitmap Heap Scan on tv_items",
+   "buffers_per_query": 1383.0,
+   "buffers_hit": 1383.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.988,
+    2.997,
+    2.891,
+    2.767,
+    3.034,
+    2.292,
+    182.207,
+    56.661,
+    15.698,
+    11.853
+   ]
+  },
+  {
+   "engine": "pgv_post_relaxed",
+   "sel": 1,
+   "ef": 40,
+   "recall": 0.99,
+   "med_ms": 75.19867195514962,
+   "p90_ms": 163.88957187300545,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 15461.3,
+   "buffers_hit": 15461.3,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    10.091,
+    13.695,
+    158.474,
+    81.719,
+    108.065,
+    17.772,
+    212.633,
+    95.431,
+    68.678,
+    44.421
+   ],
+   "iterative_scan": "relaxed_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_relaxed",
+   "sel": 1,
+   "ef": 100,
+   "recall": 0.99,
+   "med_ms": 67.87703849840909,
+   "p90_ms": 123.87744543375447,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 15356.7,
+   "buffers_hit": 15356.7,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    12.104,
+    12.691,
+    80.492,
+    26.215,
+    55.262,
+    128.863,
+    27.222,
+    84.464,
+    111.845,
+    123.323
+   ],
+   "iterative_scan": "relaxed_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_relaxed",
+   "sel": 5,
+   "ef": 40,
+   "recall": 0.7700000000000001,
+   "med_ms": 6.271716032642871,
+   "p90_ms": 69.79381619021294,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 6049.0,
+   "buffers_hit": 6049.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    4.532,
+    3.22,
+    7.751,
+    5.519,
+    2.635,
+    7.025,
+    3.627,
+    61.218,
+    146.98,
+    19.871
+   ],
+   "iterative_scan": "relaxed_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_relaxed",
+   "sel": 5,
+   "ef": 100,
+   "recall": 0.8,
+   "med_ms": 6.576341460458934,
+   "p90_ms": 10.440478869713843,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 6913.7,
+   "buffers_hit": 6913.7,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    10.283,
+    6.181,
+    6.618,
+    6.535,
+    2.323,
+    5.192,
+    11.861,
+    8.667,
+    7.021,
+    6.062
+   ],
+   "iterative_scan": "relaxed_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_relaxed",
+   "sel": 20,
+   "ef": 40,
+   "recall": 0.48,
+   "med_ms": 2.035856479778886,
+   "p90_ms": 2.6756070437841113,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 2692.0,
+   "buffers_hit": 2692.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.895,
+    1.763,
+    2.204,
+    2.086,
+    1.672,
+    3.355,
+    1.534,
+    2.517,
+    1.986,
+    2.6
+   ],
+   "iterative_scan": "relaxed_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_relaxed",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.6000000000000001,
+   "med_ms": 2.6401489158160985,
+   "p90_ms": 4.530972253996878,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 3078.0,
+   "buffers_hit": 3078.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.806,
+    2.227,
+    5.925,
+    2.475,
+    2.234,
+    3.897,
+    4.376,
+    2.216,
+    3.753,
+    2.272
+   ],
+   "iterative_scan": "relaxed_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_strict",
+   "sel": 1,
+   "ef": 40,
+   "recall": 0.77,
+   "med_ms": 88.24068756075576,
+   "p90_ms": 140.5584654537961,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 17927.3,
+   "buffers_hit": 17927.3,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    72.542,
+    86.39,
+    55.356,
+    20.092,
+    140.131,
+    47.246,
+    144.408,
+    104.412,
+    108.835,
+    90.091
+   ],
+   "iterative_scan": "strict_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_strict",
+   "sel": 1,
+   "ef": 100,
+   "recall": 0.8200000000000001,
+   "med_ms": 126.81423348840326,
+   "p90_ms": 252.33189917635173,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 17573.0,
+   "buffers_hit": 17573.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    77.438,
+    146.755,
+    200.272,
+    249.086,
+    39.309,
+    281.545,
+    106.873,
+    34.625,
+    234.934,
+    22.496
+   ],
+   "iterative_scan": "strict_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_strict",
+   "sel": 5,
+   "ef": 40,
+   "recall": 0.45,
+   "med_ms": 9.158990520518273,
+   "p90_ms": 46.2389922118745,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 6840.0,
+   "buffers_hit": 6840.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    12.754,
+    5.715,
+    5.805,
+    13.71,
+    6.549,
+    6.644,
+    5.8,
+    11.674,
+    25.358,
+    234.167
+   ],
+   "iterative_scan": "strict_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_strict",
+   "sel": 5,
+   "ef": 100,
+   "recall": 0.6000000000000001,
+   "med_ms": 7.708425458986312,
+   "p90_ms": 12.492097984068094,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 6889.7,
+   "buffers_hit": 6889.7,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    8.647,
+    17.996,
+    11.881,
+    7.526,
+    2.685,
+    5.864,
+    5.108,
+    10.458,
+    7.891,
+    6.941
+   ],
+   "iterative_scan": "strict_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_strict",
+   "sel": 20,
+   "ef": 40,
+   "recall": 0.37,
+   "med_ms": 2.912920492235571,
+   "p90_ms": 16.121476993430377,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 2700.3,
+   "buffers_hit": 2700.3,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.484,
+    1.878,
+    3.948,
+    1.692,
+    1.453,
+    4.172,
+    1.438,
+    87.185,
+    6.955,
+    8.226
+   ],
+   "iterative_scan": "strict_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_post_strict",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.6000000000000001,
+   "med_ms": 5.302922509144992,
+   "p90_ms": 31.849208811763656,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "buffers_per_query": 3078.0,
+   "buffers_hit": 3078.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.884,
+    76.799,
+    26.855,
+    4.638,
+    5.968,
+    4.13,
+    3.62,
+    3.19,
+    26.382,
+    20.231
+   ],
+   "iterative_scan": "strict_order",
+   "max_scan_tuples": 40000
+  },
+  {
+   "engine": "pgv_free",
+   "sel": 1,
+   "ef": null,
+   "recall": 1.0,
+   "med_ms": 0.40347949834540486,
+   "p90_ms": 2.365419873967766,
+   "plan_node": "Bitmap Heap Scan on tv_items",
+   "uses_hnsw": false,
+   "iterative_scan": "relaxed_order",
+   "buffers_per_query": 192.0,
+   "buffers_hit": 192.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.111,
+    4.653,
+    1.619,
+    0.393,
+    0.555,
+    0.314,
+    0.342,
+    0.398,
+    0.332,
+    0.409
+   ]
+  },
+  {
+   "engine": "pgv_free",
+   "sel": 5,
+   "ef": 40,
+   "recall": 0.7700000000000001,
+   "med_ms": 6.348215974867344,
+   "p90_ms": 31.80767501471557,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "uses_hnsw": true,
+   "iterative_scan": "relaxed_order",
+   "buffers_per_query": 6049.0,
+   "buffers_hit": 6049.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    4.428,
+    3.295,
+    7.333,
+    210.035,
+    6.079,
+    6.822,
+    4.774,
+    12.005,
+    6.618,
+    4.411
+   ]
+  },
+  {
+   "engine": "pgv_free",
+   "sel": 5,
+   "ef": 100,
+   "recall": 0.8,
+   "med_ms": 6.604799476917833,
+   "p90_ms": 31.982650293502918,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "uses_hnsw": true,
+   "iterative_scan": "relaxed_order",
+   "buffers_per_query": 6913.7,
+   "buffers_hit": 6913.7,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    15.106,
+    8.528,
+    131.78,
+    20.894,
+    2.264,
+    5.368,
+    4.042,
+    7.841,
+    4.793,
+    4.677
+   ]
+  },
+  {
+   "engine": "pgv_free",
+   "sel": 20,
+   "ef": 40,
+   "recall": 0.48,
+   "med_ms": 1.8964190385304391,
+   "p90_ms": 3.067203529644757,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "uses_hnsw": true,
+   "iterative_scan": "relaxed_order",
+   "buffers_per_query": 2692.0,
+   "buffers_hit": 2692.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.612,
+    2.426,
+    2.12,
+    1.072,
+    0.995,
+    1.673,
+    0.954,
+    1.647,
+    2.966,
+    3.974
+   ]
+  },
+  {
+   "engine": "pgv_free",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.6000000000000001,
+   "med_ms": 3.4500459441915154,
+   "p90_ms": 6.937179120723158,
+   "plan_node": "Index Scan using tv_hnsw_idx on tv_items",
+   "uses_hnsw": true,
+   "iterative_scan": "relaxed_order",
+   "buffers_per_query": 3078.0,
+   "buffers_hit": 3078.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    3.519,
+    3.528,
+    3.381,
+    2.584,
+    2.48,
+    2.102,
+    3.325,
+    4.5,
+    7.553,
+    6.869
+   ]
+  },
+  {
+   "engine": "acorn_g1_infilter",
+   "sel": 1,
+   "ef": 40,
+   "recall": 0.97,
+   "med_ms": 0.8786885300651193,
+   "p90_ms": 1.938965159934014,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 1119.0,
+   "buffers_hit": 1119.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.923,
+    2.084,
+    1.33,
+    0.998,
+    0.829,
+    0.929,
+    0.759,
+    0.746,
+    0.744,
+    0.749
+   ],
+   "member_first": true,
+   "gamma": 1
+  },
+  {
+   "engine": "acorn_g1_infilter",
+   "sel": 1,
+   "ef": 100,
+   "recall": 1.0,
+   "med_ms": 1.267688989173621,
+   "p90_ms": 5.337947339285153,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2078.7,
+   "buffers_hit": 2078.7,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    36.691,
+    1.652,
+    1.854,
+    1.315,
+    1.163,
+    1.448,
+    1.105,
+    1.221,
+    1.148,
+    1.061
+   ],
+   "member_first": true,
+   "gamma": 1
+  },
+  {
+   "engine": "acorn_g1_infilter",
+   "sel": 5,
+   "ef": 40,
+   "recall": 0.58,
+   "med_ms": 1.0684384615160525,
+   "p90_ms": 1.4144058106467128,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 1167.0,
+   "buffers_hit": 1167.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    0.703,
+    0.809,
+    0.728,
+    0.93,
+    0.85,
+    1.51,
+    1.255,
+    1.342,
+    1.207,
+    1.404
+   ],
+   "member_first": true,
+   "gamma": 1
+  },
+  {
+   "engine": "acorn_g1_infilter",
+   "sel": 5,
+   "ef": 100,
+   "recall": 0.95,
+   "med_ms": 1.7509189783595502,
+   "p90_ms": 3.4427588107064366,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2428.7,
+   "buffers_hit": 2428.7,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.77,
+    1.64,
+    1.473,
+    1.608,
+    3.781,
+    3.405,
+    2.436,
+    2.242,
+    1.645,
+    1.732
+   ],
+   "member_first": true,
+   "gamma": 1
+  },
+  {
+   "engine": "acorn_g1_infilter",
+   "sel": 20,
+   "ef": 40,
+   "recall": 0.38,
+   "med_ms": 1.2245849939063191,
+   "p90_ms": 2.8379039955325425,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 1247.3,
+   "buffers_hit": 1247.3,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.29,
+    1.025,
+    0.901,
+    1.551,
+    2.837,
+    2.847,
+    1.144,
+    1.053,
+    1.16,
+    1.616
+   ],
+   "member_first": true,
+   "gamma": 1
+  },
+  {
+   "engine": "acorn_g1_infilter",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.73,
+   "med_ms": 3.98412998765707,
+   "p90_ms": 70.78392379917203,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2777.0,
+   "buffers_hit": 2777.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.917,
+    4.595,
+    68.704,
+    21.001,
+    89.507,
+    7.293,
+    3.373,
+    3.02,
+    2.37,
+    2.973
+   ],
+   "member_first": true,
+   "gamma": 1
+  },
+  {
+   "engine": "acorn_g2_infilter",
+   "sel": 1,
+   "ef": 40,
+   "recall": 1.0,
+   "med_ms": 1.756752491928637,
+   "p90_ms": 70.35227859159932,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 1706.0,
+   "buffers_hit": 1706.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    0.808,
+    2.289,
+    1.195,
+    1.314,
+    1.255,
+    1.588,
+    2.413,
+    1.926,
+    68.427,
+    87.684
+   ],
+   "member_first": true,
+   "gamma": 2
+  },
+  {
+   "engine": "acorn_g2_infilter",
+   "sel": 1,
+   "ef": 100,
+   "recall": 1.0,
+   "med_ms": 2.0072315237484872,
+   "p90_ms": 2.2955659311264753,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 3404.0,
+   "buffers_hit": 3404.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.515,
+    2.002,
+    1.928,
+    1.773,
+    2.271,
+    1.842,
+    2.101,
+    2.013,
+    2.061,
+    1.684
+   ],
+   "member_first": true,
+   "gamma": 2
+  },
+  {
+   "engine": "acorn_g2_infilter",
+   "sel": 5,
+   "ef": 40,
+   "recall": 0.85,
+   "med_ms": 1.1227720533497632,
+   "p90_ms": 1.7587234964594245,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2006.7,
+   "buffers_hit": 2006.7,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.756,
+    1.779,
+    1.612,
+    1.232,
+    1.108,
+    1.085,
+    1.066,
+    1.111,
+    1.113,
+    1.132
+   ],
+   "member_first": true,
+   "gamma": 2
+  },
+  {
+   "engine": "acorn_g2_infilter",
+   "sel": 5,
+   "ef": 100,
+   "recall": 0.99,
+   "med_ms": 4.137358977459371,
+   "p90_ms": 39.897047833073856,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 3885.0,
+   "buffers_hit": 3885.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.035,
+    4.23,
+    4.045,
+    3.814,
+    31.123,
+    118.863,
+    22.649,
+    4.466,
+    3.383,
+    3.308
+   ],
+   "member_first": true,
+   "gamma": 2
+  },
+  {
+   "engine": "acorn_g2_infilter",
+   "sel": 20,
+   "ef": 40,
+   "recall": 0.65,
+   "med_ms": 1.84737698873505,
+   "p90_ms": 51.5010413713753,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2194.0,
+   "buffers_hit": 2194.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    1.937,
+    1.978,
+    1.837,
+    1.597,
+    1.593,
+    112.207,
+    44.756,
+    1.858,
+    1.492,
+    1.474
+   ],
+   "member_first": true,
+   "gamma": 2
+  },
+  {
+   "engine": "acorn_g2_infilter",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.93,
+   "med_ms": 3.7402550224214792,
+   "p90_ms": 4.628134763333946,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 4765.0,
+   "buffers_hit": 4765.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    3.83,
+    3.81,
+    6.391,
+    4.411,
+    3.67,
+    3.469,
+    3.625,
+    2.97,
+    2.876,
+    4.432
+   ],
+   "member_first": true,
+   "gamma": 2
+  },
+  {
+   "engine": "acorn_g2_postfilter",
+   "sel": 1,
+   "ef": 40,
+   "recall": 0.27,
+   "med_ms": 4.578672524075955,
+   "p90_ms": 61.71727064065634,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 3498.0,
+   "buffers_hit": 3498.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.998,
+    2.926,
+    3.642,
+    2.957,
+    4.599,
+    4.558,
+    31.987,
+    12.963,
+    100.664,
+    57.39
+   ],
+   "member_first": false,
+   "gamma": 2,
+   "filter_pushdown": false
+  },
+  {
+   "engine": "acorn_g2_postfilter",
+   "sel": 1,
+   "ef": 100,
+   "recall": 0.56,
+   "med_ms": 5.926194950006902,
+   "p90_ms": 31.658094841986834,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 6105.0,
+   "buffers_hit": 6105.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    3.504,
+    4.294,
+    4.059,
+    14.617,
+    6.713,
+    5.347,
+    5.009,
+    6.505,
+    185.029,
+    7.22
+   ],
+   "member_first": false,
+   "gamma": 2,
+   "filter_pushdown": false
+  },
+  {
+   "engine": "acorn_g2_postfilter",
+   "sel": 5,
+   "ef": 40,
+   "recall": 0.38999999999999996,
+   "med_ms": 3.0827124719507992,
+   "p90_ms": 4.342030524276196,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2573.0,
+   "buffers_hit": 2573.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.202,
+    1.764,
+    1.764,
+    5.723,
+    4.189,
+    3.234,
+    3.129,
+    3.036,
+    3.3,
+    2.841
+   ],
+   "member_first": false,
+   "gamma": 2,
+   "filter_pushdown": false
+  },
+  {
+   "engine": "acorn_g2_postfilter",
+   "sel": 5,
+   "ef": 100,
+   "recall": 0.74,
+   "med_ms": 3.5891089937649667,
+   "p90_ms": 19.050216057803432,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 5427.3,
+   "buffers_hit": 5427.3,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    3.011,
+    4.538,
+    3.984,
+    4.263,
+    3.017,
+    3.236,
+    3.314,
+    3.489,
+    3.689,
+    149.658
+   ],
+   "member_first": false,
+   "gamma": 2,
+   "filter_pushdown": false
+  },
+  {
+   "engine": "acorn_g2_postfilter",
+   "sel": 20,
+   "ef": 40,
+   "recall": 0.47000000000000003,
+   "med_ms": 1.86316849431023,
+   "p90_ms": 4.52180971624329,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2049.0,
+   "buffers_hit": 2049.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.637,
+    2.05,
+    1.855,
+    1.508,
+    1.598,
+    1.756,
+    1.923,
+    1.666,
+    1.871,
+    21.487
+   ],
+   "member_first": false,
+   "gamma": 2,
+   "filter_pushdown": false
+  },
+  {
+   "engine": "acorn_g2_postfilter",
+   "sel": 20,
+   "ef": 100,
+   "recall": 0.53,
+   "med_ms": 2.0313564455136657,
+   "p90_ms": 2.711257291957736,
+   "plan_node": "Index Scan using tv_acorn_idx on tv_items",
+   "buffers_per_query": 2159.0,
+   "buffers_hit": 2159.0,
+   "buffers_read": 0.0,
+   "lats_ms": [
+    2.656,
+    1.627,
+    1.526,
+    2.357,
+    1.966,
+    3.213,
+    2.097,
+    2.544,
+    1.344,
+    1.4
+   ],
+   "member_first": false,
+   "gamma": 2,
+   "filter_pushdown": false
+  }
+ ]
+}

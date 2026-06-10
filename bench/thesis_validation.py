@@ -254,6 +254,10 @@ def timed_index(cur, key, ddl, idxname):
         "seconds": round(bt, 1), "size_mb": round(size / 1048576, 1)}
     dump()
     print(f"[build] {key}: {bt:.1f}s, {size/1048576:.1f} MB", flush=True)
+    # flush build dirty pages NOW so checkpointer/bgwriter IO does not
+    # contend with the query measurements that follow (rep1 showed 4-10x
+    # median inflation in stages measured right after large builds)
+    cur.execute("CHECKPOINT")
 
 
 def meta_get(cur, k):
