@@ -30,6 +30,15 @@ int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
 /* GUC: Tier 2 scan fast-path toggle — direct C distance kernel (fmgr bypass) */
 bool acorn_scan_direct_dist = true;
 
+/*
+ * GUC: Tier 2 scan fast-path toggle — prefetch neighbor pages per expansion.
+ * Default OFF: measured -10..-13% QPS on warm shared_buffers (every
+ * PrefetchBuffer is a redundant buffer-table lookup when the page is already
+ * resident).  Enable for IO-bound deployments where the index exceeds
+ * shared_buffers and reads hit the OS/disk.
+ */
+bool acorn_scan_prefetch = false;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -98,6 +107,21 @@ _PG_init(void)
 		NULL,
 		&acorn_scan_direct_dist,
 		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_prefetch */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_prefetch",
+		"Prefetch distinct unvisited neighbor pages before the per-neighbor "
+		"distance loop in acorn_hnsw scan expansions.  Off by default: pure "
+		"overhead when the index is resident in shared_buffers; enable for "
+		"IO-bound scans.",
+		NULL,
+		&acorn_scan_prefetch,
+		false,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

@@ -13,5 +13,6 @@ extern int  acorn_ef_search;
 
 /* Tier 2 scan fast-path toggles (debug/benchmark; default on) */
 extern bool acorn_scan_direct_dist;
+extern bool acorn_scan_prefetch;
 
 #endif /* PG_ACORN_H */

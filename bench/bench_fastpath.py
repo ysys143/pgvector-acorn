@@ -39,7 +39,9 @@ BASELINE_FILE = os.path.join(os.path.dirname(__file__), "results_fastpath_baseli
 
 # Cumulative toggle order — each entry adds one optimization on top of the
 # previous config.  Only toggles that exist in this binary are used.
-TOGGLE_ORDER = ["scan_direct_dist", "scan_prefetch", "scan_single_read"]
+# scan_prefetch goes LAST: it regresses the warm-cache path (default off),
+# so it must not sit inside the chain and pollute later attributions.
+TOGGLE_ORDER = ["scan_direct_dist", "scan_single_read", "scan_prefetch"]
 
 
 def make_data():

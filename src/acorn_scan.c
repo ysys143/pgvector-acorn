@@ -1104,6 +1104,39 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 								   ce_level, 0, s->m, neighbors,
 								   HNSW_MAX_NEIGHBORS);
 
+	/*
+	 * Prefetch distinct unvisited neighbor pages before the per-neighbor
+	 * loop, so the buffer manager can issue I/O ahead of the sequential
+	 * load+distance pass below.  PrefetchBuffer does not pin.
+	 */
+	if (acorn_scan_prefetch)
+	{
+		BlockNumber seen[HNSW_MAX_NEIGHBORS];
+		int			n_seen = 0;
+
+		for (int i = 0; i < n_count; i++)
+		{
+			BlockNumber blk;
+			int			j;
+
+			if (!ItemPointerIsValid(&neighbors[i]))
+				continue;
+			if (is_visited(s->visited, &neighbors[i]))
+				continue;
+
+			blk = ItemPointerGetBlockNumber(&neighbors[i]);
+			for (j = 0; j < n_seen; j++)
+			{
+				if (seen[j] == blk)
+					break;
+			}
+			if (j < n_seen)
+				continue;
+			seen[n_seen++] = blk;
+			PrefetchBuffer(s->index, MAIN_FORKNUM, blk);
+		}
+	}
+
 	for (int i = 0; i < n_count; i++)
 	{
 		BlockNumber		nblkno;
