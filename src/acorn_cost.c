@@ -28,13 +28,21 @@
 
 #include "acorn_am.h"
 #include "acorn_cost.h"
-#include "pg_acorn.h"		/* acorn_ef_search GUC */
 
 /* Pure ORDER BY: pages charged per returned (emitted) tuple */
 #define ACORN_PAGES_PER_TUPLE		16.0
 
 /* In-filter: pages per expanded graph node (element page + neighbor page) */
 #define ACORN_T2_PAGES_PER_NODE		2.0
+
+/* In-filter: typical ef_search value used to bound expansion count.
+ * NOTE: deliberately a constant, not the live pg_acorn.ef_search GUC. Using the
+ * real ef would make the planner abandon the acorn scan for a bitmap prefilter
+ * at high ef even in the mid-selectivity band where acorn is empirically 6-8x
+ * faster (n=30K correlated: g4 0.955@203qps vs bitmap 1.0@23qps at 40%). The
+ * cost model has no recall signal, so a naive ef-aware cost mis-trades speed
+ * for an unneeded exact path. Revisit as a deliberate recall-aware calibration. */
+#define ACORN_T2_EF_SEARCH_EST		40.0
 
 void
 acorn_hnsw_costestimate(PlannerInfo *root,
@@ -84,16 +92,11 @@ acorn_hnsw_costestimate(PlannerInfo *root,
 		 */
 		Selectivity sel = costs.indexSelectivity;
 		double		N_total = Max((double) path->indexinfo->tuples, 1.0);
-		double		ef = (double) Max(acorn_ef_search, 1);
 		double		n_expand;
 
 		if (sel <= 0.0)
 			sel = 0.001;
-		/* Use the live ef_search GUC, not a constant: raising ef_search raises
-		 * the real expansion work, so the planner must see the acorn scan get
-		 * more expensive — otherwise it under-costs acorn and wrongly keeps it
-		 * over a bitmap prefilter when the filter is selective. */
-		n_expand = Min(ef / sel, N_total);
+		n_expand = Min(ACORN_T2_EF_SEARCH_EST / sel, N_total);
 
 		costs.indexStartupCost = log(Max(N_total, 2.0)) * spc_rand_cost;
 		costs.indexTotalCost = costs.indexStartupCost
