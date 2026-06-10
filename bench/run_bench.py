@@ -100,17 +100,24 @@ def main() -> None:
         ["a", "b", "c", "d"] if args.scenario == "all" else [args.scenario]
     )
 
+    # Exact scenario-A ground truth is target-independent (same vectors, queries,
+    # selectivities; computed via seqscan). Build it once, on the first target's
+    # bench_items table, and reuse it — this also lets non-PG targets (Qdrant),
+    # whose setup() does not create bench_items, run without re-querying it.
+    truth = None
+
     for target in targets:
         print(f"\n[{target.name}] setting up...")
         target.setup(vectors, metadata)
 
         pgvector_ref = PgvectorTarget(args.dsn)
 
-        truth = build_ground_truth(
-            pgvector_ref, queries,
-            selectivities=a_selectivity_sweep.SELECTIVITIES,
-            k=a_selectivity_sweep.K,
-        )
+        if truth is None:
+            truth = build_ground_truth(
+                pgvector_ref, queries,
+                selectivities=a_selectivity_sweep.SELECTIVITIES,
+                k=a_selectivity_sweep.K,
+            )
         target_results: dict = {}
 
         if "a" in run_scenarios:
