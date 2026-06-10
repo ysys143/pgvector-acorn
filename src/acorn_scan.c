@@ -20,13 +20,17 @@
 #include "executor/tuptable.h"
 #include "lib/pairingheap.h"
 #include "storage/bufmgr.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "access/tableam.h"
+#include "catalog/pg_type.h"
 
+#include "pg_acorn.h"
 #include "acorn_scan.h"
 #include "hnsw_compat.h"
 #include "acorn_t2_page.h"
+#include "acorn_dist.h"
 
 /* -----------------------------------------------------------------------
  * Internal element reference
@@ -262,6 +266,37 @@ acorn_load_dist_proc(Relation index, FmgrInfo *finfo)
 	 */
 	RegProcedure proc = index->rd_support[0];
 	fmgr_info((Oid) proc, finfo);
+}
+
+/*
+ * Resolve a direct C kernel for the opclass distance function (fmgr bypass).
+ *
+ * Matched by function name + signature (2 args, float8 return).  The kernels
+ * in acorn_dist.c are compiled with pgvector's flags and replicate its loops,
+ * so results are numerically identical to the fmgr path.  Returns NULL for
+ * unknown opclasses — callers must keep the fmgr fallback.
+ */
+static AcornDistFn
+acorn_resolve_direct_dist(Relation index)
+{
+	Oid			procOid = (Oid) index->rd_support[0];
+	char	   *name;
+	AcornDistFn fn = NULL;
+
+	if (get_func_rettype(procOid) != FLOAT8OID)
+		return NULL;
+
+	name = get_func_name(procOid);
+	if (name == NULL)
+		return NULL;
+
+	if (strcmp(name, "vector_l2_squared_distance") == 0)
+		fn = acorn_dist_l2sq;
+	else if (strcmp(name, "vector_negative_inner_product") == 0)
+		fn = acorn_dist_neg_ip;
+
+	pfree(name);
+	return fn;
 }
 
 /*
@@ -818,6 +853,7 @@ struct AcornT2StreamScan
 {
 	Relation		index;
 	FmgrInfo		dist_proc;
+	AcornDistFn		dist_direct;	/* fmgr bypass kernel; NULL = use dist_proc */
 	Datum			query;
 	int				m;
 	int				ef_search;		/* expansion budget: max node expansions */
@@ -866,30 +902,52 @@ acorn_t2_load_element(Relation index, BlockNumber blkno, OffsetNumber offno,
 }
 
 /*
+ * Compute distance(stored vector, query) for a T2 element tuple.
+ *
+ * Uses the direct C kernel when one was resolved for the opclass (fmgr
+ * bypass; numerically identical), falling back to the opclass support
+ * function through fmgr otherwise.  Caller holds the buffer lock.
+ */
+static inline double
+acorn_t2_etup_distance(AcornT2StreamScan *s, AcornT2ElementTuple etup)
+{
+	if (s->dist_direct)
+	{
+		AcornPgVector *v = (AcornPgVector *) AcornT2ElementTupleGetVector(etup);
+		AcornPgVector *q = (AcornPgVector *) DatumGetPointer(s->query);
+
+		if (likely(v->dim == q->dim))
+			return s->dist_direct((int) v->dim, v->x, q->x);
+	}
+
+	return DatumGetFloat8(
+		FunctionCall2(&s->dist_proc,
+					  PointerGetDatum(AcornT2ElementTupleGetVector(etup)),
+					  s->query));
+}
+
+/*
  * Distance using the T2 vector accessor (offset 80, not 72).
  */
 static double
-acorn_t2_distance(Relation index, BlockNumber blkno, OffsetNumber offno,
-				   Datum query, FmgrInfo *dist_proc)
+acorn_t2_distance(AcornT2StreamScan *s, BlockNumber blkno, OffsetNumber offno)
 {
 	Buffer				buf;
 	Page				page;
 	ItemId				iid;
 	AcornT2ElementTuple etup;
-	Datum				result;
+	double				result;
 
-	buf  = ReadBuffer(index, blkno);
+	buf  = ReadBuffer(s->index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	iid  = PageGetItemId(page, offno);
 	etup = (AcornT2ElementTuple) PageGetItem(page, iid);
 
-	result = FunctionCall2(dist_proc,
-						   PointerGetDatum(AcornT2ElementTupleGetVector(etup)),
-						   query);
+	result = acorn_t2_etup_distance(s, etup);
 
 	UnlockReleaseBuffer(buf);
-	return DatumGetFloat8(result);
+	return result;
 }
 
 /*
@@ -917,10 +975,7 @@ acorn_t2_load_node(AcornT2StreamScan *s,
 	etup = (AcornT2ElementTuple)
 		   PageGetItem(page, PageGetItemId(page, offno));
 
-	dist = DatumGetFloat8(
-		FunctionCall2(&s->dist_proc,
-					  PointerGetDatum(AcornT2ElementTupleGetVector(etup)),
-					  s->query));
+	dist = acorn_t2_etup_distance(s, etup);
 
 	*heaptid_out    = etup->heaptids[0];
 	*deleted_out    = (etup->deleted != 0);
@@ -966,13 +1021,13 @@ acorn_t2_eval_filter(ScanKey keys, int nkeys, int64 stored_val)
  * element loader and distance function.
  */
 static void
-acorn_t2_greedy_descent(Relation index, int m,
+acorn_t2_greedy_descent(AcornT2StreamScan *s,
 						  BlockNumber *cur_blkno, OffsetNumber *cur_offno,
-						  int start_level, int target_level,
-						  Datum query, FmgrInfo *dist_proc)
+						  int start_level, int target_level)
 {
-	double cur_dist = acorn_t2_distance(index, *cur_blkno, *cur_offno,
-										 query, dist_proc);
+	Relation	index = s->index;
+	int			m = s->m;
+	double		cur_dist = acorn_t2_distance(s, *cur_blkno, *cur_offno);
 
 	for (int lc = start_level; lc > target_level; lc--)
 	{
@@ -1008,7 +1063,7 @@ acorn_t2_greedy_descent(Relation index, int m,
 				if (!ItemPointerIsValid(&neighbors[i]))
 					continue;
 
-				nd = acorn_t2_distance(index, nblkno, noffno, query, dist_proc);
+				nd = acorn_t2_distance(s, nblkno, noffno);
 				if (nd < cur_dist)
 				{
 					cur_dist   = nd;
@@ -1120,6 +1175,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->n_expansions = 0;
 	s->exhausted    = false;
 	acorn_load_dist_proc(index, &s->dist_proc);
+	s->dist_direct = acorn_scan_direct_dist
+		? acorn_resolve_direct_dist(index) : NULL;
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
 	{
@@ -1130,8 +1187,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->m = m;
 
 	if (entry_level > 0)
-		acorn_t2_greedy_descent(index, m, &entry_blkno, &entry_offno,
-								 entry_level, 0, query, &s->dist_proc);
+		acorn_t2_greedy_descent(s, &entry_blkno, &entry_offno,
+								 entry_level, 0);
 
 	s->C = pairingheap_allocate(pq_cmp_min, NULL);	/* candidates, nearest-first */
 	s->R = pairingheap_allocate(pq_cmp_min, NULL);	/* results, nearest-first */

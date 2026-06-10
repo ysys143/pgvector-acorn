@@ -27,6 +27,9 @@ bool acorn_enable_2hop = false;
 /* GUC: runtime ef_search cap for acorn_hnsw (Tier 2) streaming scans */
 int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
 
+/* GUC: Tier 2 scan fast-path toggle — direct C distance kernel (fmgr bypass) */
+bool acorn_scan_direct_dist = true;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -81,6 +84,20 @@ _PG_init(void)
 		ACORN_DEFAULT_EF_SEARCH,	/* default */
 		1,							/* min */
 		4000,						/* max (expansion budget; allows deep sweeps) */
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_direct_dist */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_direct_dist",
+		"Use direct C distance kernels (fmgr bypass) in acorn_hnsw scans "
+		"for known pgvector distance functions.  Off forces the fmgr path "
+		"(debug/benchmark; results are numerically identical).",
+		NULL,
+		&acorn_scan_direct_dist,
+		true,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL
