@@ -1,0 +1,97 @@
+loading 20000 rows (correlated buckets)...
+
+building g2_off (gamma=2, payload_edges=false)...
+  built in 68.8s
+  g2_off  mf=off sel= 1%  ef=  40  recall=0.403  med=2.02ms  p90=10.09ms
+  g2_off  mf=off sel= 1%  ef= 100  recall=0.657  med=3.16ms  p90=13.62ms
+  g2_off  mf=off sel= 1%  ef= 200  recall=0.850  med=5.68ms  p90=14.21ms
+  g2_off  mf=off sel= 1%  ef= 400  recall=0.967  med=16.62ms  p90=81.21ms
+  g2_off  mf=off sel=40%  ef=  40  recall=0.897  med=1.14ms  p90=1.85ms
+  g2_off  mf=off sel=40%  ef= 100  recall=0.897  med=1.66ms  p90=15.98ms
+  g2_off  mf=off sel=40%  ef= 200  recall=0.897  med=1.10ms  p90=1.82ms
+  g2_off  mf=off sel=40%  ef= 400  recall=0.897  med=1.38ms  p90=1.84ms
+  g2_off  mf=on  sel= 1%  ef=  40  recall=0.270  med=1.62ms  p90=2.35ms
+  g2_off  mf=on  sel= 1%  ef= 100  recall=0.527  med=3.19ms  p90=4.41ms
+  g2_off  mf=on  sel= 1%  ef= 200  recall=0.767  med=5.29ms  p90=74.56ms
+  g2_off  mf=on  sel= 1%  ef= 400  recall=0.947  med=13.05ms  p90=99.31ms
+  g2_off  mf=on  sel=40%  ef=  40  recall=0.753  med=1.72ms  p90=2.51ms
+  g2_off  mf=on  sel=40%  ef= 100  recall=0.880  med=3.29ms  p90=8.68ms
+  g2_off  mf=on  sel=40%  ef= 200  recall=0.960  med=6.02ms  p90=26.59ms
+  g2_off  mf=on  sel=40%  ef= 400  recall=0.993  med=39.46ms  p90=81.59ms
+
+building g4_off (gamma=4, payload_edges=false)...
+  built in 78.8s
+  g4_off  mf=off sel= 1%  ef=  40  recall=0.577  med=2.63ms  p90=7.75ms
+  g4_off  mf=off sel= 1%  ef= 100  recall=0.810  med=5.44ms  p90=13.49ms
+  g4_off  mf=off sel= 1%  ef= 200  recall=0.947  med=8.15ms  p90=69.75ms
+  g4_off  mf=off sel= 1%  ef= 400  recall=0.997  med=57.20ms  p90=100.05ms
+  g4_off  mf=off sel=40%  ef=  40  recall=0.957  med=1.79ms  p90=7.02ms
+  g4_off  mf=off sel=40%  ef= 100  recall=0.957  med=2.34ms  p90=14.26ms
+  g4_off  mf=off sel=40%  ef= 200  recall=0.957  med=1.78ms  p90=2.91ms
+  g4_off  mf=off sel=40%  ef= 400  recall=0.957  med=1.56ms  p90=3.87ms
+  g4_off  mf=on  sel= 1%  ef=  40  recall=0.393  med=3.56ms  p90=17.11ms
+  g4_off  mf=on  sel= 1%  ef= 100  recall=0.590  med=4.69ms  p90=11.75ms
+  g4_off  mf=on  sel= 1%  ef= 200  recall=0.853  med=9.66ms  p90=72.88ms
+  g4_off  mf=on  sel= 1%  ef= 400  recall=0.980  med=54.22ms  p90=108.55ms
+  g4_off  mf=on  sel=40%  ef=  40  recall=0.853  med=2.74ms  p90=40.40ms
+  g4_off  mf=on  sel=40%  ef= 100  recall=0.953  med=6.08ms  p90=16.88ms
+  g4_off  mf=on  sel=40%  ef= 200  recall=0.990  med=25.14ms  p90=78.80ms
+  g4_off  mf=on  sel=40%  ef= 400  recall=0.997  med=59.99ms  p90=107.37ms
+
+building g1_on (gamma=1, payload_edges=true)...
+  built in 31.3s
+  g1_on   mf=off sel= 1%  ef=  40  recall=0.157  med=1.14ms  p90=1.72ms
+  g1_on   mf=off sel= 1%  ef= 100  recall=0.380  med=1.79ms  p90=2.96ms
+  g1_on   mf=off sel= 1%  ef= 200  recall=0.567  med=3.57ms  p90=20.97ms
+  g1_on   mf=off sel= 1%  ef= 400  recall=0.787  med=5.83ms  p90=22.60ms
+  g1_on   mf=off sel=40%  ef=  40  recall=0.590  med=0.64ms  p90=1.21ms
+  g1_on   mf=off sel=40%  ef= 100  recall=0.590  med=0.83ms  p90=1.71ms
+  g1_on   mf=off sel=40%  ef= 200  recall=0.590  med=0.76ms  p90=1.23ms
+  g1_on   mf=off sel=40%  ef= 400  recall=0.590  med=0.70ms  p90=0.85ms
+  g1_on   mf=on  sel= 1%  ef=  40  recall=0.990  med=0.77ms  p90=13.03ms
+  g1_on   mf=on  sel= 1%  ef= 100  recall=1.000  med=1.01ms  p90=1.97ms
+  g1_on   mf=on  sel= 1%  ef= 200  recall=1.000  med=1.78ms  p90=4.48ms
+  g1_on   mf=on  sel= 1%  ef= 400  recall=1.000  med=4.88ms  p90=27.69ms
+  g1_on   mf=on  sel=40%  ef=  40  recall=0.527  med=1.15ms  p90=3.41ms
+  g1_on   mf=on  sel=40%  ef= 100  recall=0.687  med=1.81ms  p90=4.68ms
+  g1_on   mf=on  sel=40%  ef= 200  recall=0.767  med=4.22ms  p90=11.04ms
+  g1_on   mf=on  sel=40%  ef= 400  recall=0.823  med=5.52ms  p90=21.84ms
+
+building g2_on (gamma=2, payload_edges=true)...
+  built in 57.0s
+  g2_on   mf=off sel= 1%  ef=  40  recall=0.293  med=1.44ms  p90=1.69ms
+  g2_on   mf=off sel= 1%  ef= 100  recall=0.557  med=3.38ms  p90=18.32ms
+  g2_on   mf=off sel= 1%  ef= 200  recall=0.793  med=5.72ms  p90=60.04ms
+  g2_on   mf=off sel= 1%  ef= 400  recall=0.953  med=17.88ms  p90=116.09ms
+  g2_on   mf=off sel=40%  ef=  40  recall=0.780  med=1.08ms  p90=1.61ms
+  g2_on   mf=off sel=40%  ef= 100  recall=0.780  med=1.12ms  p90=1.53ms
+  g2_on   mf=off sel=40%  ef= 200  recall=0.780  med=1.03ms  p90=1.23ms
+  g2_on   mf=off sel=40%  ef= 400  recall=0.780  med=1.18ms  p90=1.84ms
+  g2_on   mf=on  sel= 1%  ef=  40  recall=1.000  med=1.06ms  p90=1.33ms
+  g2_on   mf=on  sel= 1%  ef= 100  recall=1.000  med=1.99ms  p90=2.91ms
+  g2_on   mf=on  sel= 1%  ef= 200  recall=1.000  med=5.04ms  p90=7.11ms
+  g2_on   mf=on  sel= 1%  ef= 400  recall=1.000  med=8.27ms  p90=75.13ms
+  g2_on   mf=on  sel=40%  ef=  40  recall=0.703  med=2.36ms  p90=5.32ms
+  g2_on   mf=on  sel=40%  ef= 100  recall=0.867  med=3.99ms  p90=7.55ms
+  g2_on   mf=on  sel=40%  ef= 200  recall=0.950  med=6.26ms  p90=23.96ms
+  g2_on   mf=on  sel=40%  ef= 400  recall=0.960  med=11.58ms  p90=124.43ms
+
+=== summary (recall / median ms / p90 ms) ===
+config   mf   sel%  ef=40                      ef=100                     ef=200                     ef=400                   
+g2_off   off    1   0.403/  2.02/  10.09   0.657/  3.16/  13.62   0.850/  5.68/  14.21   0.967/ 16.62/  81.21   
+g2_off   off   40   0.897/  1.14/   1.85   0.897/  1.66/  15.98   0.897/  1.10/   1.82   0.897/  1.38/   1.84   
+g2_off   on     1   0.270/  1.62/   2.35   0.527/  3.19/   4.41   0.767/  5.29/  74.56   0.947/ 13.05/  99.31   
+g2_off   on    40   0.753/  1.72/   2.51   0.880/  3.29/   8.68   0.960/  6.02/  26.59   0.993/ 39.46/  81.59   
+g4_off   off    1   0.577/  2.63/   7.75   0.810/  5.44/  13.49   0.947/  8.15/  69.75   0.997/ 57.20/ 100.05   
+g4_off   off   40   0.957/  1.79/   7.02   0.957/  2.34/  14.26   0.957/  1.78/   2.91   0.957/  1.56/   3.87   
+g4_off   on     1   0.393/  3.56/  17.11   0.590/  4.69/  11.75   0.853/  9.66/  72.88   0.980/ 54.22/ 108.55   
+g4_off   on    40   0.853/  2.74/  40.40   0.953/  6.08/  16.88   0.990/ 25.14/  78.80   0.997/ 59.99/ 107.37   
+g1_on    off    1   0.157/  1.14/   1.72   0.380/  1.79/   2.96   0.567/  3.57/  20.97   0.787/  5.83/  22.60   
+g1_on    off   40   0.590/  0.64/   1.21   0.590/  0.83/   1.71   0.590/  0.76/   1.23   0.590/  0.70/   0.85   
+g1_on    on     1   0.990/  0.77/  13.03   1.000/  1.01/   1.97   1.000/  1.78/   4.48   1.000/  4.88/  27.69   
+g1_on    on    40   0.527/  1.15/   3.41   0.687/  1.81/   4.68   0.767/  4.22/  11.04   0.823/  5.52/  21.84   
+g2_on    off    1   0.293/  1.44/   1.69   0.557/  3.38/  18.32   0.793/  5.72/  60.04   0.953/ 17.88/ 116.09   
+g2_on    off   40   0.780/  1.08/   1.61   0.780/  1.12/   1.53   0.780/  1.03/   1.23   0.780/  1.18/   1.84   
+g2_on    on     1   1.000/  1.06/   1.33   1.000/  1.99/   2.91   1.000/  5.04/   7.11   1.000/  8.27/  75.13   
+g2_on    on    40   0.703/  2.36/   5.32   0.867/  3.99/   7.55   0.950/  6.26/  23.96   0.960/ 11.58/ 124.43   
+done
