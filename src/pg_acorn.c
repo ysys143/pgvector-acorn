@@ -38,6 +38,36 @@ int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
  */
 bool acorn_member_first = false;
 
+/* GUC: Tier 2 scan fast-path toggle — direct C distance kernel (fmgr bypass) */
+bool acorn_scan_direct_dist = true;
+
+/*
+ * GUC: Tier 2 scan fast-path toggle — prefetch neighbor pages per expansion.
+ * Default OFF: measured -10..-13% QPS on warm shared_buffers (every
+ * PrefetchBuffer is a redundant buffer-table lookup when the page is already
+ * resident).  Enable for IO-bound deployments where the index exceeds
+ * shared_buffers and reads hit the OS/disk.
+ */
+bool acorn_scan_prefetch = false;
+
+/*
+ * GUC: Tier 2 scan fast-path toggle — carry neighbor-tuple location + level
+ * in the candidate queue so expansion does not re-read the element page.
+ */
+bool acorn_scan_single_read = true;
+
+/*
+ * GUC: Tier 2 scan fast-path toggle — single hash probe for the visited set
+ * (HASH_ENTER with found flag instead of HASH_FIND + HASH_ENTER).
+ */
+bool acorn_scan_visited_oneprobe = true;
+
+/*
+ * GUC: Tier 2 scan fast-path toggle — direct int4 comparison for known
+ * btree int4 operator predicates in the inline filter (fmgr bypass).
+ */
+bool acorn_scan_direct_filter = true;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -105,6 +135,77 @@ _PG_init(void)
 		NULL,
 		&acorn_member_first,
 		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_direct_dist */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_direct_dist",
+		"Use direct C distance kernels (fmgr bypass) in acorn_hnsw scans "
+		"for known pgvector distance functions.  Off forces the fmgr path "
+		"(debug/benchmark; results are numerically identical).",
+		NULL,
+		&acorn_scan_direct_dist,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_prefetch */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_prefetch",
+		"Prefetch distinct unvisited neighbor pages before the per-neighbor "
+		"distance loop in acorn_hnsw scan expansions.  Off by default: pure "
+		"overhead when the index is resident in shared_buffers; enable for "
+		"IO-bound scans.",
+		NULL,
+		&acorn_scan_prefetch,
+		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_single_read */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_single_read",
+		"Capture neighbor-tuple location at node discovery so acorn_hnsw "
+		"scan expansion does not re-read the element page (debug/benchmark; "
+		"results identical).",
+		NULL,
+		&acorn_scan_single_read,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_visited_oneprobe */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_visited_oneprobe",
+		"Use a single hash probe (HASH_ENTER) for the acorn_hnsw scan "
+		"visited set instead of find-then-enter (debug/benchmark; results "
+		"identical).",
+		NULL,
+		&acorn_scan_visited_oneprobe,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_direct_filter */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_direct_filter",
+		"Evaluate known int4 comparison predicates on the inline filter "
+		"value with direct C compares instead of fmgr (debug/benchmark; "
+		"results identical).",
+		NULL,
+		&acorn_scan_direct_filter,
+		true,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL
