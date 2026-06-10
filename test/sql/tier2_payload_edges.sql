@@ -42,12 +42,18 @@ FROM generate_series(1, 2000) i;
 CREATE TABLE items_on AS SELECT * FROM items_off;
 
 -- (a) reloption accepted; index builds with payload edges off and on.
+-- acorn_diversify is pinned OFF in both indexes: this test isolates the
+-- payload-edges effect against legacy nearest-only selection (the strict
+-- eq_gt_ef100 assertion was calibrated on that baseline; the diversity
+-- heuristic lifts the off-index enough that payload edges no longer strictly
+-- beat it — diversity has its own test in tier2_diversify.sql).
 CREATE INDEX items_off_idx ON items_off
     USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
-    WITH (m = 16, ef_construction = 64, acorn_gamma = 1);
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 1, acorn_diversify = false);
 CREATE INDEX items_on_idx ON items_on
     USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
-    WITH (m = 16, ef_construction = 64, acorn_gamma = 1, acorn_payload_edges = true);
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 1, acorn_payload_edges = true,
+          acorn_diversify = false);
 
 SELECT reloptions FROM pg_class WHERE relname = 'items_on_idx';
 
