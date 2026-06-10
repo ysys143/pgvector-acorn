@@ -44,3 +44,87 @@ acorn_dist_neg_ip(int dim, const float *ax, const float *bx)
 
 	return (double) -distance;
 }
+
+/* -----------------------------------------------------------------------
+ * SQ8 asymmetric kernels (vector co-location)
+ *
+ * Stored codes dequantize as offset + scale * code[i]; the query side is
+ * float.  Same accumulator discipline as the exact kernels so the compiler
+ * auto-vectorizes the loops under the Makefile's pgvector flags.
+ * ----------------------------------------------------------------------- */
+
+double
+acorn_dist_l2sq_sq8(int dim, const uint8 *code, float scale, float offset,
+					const float *qx)
+{
+	float		distance = 0.0;
+
+	/* Auto-vectorized */
+	for (int i = 0; i < dim; i++)
+	{
+		float		diff = qx[i] - (offset + scale * (float) code[i]);
+
+		distance += diff * diff;
+	}
+
+	return (double) distance;
+}
+
+double
+acorn_dist_neg_ip_sq8(int dim, const uint8 *code, float scale, float offset,
+					  const float *qx)
+{
+	float		distance = 0.0;
+
+	/* Auto-vectorized */
+	for (int i = 0; i < dim; i++)
+		distance += qx[i] * (offset + scale * (float) code[i]);
+
+	return (double) -distance;
+}
+
+/*
+ * Affine SQ8 encoder: code[i] = round((x[i] - min) / scale), scale =
+ * (max - min) / 255.  Constant vectors encode with scale 0 (codes all 0,
+ * dequantizing back to the constant via offset).
+ */
+void
+acorn_sq8_encode(int dim, const float *x, uint8 *code_out,
+				 float *scale_out, float *offset_out)
+{
+	float		lo = x[0];
+	float		hi = x[0];
+	float		scale;
+	float		inv;
+
+	for (int i = 1; i < dim; i++)
+	{
+		if (x[i] < lo)
+			lo = x[i];
+		if (x[i] > hi)
+			hi = x[i];
+	}
+
+	scale = (hi - lo) / 255.0f;
+	inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+
+	/* Auto-vectorized */
+	for (int i = 0; i < dim; i++)
+	{
+		float		q = (x[i] - lo) * inv + 0.5f;
+
+		code_out[i] = (uint8) q;	/* q in [0, 255.5); truncation == round */
+	}
+
+	*scale_out = scale;
+	*offset_out = lo;
+}
+
+void
+acorn_sq8_decode(int dim, const uint8 *code, float scale, float offset,
+				 float *x_out)
+{
+	/* Auto-vectorized */
+	for (int i = 0; i < dim; i++)
+		x_out[i] = offset + scale * (float) code[i];
+}

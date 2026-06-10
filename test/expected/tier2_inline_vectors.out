@@ -1,0 +1,210 @@
+-- tier2_inline_vectors.sql: vector co-location (acorn_inline_vectors).
+--
+-- The reloption stores, per layer-0 neighbor slot, an SQ8-quantized copy of
+-- the target's vector plus its heaptid/filter_val/nbrtid, so the tier2 scan
+-- discovers neighbors without per-neighbor element-page reads.  Emitted
+-- results are re-ranked with exact distances.
+--
+-- Tests: reloption accepted; filter correctness across ef_search; REAL
+-- recall (exact seqscan truth table) of inline=on within 0.1 of an
+-- identically-built inline=off index at equal ef; insert smoke (aminsert
+-- updates inline entries; query correctness afterwards).
+--
+-- Both indexes are built in the same backend: acorn_build seeds level
+-- assignment from MyProcPid per build, so the two graphs are identical and
+-- the recall delta isolates the inline (SQ8 + re-rank) scan path.
+\set ON_ERROR_STOP on
+\set q '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'
+CREATE SCHEMA test_tier2_inline;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+SET search_path = test_tier2_inline, public;
+-- 2000 rows, 10 buckets -> bucket < 1 = ~10% selectivity (~200 rows)
+SELECT setseed(0.42);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 2000) i;
+-- Twin table with identical rows (same physical order) for the off index.
+CREATE TABLE items_off (
+    id        int PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+INSERT INTO items_off SELECT id, bucket, embedding FROM items ORDER BY id;
+-- Reloption accepted (build succeeds) on the inline index ...
+CREATE INDEX items_inline_idx ON items
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_inline_vectors = true);
+-- ... and is recorded in pg_class.reloptions.
+SELECT reloptions @> ARRAY['acorn_inline_vectors=true'] AS reloption_stored
+FROM pg_class WHERE relname = 'items_inline_idx';
+ reloption_stored 
+------------------
+ t
+(1 row)
+
+-- Reference index: identical build, inline vectors off.
+CREATE INDEX items_off_idx ON items_off
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2);
+-- Exact ground truth: top-10 filtered KNN via seqscan (no index).
+SET enable_seqscan = on;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE truth AS
+    SELECT id FROM items WHERE bucket < 1
+    ORDER BY embedding <=> :'q'::vector LIMIT 10;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+-- Recall against the exact truth table for either table's index.
+CREATE OR REPLACE FUNCTION acorn_recall(tbl regclass, ef int) RETURNS numeric AS $$
+DECLARE
+    matched int;
+BEGIN
+    EXECUTE format('SET pg_acorn.ef_search = %s', ef);
+    SET enable_seqscan = off;
+    EXECUTE format(
+        'SELECT count(*) FROM (
+             SELECT id FROM %s WHERE bucket < 1
+             ORDER BY embedding <=> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector
+             LIMIT 10) r JOIN truth USING (id)', tbl)
+    INTO matched;
+    RESET enable_seqscan;
+    RETURN matched / 10.0;
+END;
+$$ LANGUAGE plpgsql;
+-- Filter correctness must hold at every ef_search value (inline index).
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 10;
+SELECT bool_and(bucket < 5) AS filter_correct_ef10
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ filter_correct_ef10 
+---------------------
+ t
+(1 row)
+
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket < 5) AS filter_correct_ef400
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ filter_correct_ef400 
+----------------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+-- REAL recall: inline=on within 0.1 of inline=off at equal ef.
+SELECT abs(acorn_recall('items', 40)  - acorn_recall('items_off', 40))  <= 0.1
+    AS recall_close_ef40;
+ recall_close_ef40 
+-------------------
+ t
+(1 row)
+
+SELECT abs(acorn_recall('items', 400) - acorn_recall('items_off', 400)) <= 0.1
+    AS recall_close_ef400;
+ recall_close_ef400 
+--------------------
+ t
+(1 row)
+
+-- The scan_inline_vectors GUC falls back to the classic per-neighbor path
+-- on the SAME inline index (TID slots are unchanged by co-location); the
+-- classic path on the inline graph must match the off-index recall exactly.
+SET pg_acorn.scan_inline_vectors = off;
+SELECT acorn_recall('items', 400) = acorn_recall('items_off', 400)
+    AS classic_path_identical;
+ classic_path_identical 
+------------------------
+ t
+(1 row)
+
+RESET pg_acorn.scan_inline_vectors;
+-- Insert smoke: aminsert with inline=on must keep co-located entries in
+-- sync (reverse edges update both the TID slot and the inline entry).
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 50) i;
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket < 5) AS post_insert_filter_correct,
+       count(*) = 10        AS post_insert_returns_k
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+ post_insert_filter_correct | post_insert_returns_k 
+----------------------------+-----------------------
+ t                          | t
+(1 row)
+
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+-- Insert-from-empty smoke on an L2 inline index (every node arrives through
+-- aminsert: chunk-chain writes + reverse-edge inline updates).  L2 is
+-- metric-faithful for as-is stored vectors, so an inserted exact match of
+-- the query (distance 0) must be the nearest filtered result.
+CREATE TABLE items_ins (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+CREATE INDEX items_ins_idx ON items_ins
+    USING acorn_hnsw (embedding vector_l2_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_inline_vectors = true);
+INSERT INTO items_ins (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 500) i;
+INSERT INTO items_ins (bucket, embedding) VALUES (0, :'q'::vector);
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket < 5) AS ins_filter_correct,
+       count(*) = 10        AS ins_returns_k
+FROM (SELECT bucket FROM items_ins WHERE bucket < 5
+      ORDER BY embedding <-> :'q'::vector LIMIT 10) r;
+ ins_filter_correct | ins_returns_k 
+--------------------+---------------
+ t                  | t
+(1 row)
+
+SELECT (SELECT max(id) FROM items_ins) = (
+    SELECT id FROM items_ins WHERE bucket < 5
+    ORDER BY embedding <-> :'q'::vector LIMIT 1
+) AS inserted_exact_match_is_nearest;
+ inserted_exact_match_is_nearest 
+---------------------------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+DROP SCHEMA test_tier2_inline CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table items
+drop cascades to table items_off
+drop cascades to table truth
+drop cascades to function acorn_recall(regclass,integer)
+drop cascades to table items_ins
