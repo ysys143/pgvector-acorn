@@ -1,0 +1,21 @@
+{
+ "meta": {
+  "dsn": "postgresql://postgres@localhost/postgres",
+  "n": 60000,
+  "dim": 128,
+  "diversify": true,
+  "out": "bench/results_build_bench.json"
+ },
+ "builds": {
+  "fmgr": 436.7059554220177,
+  "direct": 394.68634645000566,
+  "direct_diversify": 562.3138522789814
+ },
+ "speedup": 1.11,
+ "determinism": {
+  "same_seed_identical_queries": "40/40",
+  "diff_seed_differing_queries": "40/40",
+  "same_seed_ok": true,
+  "diff_seed_ok": true
+ }
+}
