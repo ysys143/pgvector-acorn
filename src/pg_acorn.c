@@ -85,6 +85,15 @@ bool acorn_scan_visited_oneprobe = true;
  */
 bool acorn_scan_direct_filter = true;
 
+/*
+ * GUC: Tier 2 scan toggle — use co-located neighbor data (SQ8 vectors +
+ * metadata in the layer-0 neighbor lists) on indexes built with
+ * acorn_inline_vectors=true.  Off forces the classic per-neighbor
+ * element-page path on the same index (debug/benchmark; the TID-slot
+ * layout is unchanged, so both paths read inline indexes correctly).
+ */
+bool acorn_scan_inline_vectors = true;
+
 void _PG_init(void);
 void _PG_fini(void);
 
@@ -253,6 +262,20 @@ _PG_init(void)
 		"results identical).",
 		NULL,
 		&acorn_scan_direct_filter,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.scan_inline_vectors */
+	DefineCustomBoolVariable(
+		"pg_acorn.scan_inline_vectors",
+		"Use co-located neighbor data (SQ8 vectors + metadata in layer-0 "
+		"neighbor lists) on acorn_inline_vectors indexes.  Off forces the "
+		"classic per-neighbor element-page path (debug/benchmark).",
+		NULL,
+		&acorn_scan_inline_vectors,
 		true,
 		PGC_USERSET,
 		0,

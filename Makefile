@@ -32,6 +32,7 @@ REGRESS = \
 	tier2_ef_search \
 	tier2_payload_edges \
 	tier2_diversify \
+	tier2_inline_vectors \
 	no_regression \
 	recall_filter \
 	recall_gamma \

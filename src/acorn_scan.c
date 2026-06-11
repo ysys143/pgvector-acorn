@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include <float.h>
+#include <math.h>
 
 #include "executor/executor.h"
 #include "executor/tuptable.h"
@@ -42,6 +43,15 @@ typedef struct AcornElem
 	ItemPointerData indextid;	/* index page (blkno, offno) */
 	ItemPointerData heaptid;	/* heap TID — for predicate evaluation */
 	double			distance;
+
+	/*
+	 * Lower bound on the EXACT distance.  Equal to `distance` everywhere
+	 * except inline-vector (SQ8) discoveries, where it subtracts the
+	 * worst-case quantization error.  The T2 result heap R orders on this,
+	 * so the exact re-rank provably pulls every candidate that could still
+	 * beat the current exact head before anything is emitted.
+	 */
+	double			lb;
 
 	/*
 	 * T2 single-read fast path: neighbor-tuple location + level captured at
@@ -79,6 +89,16 @@ pq_cmp_min(const pairingheap_node *a, const pairingheap_node *b,
 		   void *arg)
 {
 	return -pq_cmp_max(a, b, arg);
+}
+
+/* min-heap on the exact-distance LOWER BOUND (T2 result heap R only) */
+static int
+pq_cmp_lb_min(const pairingheap_node *a, const pairingheap_node *b,
+			  void *arg)
+{
+	double la = ((const AcornPQNode *) a)->elem.lb;
+	double lbv = ((const AcornPQNode *) b)->elem.lb;
+	return (la < lbv) ? 1 : (la > lbv) ? -1 : 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -136,24 +156,33 @@ visit_once(HTAB *visited, const ItemPointerData *tid)
 
 /*
  * Read meta page, return true if index has an entry point.
+ *
+ * dims_out / acorn_flags_out (nullable) read the Tier 2 meta extension; on
+ * pgvector-written meta pages (Tier 1) and pre-extension Tier 2 indexes the
+ * flag bytes are zero (PageInit zeroes the page), i.e. inline vectors off.
  */
 static bool
 acorn_meta_read(Relation index, BlockNumber *entry_blkno,
-				OffsetNumber *entry_offno, int *entry_level, int *m_out)
+				OffsetNumber *entry_offno, int *entry_level, int *m_out,
+				int *dims_out, uint16 *acorn_flags_out)
 {
 	Buffer		buf;
 	Page		page;
-	HnswMetaPage meta;
+	AcornT2MetaPage meta;
 
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	meta = HnswPageGetMeta(page);
+	meta = AcornT2PageGetMeta(page);
 
-	*entry_blkno = meta->entryBlkno;
-	*entry_offno = meta->entryOffno;
-	*entry_level = (int) meta->entryLevel;
-	*m_out = (int) meta->m;
+	*entry_blkno = meta->hnsw.entryBlkno;
+	*entry_offno = meta->hnsw.entryOffno;
+	*entry_level = (int) meta->hnsw.entryLevel;
+	*m_out = (int) meta->hnsw.m;
+	if (dims_out)
+		*dims_out = (int) meta->hnsw.dimensions;
+	if (acorn_flags_out)
+		*acorn_flags_out = meta->acorn_flags;
 
 	UnlockReleaseBuffer(buf);
 	return (*entry_blkno != InvalidBlockNumber);
@@ -687,7 +716,8 @@ acorn_scan_execute(AcornScanState *state, Relation index, Relation heap,
 	dist_direct = acorn_scan_direct_dist
 		? acorn_resolve_direct_dist(index) : NULL;
 
-	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
+	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
+						 NULL, NULL))
 		return 0;			/* empty index */
 
 	/* Greedy descent to layer 1 (skipping to base layer entry point) */
@@ -821,7 +851,8 @@ acorn_stream_begin(Relation index, Datum query, Snapshot snapshot,
 	s->exhausted = false;
 	acorn_load_dist_proc(index, &s->dist_proc);
 
-	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
+	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
+						 NULL, NULL))
 	{
 		s->exhausted = true;		/* empty index */
 		MemoryContextSwitchTo(old);
@@ -943,6 +974,16 @@ acorn_stream_next(AcornStreamScan *s, ItemPointerData *heaptid_out)
  * filter-passing nodes go to both C and R (candidate + result).
  * ----------------------------------------------------------------------- */
 
+/*
+ * Exact re-rank lookahead for inline-vector scans: before emitting, the top
+ * window of approx-ordered results is re-scored with exact distances (one
+ * element-page read each), and emission order within the window is exact.
+ * 40 = max(4k, 40) for the k <= 10 regime the AM streams for; beyond the
+ * window the scan keeps sliding (one re-rank per emit), so larger LIMITs
+ * stay covered.
+ */
+#define ACORN_T2_RERANK_WINDOW	40
+
 /* Persistent in-filter streaming frontier for Tier 2. */
 struct AcornT2StreamScan
 {
@@ -962,6 +1003,21 @@ struct AcornT2StreamScan
 	bool			member_first;	/* spend budget on passing candidates first */
 	ScanKey			keys;		/* filter ScanKeys (lives in caller's memory) */
 	int				nkeys;
+
+	/*
+	 * Vector co-location (acorn_inline_vectors index + scan_inline_vectors
+	 * GUC).  Discovery distances come from co-located SQ8 codes (approx);
+	 * C/Cm are approx-ordered, R is ordered by the exact-distance lower
+	 * bound, and Rx holds exact-rescored results.
+	 */
+	bool			inline_on;
+	int				inline_dim;		/* index dimensions (= code length) */
+	Size			inline_esz;		/* on-disk inline entry stride */
+	AcornSq8DistFn	sq8_direct;		/* NULL = dequantize + fmgr */
+	AcornPgVector  *dequant_scratch;	/* lazily allocated, in mcxt */
+	double			q_l1;			/* L1 norm of the query (IP error bound) */
+	pairingheap	   *Rx;			/* exact-reranked results, awaiting emit */
+	int				rx_count;
 };
 
 /*
@@ -1141,6 +1197,312 @@ acorn_t2_eval_filter(ScanKey keys, int nkeys, int64 stored_val)
 			return false;
 	}
 	return true;
+}
+
+/* -----------------------------------------------------------------------
+ * Vector co-location: inline-entry discovery (acorn_inline_vectors)
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Approximate distance from a co-located SQ8 entry to the query.
+ * Uses the direct asymmetric kernel when the opclass distance resolved to a
+ * known function; otherwise dequantizes into a scratch vector and calls the
+ * opclass support function through fmgr (correct for any opclass).
+ */
+static double
+acorn_t2_inline_distance(AcornT2StreamScan *s, const AcornT2InlineEntry *e)
+{
+	if (s->sq8_direct)
+	{
+		AcornPgVector *q = (AcornPgVector *) DatumGetPointer(s->query);
+
+		return s->sq8_direct(s->inline_dim, e->code, e->scale, e->offset, q->x);
+	}
+
+	if (s->dequant_scratch == NULL)
+	{
+		Size		sz = offsetof(AcornPgVector, x)
+			+ sizeof(float) * s->inline_dim;
+
+		s->dequant_scratch = (AcornPgVector *)
+			MemoryContextAllocZero(s->mcxt, sz);
+		SET_VARSIZE(s->dequant_scratch, sz);
+		s->dequant_scratch->dim = (int16) s->inline_dim;
+	}
+	acorn_sq8_decode(s->inline_dim, e->code, e->scale, e->offset,
+					 s->dequant_scratch->x);
+	return DatumGetFloat8(FunctionCall2(&s->dist_proc,
+										PointerGetDatum(s->dequant_scratch),
+										s->query));
+}
+
+/*
+ * Worst-case lower bound on the exact distance given an SQ8 approximation.
+ *
+ * Per-coordinate reconstruction error is bounded by scale/2 (round to
+ * nearest), so:
+ *   neg IP:  |d_exact - d_approx| <= (scale/2) * ||q||_1
+ *   L2^2:    ||e||_2 <= (scale/2) * sqrt(dim)  ->
+ *            sqrt(d_exact) >= sqrt(d_approx) - ||e||_2
+ * Unknown opclasses (fmgr dequant path) have no usable bound; the re-rank
+ * then falls back to the fixed lookahead window.
+ */
+static inline double
+acorn_t2_inline_lb(AcornT2StreamScan *s, double dist, float scale)
+{
+	if (s->sq8_direct == acorn_dist_neg_ip_sq8)
+		return dist - 0.5 * (double) scale * s->q_l1;
+	if (s->sq8_direct == acorn_dist_l2sq_sq8)
+	{
+		double		en = 0.5 * (double) scale * sqrt((double) s->inline_dim);
+		double		lo = sqrt(Max(dist, 0.0)) - en;
+
+		return (lo > 0.0) ? lo * lo : 0.0;
+	}
+	return dist;				/* no bound available */
+}
+
+/* Discovery snapshot of one neighbor slot (stack-local during expansion) */
+typedef struct AcornInlineCand
+{
+	ItemPointerData indextid;
+	ItemPointerData heaptid;
+	ItemPointerData nbrtid;
+	uint8			level;
+	bool			deleted;
+	bool			from_inline;	/* false: stale entry — read element page */
+	float			scale;			/* SQ8 scale (error bound), from_inline only */
+	int64			fval;
+	double			dist;
+} AcornInlineCand;
+
+/*
+ * Expand one candidate using the co-located layer-0 entries: read the
+ * neighbor-tuple chunk chain (2 pages at the dim=128/gamma=2 design point),
+ * compute approximate SQ8 distances for every unvisited slot, and push
+ * candidates carrying heaptid/filter_val/nbrtid WITHOUT visiting their
+ * element pages.  Slots whose inline entry is stale (indextid mismatch after
+ * a torn reverse-edge update) or missing are resolved with a per-slot
+ * element-page read — the classic cost, never a wrong result.
+ *
+ * ACORN invariant unchanged: every neighbor stays expandable (C/Cm);
+ * filter-passing ones also enter R (approx-ordered; exact re-rank at emit).
+ */
+static void
+acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
+{
+	AcornInlineCand cands[HNSW_MAX_NEIGHBORS];
+	ItemPointerData tids_local[HNSW_MAX_NEIGHBORS];
+	bool			covered[HNSW_MAX_NEIGHBORS] = {false};
+	int				n_c = 0;
+	int				layer0_n = HnswGetLayerM(s->m, 0);
+	BlockNumber		nbr_blkno;
+	OffsetNumber	nbr_offno;
+	ItemPointerData next_tid;
+	bool			first = true;
+
+	Assert(layer0_n <= HNSW_MAX_NEIGHBORS);
+
+	if (ce->has_nbr)
+	{
+		nbr_blkno = ItemPointerGetBlockNumber(&ce->nbrtid);
+		nbr_offno = ItemPointerGetOffsetNumber(&ce->nbrtid);
+	}
+	else
+	{
+		ItemPointerData ce_heaptid;
+		int				ce_level;
+		bool			ce_deleted;
+		Buffer			ebuf;
+
+		ebuf = acorn_t2_load_element(s->index,
+									  ItemPointerGetBlockNumber(&ce->indextid),
+									  ItemPointerGetOffsetNumber(&ce->indextid),
+									  &ce_heaptid, &ce_level, &ce_deleted,
+									  &nbr_blkno, &nbr_offno, NULL);
+		UnlockReleaseBuffer(ebuf);
+	}
+
+	/* Walk the chunk chain: primary neighbor tuple, then continuations */
+	ItemPointerSet(&next_tid, nbr_blkno, nbr_offno);
+	while (ItemPointerIsValid(&next_tid))
+	{
+		Buffer				buf;
+		Page				page;
+		BlockNumber			cblk = ItemPointerGetBlockNumber(&next_tid);
+		OffsetNumber		coff = ItemPointerGetOffsetNumber(&next_tid);
+		AcornT2InlineHdr	hdr;
+		char			   *entries;
+
+		buf  = ReadBuffer(s->index, cblk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (first)
+		{
+			HnswNeighborTuple	ntup = (HnswNeighborTuple)
+				PageGetItem(page, PageGetItemId(page, coff));
+			int					level  = (int) ntup->count / s->m - 2;
+			int					start0 = HnswNeighborStart(s->m, level, 0);
+			ItemPointerData	   *tids   = HnswNeighborTupleGetTids(ntup);
+
+			Assert(ntup->type == HNSW_NEIGHBOR_TUPLE_TYPE);
+			memcpy(tids_local, &tids[start0],
+				   layer0_n * sizeof(ItemPointerData));
+			hdr     = AcornT2NeighborInlineHdr(ntup);
+			entries = AcornT2InlineHdrEntries(hdr);
+		}
+		else
+		{
+			AcornT2InlineCont	cont = (AcornT2InlineCont)
+				PageGetItem(page, PageGetItemId(page, coff));
+
+			if (cont->type != ACORN_T2_INLINE_TUPLE_TYPE)
+			{
+				/* broken chain: stop; uncovered slots are resolved below */
+				UnlockReleaseBuffer(buf);
+				break;
+			}
+			hdr     = &cont->hdr;
+			entries = AcornT2ContEntries(cont);
+		}
+
+		for (int j = hdr->start;
+			 j < (int) hdr->start + (int) hdr->n_here && j < layer0_n;
+			 j++)
+		{
+			const AcornT2InlineEntry *e;
+			AcornInlineCand *c;
+
+			if (covered[j])
+				continue;
+			covered[j] = true;
+
+			if (!ItemPointerIsValid(&tids_local[j]))
+				continue;
+			if (!visit_once(s->visited, &tids_local[j]))
+				continue;
+
+			e = (const AcornT2InlineEntry *)
+				AcornT2InlineEntryAt(entries, j - hdr->start, s->inline_esz);
+
+			c = &cands[n_c++];
+			c->indextid = tids_local[j];
+
+			if ((e->flags & ACORN_T2_INLINE_VALID) &&
+				ItemPointerEquals((ItemPointer) &e->indextid, &tids_local[j]))
+			{
+				c->heaptid     = e->heaptid;
+				c->nbrtid      = e->nbrtid;
+				c->level       = e->level;
+				c->deleted     = (e->flags & ACORN_T2_INLINE_DELETED) != 0;
+				c->from_inline = true;
+				c->scale       = e->scale;
+				c->fval        = e->filter_val;
+				c->dist        = acorn_t2_inline_distance(s, e);
+			}
+			else
+				c->from_inline = false;
+		}
+
+		next_tid = hdr->next;
+		UnlockReleaseBuffer(buf);
+		first = false;
+	}
+
+	/* Slots no chunk covered (defensive — well-formed chains cover all) */
+	for (int j = 0; j < layer0_n; j++)
+	{
+		if (covered[j] || !ItemPointerIsValid(&tids_local[j]))
+			continue;
+		if (!visit_once(s->visited, &tids_local[j]))
+			continue;
+		cands[n_c].indextid    = tids_local[j];
+		cands[n_c].from_inline = false;
+		n_c++;
+	}
+
+	/* Resolve stale slots, then push candidates/results */
+	for (int i = 0; i < n_c; i++)
+	{
+		AcornInlineCand *c = &cands[i];
+		AcornPQNode	   *cn;
+		bool			passes;
+
+		if (!c->from_inline)
+		{
+			ItemPointerData nbrtid;
+			uint8			level;
+
+			c->dist = acorn_t2_load_node(s,
+								 ItemPointerGetBlockNumber(&c->indextid),
+								 ItemPointerGetOffsetNumber(&c->indextid),
+								 &c->heaptid, &c->deleted, &c->fval,
+								 &nbrtid, &level);
+			c->nbrtid = nbrtid;
+			c->level  = level;
+		}
+
+		passes = !c->deleted &&
+			acorn_t2_eval_filter(s->keys, s->nkeys, c->fval);
+
+		cn = palloc(sizeof(AcornPQNode));
+		ItemPointerCopy(&c->indextid, &cn->elem.indextid);
+		ItemPointerSetInvalid(&cn->elem.heaptid);
+		cn->elem.distance = c->dist;
+		cn->elem.lb = c->from_inline
+			? acorn_t2_inline_lb(s, c->dist, c->scale)
+			: c->dist;
+		ItemPointerCopy(&c->nbrtid, &cn->elem.nbrtid);
+		cn->elem.level   = c->level;
+		cn->elem.has_nbr = true;
+		pairingheap_add((s->member_first && passes) ? s->Cm : s->C,
+						&cn->ph_node);
+
+		if (passes)
+		{
+			AcornPQNode *rn = palloc(sizeof(AcornPQNode));
+
+			ItemPointerCopy(&c->indextid, &rn->elem.indextid);
+			ItemPointerCopy(&c->heaptid, &rn->elem.heaptid);
+			rn->elem.distance = c->dist;
+			rn->elem.lb = c->from_inline
+				? acorn_t2_inline_lb(s, c->dist, c->scale)
+				: c->dist;		/* element-page read: exact already */
+			rn->elem.has_nbr  = false;
+			pairingheap_add(s->R, &rn->ph_node);
+		}
+	}
+}
+
+/*
+ * Pop the nearest approx-ordered result, re-score it with the EXACT distance
+ * (one element-page read, which also refreshes the deleted flag), and move
+ * it to Rx.  Vacuum-deleted nodes are dropped here — same outcome as the
+ * non-inline scan's discovery-time deleted check.
+ */
+static void
+acorn_t2_rerank_one(AcornT2StreamScan *s)
+{
+	AcornPQNode	   *rn = (AcornPQNode *) pairingheap_remove_first(s->R);
+	ItemPointerData heaptid;
+	bool			deleted;
+	int64			fval;
+	double			exact;
+
+	exact = acorn_t2_load_node(s,
+							   ItemPointerGetBlockNumber(&rn->elem.indextid),
+							   ItemPointerGetOffsetNumber(&rn->elem.indextid),
+							   &heaptid, &deleted, &fval, NULL, NULL);
+	if (deleted)
+	{
+		pfree(rn);
+		return;
+	}
+	rn->elem.distance = exact;
+	rn->elem.heaptid  = heaptid;
+	pairingheap_add(s->Rx, &rn->ph_node);
+	s->rx_count++;
 }
 
 /*
@@ -1328,6 +1690,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 			ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
 			ItemPointerSetInvalid(&cn->elem.heaptid);
 			cn->elem.distance = nd;
+			cn->elem.lb       = nd;
 			if (acorn_scan_single_read)
 			{
 				ItemPointerCopy(&n_nbrtid, &cn->elem.nbrtid);
@@ -1346,6 +1709,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 				ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
 				ItemPointerCopy(&nheaptid, &rn->elem.heaptid);
 				rn->elem.distance = nd;
+				rn->elem.lb       = nd;		/* exact (element page) */
 				pairingheap_add(s->R, &rn->ph_node);
 			}
 		}
@@ -1364,6 +1728,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	OffsetNumber		entry_offno;
 	int					entry_level;
 	int					m;
+	int					meta_dims = 0;
+	uint16				meta_flags = 0;
 	HASHCTL				info;
 
 	(void) snapshot;			/* visibility handled by executor post-fetch */
@@ -1381,7 +1747,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->dist_direct = acorn_scan_direct_dist
 		? acorn_resolve_direct_dist(index) : NULL;
 
-	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m))
+	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
+						 &meta_dims, &meta_flags))
 	{
 		s->exhausted = true;		/* empty index */
 		MemoryContextSwitchTo(old);
@@ -1389,13 +1756,46 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	}
 	s->m = m;
 
+	/*
+	 * Vector co-location: the layout flag comes from the META PAGE (set at
+	 * build time), not rd_options.  The SQ8 kernel is resolved independently
+	 * of the scan_direct_dist GUC — approx distances have no fmgr equivalent;
+	 * unknown opclasses dequantize and go through fmgr.
+	 */
+	s->inline_on = (meta_flags & ACORN_T2_META_INLINE_VECTORS) != 0
+		&& acorn_scan_inline_vectors
+		&& meta_dims > 0;
+	if (s->inline_on)
+	{
+		AcornPgVector  *q  = (AcornPgVector *) DatumGetPointer(query);
+		AcornDistFn		fn = acorn_resolve_direct_dist(index);
+
+		s->inline_dim = meta_dims;
+		s->inline_esz = ACORN_T2_INLINE_ENTRY_SIZE(meta_dims);
+		s->sq8_direct = NULL;
+		if ((int) q->dim == meta_dims)
+		{
+			if (fn == acorn_dist_l2sq)
+				s->sq8_direct = acorn_dist_l2sq_sq8;
+			else if (fn == acorn_dist_neg_ip)
+				s->sq8_direct = acorn_dist_neg_ip_sq8;
+		}
+
+		/* ||q||_1 for the neg-IP quantization error bound */
+		s->q_l1 = 0.0;
+		for (int i = 0; i < (int) q->dim; i++)
+			s->q_l1 += fabs((double) q->x[i]);
+	}
+
 	if (entry_level > 0)
 		acorn_t2_greedy_descent(s, &entry_blkno, &entry_offno,
 								 entry_level, 0);
 
 	s->C  = pairingheap_allocate(pq_cmp_min, NULL);	/* candidates, nearest-first */
 	s->Cm = pairingheap_allocate(pq_cmp_min, NULL);	/* passing candidates */
-	s->R  = pairingheap_allocate(pq_cmp_min, NULL);	/* results, nearest-first */
+	s->R  = pairingheap_allocate(pq_cmp_lb_min, NULL);	/* results, by lower bound */
+	s->Rx = pairingheap_allocate(pq_cmp_min, NULL);	/* exact-reranked results */
+	s->rx_count = 0;
 
 	memset(&info, 0, sizeof(info));
 	info.keysize   = sizeof(ItemPointerData);
@@ -1429,7 +1829,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 			ItemPointerCopy(&entry_tid, &cn->elem.indextid);
 			ItemPointerSetInvalid(&cn->elem.heaptid);
 			cn->elem.distance = d;
-			if (acorn_scan_single_read)
+			cn->elem.lb       = d;
+			if (acorn_scan_single_read || s->inline_on)
 			{
 				ItemPointerCopy(&nbrtid, &cn->elem.nbrtid);
 				cn->elem.level   = level;
@@ -1447,6 +1848,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 				ItemPointerCopy(&entry_tid, &rn->elem.indextid);
 				ItemPointerCopy(&heaptid, &rn->elem.heaptid);
 				rn->elem.distance = d;
+				rn->elem.lb       = d;		/* exact (element page) */
 				pairingheap_add(s->R, &rn->ph_node);
 			}
 		}
@@ -1485,13 +1887,38 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 
 	for (;;)
 	{
-		double r_dist = pairingheap_is_empty(s->R) ? DBL_MAX
-			: ((AcornPQNode *) pairingheap_first(s->R))->elem.distance;
+		/*
+		 * R is ordered by the exact-distance lower bound.  The EXPANSION
+		 * safety bound stays at the approx level (head's `distance`): using
+		 * the lb there stops exploration early and wastes the ef budget
+		 * (measured: -0.05 recall at 40% selectivity).  The lb is consulted
+		 * only for the re-rank refill decision below.
+		 */
+		AcornPQNode *rhead = pairingheap_is_empty(s->R) ? NULL
+			: (AcornPQNode *) pairingheap_first(s->R);
+		double r_dist = rhead ? rhead->elem.distance : DBL_MAX;
+		double r_lb   = rhead ? rhead->elem.lb       : DBL_MAX;
+		double rx_dist = (s->inline_on && !pairingheap_is_empty(s->Rx))
+			? ((AcornPQNode *) pairingheap_first(s->Rx))->elem.distance
+			: DBL_MAX;
+		double r_bound = Min(r_dist, rx_dist);
 		double cf_dist = pairingheap_is_empty(s->C) ? DBL_MAX
 			: ((AcornPQNode *) pairingheap_first(s->C))->elem.distance;
 		double cm_dist = pairingheap_is_empty(s->Cm) ? DBL_MAX
 			: ((AcornPQNode *) pairingheap_first(s->Cm))->elem.distance;
 		double c_dist = Min(cf_dist, cm_dist);
+
+		/*
+		 * Expansion trigger uses the candidates' exact-distance lower bound
+		 * (== distance when not SQ8-approximated): keep exploring while a
+		 * candidate COULD truly beat the nearest result, so quantization
+		 * over-estimates cannot truncate discovery.  Budget-capped as ever.
+		 */
+		double cf_lb = pairingheap_is_empty(s->C) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->C))->elem.lb;
+		double cm_lb = pairingheap_is_empty(s->Cm) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->Cm))->elem.lb;
+		double c_lb = Min(cf_lb, cm_lb);
 
 		/*
 		 * Explore while a candidate may still beat the nearest result, but
@@ -1505,7 +1932,7 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 		 * both heaps, so a result is never emitted past a closer unexpanded
 		 * candidate of either kind.
 		 */
-		if (c_dist != DBL_MAX && c_dist <= r_dist
+		if (c_dist != DBL_MAX && c_lb <= r_bound
 			&& s->n_expansions < s->ef_search)
 		{
 			pairingheap *src;
@@ -1522,9 +1949,51 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			cn = (AcornPQNode *) pairingheap_remove_first(src);
 			ce = cn->elem;
 			pfree(cn);
-			acorn_t2_stream_expand(s, &ce);
+			if (s->inline_on)
+				acorn_t2_stream_expand_inline(s, &ce);
+			else
+				acorn_t2_stream_expand(s, &ce);
 			s->n_expansions++;
 			continue;
+		}
+
+		/*
+		 * Inline mode: exact re-rank before emission.  R is ordered by the
+		 * exact-distance lower bound, so re-ranking while lb(R head) <=
+		 * exact(Rx head) provably moves every candidate that could still
+		 * beat the current exact head into Rx — emission order among
+		 * emitted results is then exact, with no quantization misses.  The
+		 * fixed lookahead window only matters for opclasses without a
+		 * usable error bound (fmgr dequant path, where lb == approx).
+		 */
+		if (s->inline_on)
+		{
+			bool	have_bound = (s->sq8_direct != NULL);
+
+			if (rhead != NULL &&
+				(r_lb <= rx_dist ||
+				 (!have_bound && s->rx_count < ACORN_T2_RERANK_WINDOW)))
+			{
+				acorn_t2_rerank_one(s);
+				continue;		/* re-derive all bounds */
+			}
+
+			if (pairingheap_is_empty(s->Rx))
+			{
+				s->exhausted = true;
+				MemoryContextSwitchTo(old);
+				return false;
+			}
+
+			{
+				AcornPQNode *rn = (AcornPQNode *) pairingheap_remove_first(s->Rx);
+
+				s->rx_count--;
+				*heaptid_out = rn->elem.heaptid;
+				pfree(rn);
+				MemoryContextSwitchTo(old);
+				return true;
+			}
 		}
 
 		if (pairingheap_is_empty(s->R))

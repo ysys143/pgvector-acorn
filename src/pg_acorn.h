@@ -22,5 +22,6 @@ extern bool acorn_scan_prefetch;
 extern bool acorn_scan_single_read;
 extern bool acorn_scan_visited_oneprobe;
 extern bool acorn_scan_direct_filter;
+extern bool acorn_scan_inline_vectors;
 
 #endif /* PG_ACORN_H */

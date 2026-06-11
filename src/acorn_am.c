@@ -75,6 +75,11 @@ acorn_am_init(void)
 					   "keepPrunedConnections) in neighbor selection",
 					   false,
 					   AccessExclusiveLock);
+	add_bool_reloption(acorn_relopt_kind, "acorn_inline_vectors",
+					   "Co-locate quantized vectors + filter metadata in the "
+					   "layer-0 neighbor lists (vector co-location)",
+					   false,
+					   AccessExclusiveLock);
 }
 
 static bytea *
@@ -86,6 +91,7 @@ acorn_options(Datum reloptions, bool validate)
 		{"acorn_gamma", RELOPT_TYPE_INT, offsetof(AcornOptions, gamma)},
 		{"acorn_payload_edges", RELOPT_TYPE_BOOL, offsetof(AcornOptions, payloadEdges)},
 		{"acorn_diversify", RELOPT_TYPE_BOOL, offsetof(AcornOptions, diversify)},
+		{"acorn_inline_vectors", RELOPT_TYPE_BOOL, offsetof(AcornOptions, inlineVectors)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
