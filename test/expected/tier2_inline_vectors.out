@@ -17,7 +17,9 @@
 \set q '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'
 CREATE SCHEMA test_tier2_inline;
 CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
 SET search_path = test_tier2_inline, public;
 -- 2000 rows, 10 buckets -> bucket < 1 = ~10% selectivity (~200 rows)
 SELECT setseed(0.42);
