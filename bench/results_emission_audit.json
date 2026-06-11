@@ -1,0 +1,93 @@
+{
+ "meta": {
+  "dsn": "postgresql://postgres@localhost/postgres",
+  "n": 50000,
+  "dim": 128,
+  "efc": 64,
+  "gamma": 2,
+  "seeds": "11,22,33",
+  "diversify": "off",
+  "force_load": false,
+  "out": "bench/results_emission_audit.json"
+ },
+ "cells": [
+  {
+   "seed": 11,
+   "mode": "eager",
+   "build_s": 232.9,
+   "unf_raw": 0.1225,
+   "unf_rr50": 0.375,
+   "sel10_raw": 0.9825,
+   "sel10_rr50": 1.0,
+   "sel40_raw": 0.7475,
+   "sel40_rr50": 1.0,
+   "post20_ef400_raw": 0.3175,
+   "post20_ef400_rr50": 0.82
+  },
+  {
+   "seed": 11,
+   "mode": "buffered",
+   "build_s": 232.9,
+   "unf_raw": 1.0,
+   "unf_rr50": 1.0,
+   "sel10_raw": 1.0,
+   "sel10_rr50": 1.0,
+   "sel40_raw": 1.0,
+   "sel40_rr50": 1.0,
+   "post20_ef400_raw": 0.91,
+   "post20_ef400_rr50": 0.91
+  },
+  {
+   "seed": 22,
+   "mode": "eager",
+   "build_s": 337.3,
+   "unf_raw": 0.1025,
+   "unf_rr50": 0.4125,
+   "sel10_raw": 0.995,
+   "sel10_rr50": 1.0,
+   "sel40_raw": 0.8225,
+   "sel40_rr50": 1.0,
+   "post20_ef400_raw": 0.3325,
+   "post20_ef400_rr50": 0.815
+  },
+  {
+   "seed": 22,
+   "mode": "buffered",
+   "build_s": 337.3,
+   "unf_raw": 1.0,
+   "unf_rr50": 1.0,
+   "sel10_raw": 1.0,
+   "sel10_rr50": 1.0,
+   "sel40_raw": 1.0,
+   "sel40_rr50": 1.0,
+   "post20_ef400_raw": 0.9175,
+   "post20_ef400_rr50": 0.9175
+  },
+  {
+   "seed": 33,
+   "mode": "eager",
+   "build_s": 325.2,
+   "unf_raw": 0.14,
+   "unf_rr50": 0.4075,
+   "sel10_raw": 0.975,
+   "sel10_rr50": 1.0,
+   "sel40_raw": 0.78,
+   "sel40_rr50": 1.0,
+   "post20_ef400_raw": 0.31,
+   "post20_ef400_rr50": 0.805
+  },
+  {
+   "seed": 33,
+   "mode": "buffered",
+   "build_s": 325.2,
+   "unf_raw": 1.0,
+   "unf_rr50": 1.0,
+   "sel10_raw": 1.0,
+   "sel10_rr50": 1.0,
+   "sel40_raw": 1.0,
+   "sel40_rr50": 1.0,
+   "post20_ef400_raw": 0.93,
+   "post20_ef400_rr50": 0.93
+  }
+ ]
+}
