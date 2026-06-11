@@ -38,6 +38,16 @@ resumable:
 (acorn_g2 includes the postfilter-mode cells). The currently-built acorn
 index variant is tracked in table tv_meta so resumes skip rebuilds.
 
+ACCEPTANCE stages (post Z1+Z2 merge — build-quality + vector co-location):
+  --stages load,prefilter_cal,acorn_g1_inline,acorn_g2_inline \
+  --out bench/results_acceptance_250k.json
+Adds engines acorn_g1pe_mf_inline / acorn_g2pe_mf_inline (gamma in {1,2},
+payload_edges=on, member_first=on, acorn_inline_vectors=on, deterministic
+pg_acorn.build_seed). Unchanged pg-native baselines are NOT re-measured;
+the refuted-run bars (bench/results_thesis_250k.json) are reused, except
+the sel=1% prefilter cell which is re-run as a load-contamination
+calibration check (flagged if it deviates > 25% from the 5.47 ms bar).
+
 Run (from the integration worktree):
   docker compose -f docker/docker-compose.yml --profile bench run --rm \
       --no-deps bench python3 -u bench/thesis_validation.py
@@ -68,6 +78,14 @@ PG_EXPECT = {
     "shared_buffers": "2GB", "work_mem": "64MB", "jit": "off",
     "max_parallel_workers_per_gather": "0",
 }
+
+BUILD_SEED = 42                 # pg_acorn.build_seed for deterministic builds
+
+# Refuted-run pg-native bars (bench/results_thesis_250k.json, FAIR-1T,
+# identical fixture/protocol). Reused for acceptance verdicts so unchanged
+# baselines are not re-measured; recall was 1.0 at every cell.
+BAR_PREFILTER_MED_MS = {1: 5.47, 2: 5.96, 5: 85.53, 10: 119.15, 20: 229.48}
+CAL_TOLERANCE = 0.25            # sel=1% prefilter re-run must stay within 25%
 
 SQL = ("SELECT id FROM tv_items WHERE bucket < %s::int4 "
        "ORDER BY embedding <=> %s::vector LIMIT %s")
@@ -138,6 +156,8 @@ def pg_show(cur, names):
 
 def pg_verify_server(conn):
     with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_acorn")
         shown = pg_show(cur, list(PG_EXPECT) + [
             "effective_io_concurrency", "track_io_timing", "server_version"])
         cur.execute("SELECT count(*) FROM pg_settings "
@@ -244,14 +264,24 @@ def idx_exists(cur, name):
 
 def timed_index(cur, key, ddl, idxname):
     cur.execute("SET maintenance_work_mem = '2GB'")
+    build_env = pg_show(cur, ["maintenance_work_mem",
+                              "max_parallel_maintenance_workers"])
     print(f"[build] {key}: {ddl.strip().splitlines()[0]} ...", flush=True)
     t0 = time.perf_counter()
     cur.execute(ddl)
     bt = time.perf_counter() - t0
     cur.execute(f"SELECT pg_relation_size('{idxname}')")
     size = cur.fetchone()[0]
-    results["meta"].setdefault("builds", {})[key] = {
-        "seconds": round(bt, 1), "size_mb": round(size / 1048576, 1)}
+    rec = {"seconds": round(bt, 1), "size_mb": round(size / 1048576, 1),
+           **build_env}
+    if key.startswith("acorn"):
+        rec["build_seed"] = BUILD_SEED
+        rec["build_direct_dist"] = pg_show(
+            cur, ["pg_acorn.build_direct_dist"])["pg_acorn.build_direct_dist"]
+        rec["note"] = ("acorn_hnsw build is single-threaded; "
+                       "max_parallel_maintenance_workers has no effect "
+                       "(known gap, Z4 queued)")
+    results["meta"].setdefault("builds", {})[key] = rec
     dump()
     print(f"[build] {key}: {bt:.1f}s, {size/1048576:.1f} MB", flush=True)
     # flush build dirty pages NOW so checkpointer/bgwriter IO does not
@@ -275,7 +305,7 @@ def meta_set(cur, k, v):
                 "DO UPDATE SET val=EXCLUDED.val", (k, v))
 
 
-def ensure_acorn(cur, variant, gamma):
+def ensure_acorn(cur, variant, gamma, inline=False):
     """Build tv_acorn_idx for the requested variant unless already built."""
     if meta_get(cur, "acorn_index") == variant and idx_exists(
             cur, "tv_acorn_idx"):
@@ -283,13 +313,17 @@ def ensure_acorn(cur, variant, gamma):
         return
     drop_idx(cur, "tv_acorn_idx")
     meta_set(cur, "acorn_index", "building")
+    cur.execute(f"SET pg_acorn.build_seed = {BUILD_SEED}")
+    cur.execute("SET pg_acorn.build_direct_dist = on")
+    inline_clause = (",\n                  acorn_inline_vectors = true"
+                     if inline else "")
     timed_index(
         cur, f"acorn_{variant}",
         f"""CREATE INDEX tv_acorn_idx ON tv_items
             USING acorn_hnsw (embedding vector_cosine_ops,
                               bucket int4_acorn_ops)
             WITH (m = 16, ef_construction = 64, acorn_gamma = {gamma},
-                  acorn_payload_edges = true)""",
+                  acorn_payload_edges = true{inline_clause})""",
         "tv_acorn_idx")
     meta_set(cur, "acorn_index", variant)
 
@@ -371,6 +405,55 @@ def stage_prefilter(conn, queries, truths):
         for op in results["ops"]:
             if op["engine"] == "pg_prefilter" and op["recall"] < 0.999:
                 raise SystemExit(f"prefilter recall != 1.0: {op}")
+
+
+def stage_prefilter_cal(conn, queries, truths):
+    """Calibration: re-run ONLY the sel=1% prefilter cell and compare with
+    the refuted-run bar. Deviation > CAL_TOLERANCE flags host load
+    contamination — acceptance latencies would not be comparable."""
+    sel = 1
+    with conn.cursor() as cur:
+        native_session(cur)
+        drop_idx(cur, "tv_hnsw_idx")
+        meta_set(cur, "hnsw", "absent")
+        drop_idx(cur, "tv_acorn_idx")
+        meta_set(cur, "acorn_index", "none")
+        if not idx_exists(cur, "tv_bucket_btree"):
+            timed_index(cur, "btree",
+                        "CREATE INDEX tv_bucket_btree ON tv_items (bucket)",
+                        "tv_bucket_btree")
+            meta_set(cur, "btree", "built")
+        cur.execute("ANALYZE tv_items")
+        plan = pg_explain(cur, SQL, sel, queries[0])
+        node = plan_check(f"pg_prefilter_cal/sel{sel}", plan,
+                          must_not_re=[r"tv_hnsw_idx", r"tv_acorn_idx"])
+        pg_prewarm(cur, SQL, queries, sel)
+        lats, recalls = pg_measure(cur, SQL, queries, truths[sel], sel)
+        rec, med, p90 = summarize(lats, recalls)
+        bt, bh, br = pg_buf_samples(cur, SQL, queries, sel)
+        add_op(engine="pg_prefilter_cal", sel=sel, ef=None, recall=rec,
+               med_ms=med, p90_ms=p90, plan_node=node,
+               buffers_per_query=bt, buffers_hit=bh, buffers_read=br,
+               lats_ms=[round(x, 3) for x in lats])
+        bar = BAR_PREFILTER_MED_MS[sel]
+        dev = (med - bar) / bar
+        ok = abs(dev) <= CAL_TOLERANCE
+        results["meta"]["calibration"] = {
+            "sel": sel, "bar_med_ms": bar, "measured_med_ms": round(med, 2),
+            "deviation_pct": round(100 * dev, 1), "tolerance_pct": 25,
+            "ok": bool(ok), "recall": rec,
+            "bars_source": "bench/results_thesis_250k.json"}
+        dump()
+        print(f"[calibration] sel=1% prefilter med={med:.2f}ms vs bar "
+              f"{bar:.2f}ms ({dev:+.1%}) -> {'OK' if ok else 'FLAGGED'}",
+              flush=True)
+        if rec < 0.999:
+            raise SystemExit(f"calibration recall != 1.0: {rec}")
+        if not ok:
+            print("[calibration] WARNING: > 25% deviation from the "
+                  "refuted-run bar — host load contamination suspected. "
+                  "Re-run this stage when the machine is quiet before "
+                  "trusting acceptance latencies.", flush=True)
 
 
 def stage_postfilter(conn, queries, truths):
@@ -526,10 +609,41 @@ def stage_acorn(conn, queries, truths, variant, gamma, postfilter_too):
                   plan_fn=plan_fn2)
 
 
+def stage_acorn_inline(conn, queries, truths, variant, gamma):
+    """ACCEPTANCE configs: acorn in-filter with inline vectors ON.
+    variant is the full engine suffix (e.g. 'g1pe_mf_inline')."""
+    with conn.cursor() as cur:
+        drop_idx(cur, "tv_hnsw_idx")        # only one vector index at a time
+        meta_set(cur, "hnsw", "absent")
+        ensure_acorn(cur, variant, gamma, inline=True)
+        cur.execute("ANALYZE tv_items")
+
+    engine = f"acorn_{variant}"
+    with conn.cursor() as cur:
+        acorn_session(cur, member_first=True)
+        cur.execute("SET pg_acorn.scan_inline_vectors = on")
+
+        def plan_fn(sel):
+            plan = pg_explain(cur, SQL, sel, queries[0])
+            return plan_check(
+                f"{engine}/sel{sel}", plan,
+                must_re=[r"Index Scan using tv_acorn_idx",
+                         r"Index Cond: \(bucket <"])
+
+        run_cells(cur, engine, SQL, queries, truths, EFS_ACORN,
+                  set_ef=lambda ef: cur.execute(
+                      f"SET pg_acorn.ef_search = {ef}"),
+                  extra_fields={"member_first": True, "gamma": gamma,
+                                "payload_edges": True,
+                                "inline_vectors": True},
+                  plan_fn=plan_fn)
+
+
 # ---------------------------------------------------------------- report
 PG_NATIVE = ["pg_prefilter", "pgv_post_relaxed", "pgv_post_strict",
              "pgv_free"]
-ACORN = ["acorn_g1_infilter", "acorn_g2_infilter", "acorn_g2_postfilter"]
+ACORN = ["acorn_g1_infilter", "acorn_g2_infilter", "acorn_g2_postfilter",
+         "acorn_g1pe_mf_inline", "acorn_g2pe_mf_inline"]
 Y1_PAGES_BEFORE, Y1_PAGES_AFTER = 66.0, 2.0
 
 
@@ -566,14 +680,23 @@ def report():
                       f"@ med={mx['med_ms']:.2f}ms ef={mx['ef']})")
         nat = [(e, b) for e, b in rows if e in PG_NATIVE]
         aco = [(e, b) for e, b in rows if e in ACORN]
+        if not nat and sel in BAR_PREFILTER_MED_MS:
+            # acceptance runs reuse the refuted-run pg-native bars
+            nat = [("pg_prefilter(bar)",
+                    {"med_ms": BAR_PREFILTER_MED_MS[sel], "recall": 1.0})]
+            print(f"  {'pg_prefilter(bar)':22s} med="
+                  f"{BAR_PREFILTER_MED_MS[sel]:8.2f}ms (reused bar, "
+                  f"recall=1.000)")
         if nat and aco:
             bn = min(nat, key=lambda r: r[1]["med_ms"])
             ba = min(aco, key=lambda r: r[1]["med_ms"])
             ratio = bn[1]["med_ms"] / ba[1]["med_ms"]
             winner = "pg_acorn" if ratio > 1.0 else "pg-native"
+            beats_15 = " [BEATS BAR >= 1.5x]" if ratio >= 1.5 else ""
             print(f"  >> best native: {bn[0]} {bn[1]['med_ms']:.2f}ms | "
                   f"best acorn: {ba[0]} {ba[1]['med_ms']:.2f}ms | "
-                  f"winner: {winner} ({max(ratio, 1/ratio):.2f}x)")
+                  f"winner: {winner} ({max(ratio, 1/ratio):.2f}x)"
+                  f"{beats_15}")
         elif nat and not aco:
             print("  >> acorn never reaches 0.95 here: pg-native wins")
 
@@ -614,8 +737,11 @@ def main():
             prev = json.load(f)
         results["meta"] = prev.get("meta", {})
         stage_prefixes = {"prefilter": ["pg_prefilter"],
+                          "prefilter_cal": ["pg_prefilter_cal"],
                           "postfilter": ["pgv_post"], "free": ["pgv_free"],
-                          "acorn_g1": ["acorn_g1"], "acorn_g2": ["acorn_g2"]}
+                          "acorn_g1": ["acorn_g1_"], "acorn_g2": ["acorn_g2_"],
+                          "acorn_g1_inline": ["acorn_g1pe_mf_inline"],
+                          "acorn_g2_inline": ["acorn_g2pe_mf_inline"]}
         drop = [p for s in stages for p in stage_prefixes.get(s, [])]
         results["ops"] = [o for o in prev.get("ops", [])
                           if not any(o["engine"].startswith(p)
@@ -628,6 +754,10 @@ def main():
         "efs_acorn": EFS_ACORN, "efs_pgvector": EFS_PGV,
         "metric": "cosine", "correlation": "high (dominant-block)",
         "max_scan_tuples": MAX_SCAN_TUPLES, "stages_this_run": stages,
+        "build_seed": BUILD_SEED,
+        "baseline_bars": {"pg_prefilter_med_ms": BAR_PREFILTER_MED_MS,
+                          "source": "bench/results_thesis_250k.json",
+                          "note": "recall 1.0 at every reused cell"},
         "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
     dump()
@@ -652,6 +782,8 @@ def main():
         stage_load(conn, vecs, buckets, force=args.reload)
     if "prefilter" in stages:
         stage_prefilter(conn, queries, truths)
+    if "prefilter_cal" in stages:
+        stage_prefilter_cal(conn, queries, truths)
     if "postfilter" in stages:
         stage_postfilter(conn, queries, truths)
     if "free" in stages:
@@ -660,6 +792,10 @@ def main():
         stage_acorn(conn, queries, truths, "g1", 1, postfilter_too=False)
     if "acorn_g2" in stages:
         stage_acorn(conn, queries, truths, "g2", 2, postfilter_too=True)
+    if "acorn_g1_inline" in stages:
+        stage_acorn_inline(conn, queries, truths, "g1pe_mf_inline", 1)
+    if "acorn_g2_inline" in stages:
+        stage_acorn_inline(conn, queries, truths, "g2pe_mf_inline", 2)
     conn.close()
 
     results["meta"]["finished_utc"] = time.strftime(
