@@ -1,0 +1,153 @@
+-- tier2_build_parallel.sql: parallel index build (amcanbuildparallel).
+--
+-- A small table is forced into a parallel build via the table's
+-- parallel_workers storage parameter (plan_create_index_workers honors it
+-- regardless of table size) + max_parallel_maintenance_workers.  The
+-- parallel-built index must reach REAL-recall parity (exact seqscan truth
+-- table; twin tables with identical rows) with a serial build of the same
+-- data, and respect filters at every ef.
+--
+-- DETERMINISM CONTRACT: pg_acorn.build_seed guarantees reproducible graphs
+-- for SERIAL builds only.  Parallel builds interleave tuples
+-- nondeterministically (dynamic block assignment), so two parallel builds
+-- may differ; recall parity — not graph identity — is the invariant tested
+-- here.  (Serial determinism itself is asserted in tier2_diversify.sql.)
+--
+-- The maintenance_work_mem arena also bounds the parallel graph: the last
+-- section builds with a 1MB budget under parallel workers, exercising the
+-- shared-arena spill (WARNING numbers depend on worker interleaving and are
+-- not stable regression output, so client_min_messages suppresses them).
+
+\set ON_ERROR_STOP on
+\set q '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'
+
+CREATE SCHEMA test_tier2_par;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+SET search_path = test_tier2_par, public;
+
+SELECT setseed(0.42);
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 4000) i;
+
+-- Twin table with identical rows (same physical order) for the serial twin.
+CREATE TABLE items_ser (
+    id        int PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+INSERT INTO items_ser SELECT id, bucket, embedding FROM items ORDER BY id;
+
+-- Exact ground truth: top-10 filtered KNN via seqscan (no index).
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE truth AS
+    SELECT id FROM items WHERE bucket < 1
+    ORDER BY embedding <=> :'q'::vector LIMIT 10;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+-- Force a parallel build (2 workers) on the small table.
+ALTER TABLE items SET (parallel_workers = 2);
+SET max_parallel_maintenance_workers = 2;
+SET maintenance_work_mem = '8MB';
+SET pg_acorn.build_seed = 42;
+
+CREATE INDEX items_par_idx ON items
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_payload_edges = true, acorn_inline_vectors = true);
+
+-- All rows present despite multi-participant insertion.
+SELECT c.reltuples::int AS index_tuples
+FROM pg_class c WHERE c.relname = 'items_par_idx';
+
+-- Serial twin for the parity bar.
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX items_ser_idx ON items_ser
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_payload_edges = true, acorn_inline_vectors = true);
+RESET max_parallel_maintenance_workers;
+RESET maintenance_work_mem;
+RESET pg_acorn.build_seed;
+
+-- Recall against the exact truth table for either table's index.
+CREATE OR REPLACE FUNCTION acorn_recall(tbl regclass, ef int) RETURNS numeric AS $$
+DECLARE
+    matched int;
+BEGIN
+    EXECUTE format('SET pg_acorn.ef_search = %s', ef);
+    SET enable_seqscan = off;
+    EXECUTE format(
+        'SELECT count(*) FROM (
+             SELECT id FROM %s WHERE bucket < 1
+             ORDER BY embedding <=> ''[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]''::vector
+             LIMIT 10) r JOIN truth USING (id)', tbl)
+    INTO matched;
+    RESET enable_seqscan;
+    RETURN matched / 10.0;
+END;
+$$ LANGUAGE plpgsql;
+
+-- REAL recall parity: parallel-built within 0.2 of serial-built at equal ef.
+SELECT abs(acorn_recall('items', 400) - acorn_recall('items_ser', 400)) <= 0.2
+    AS parallel_recall_parity_ef400;
+
+-- Filter correctness at low and high ef on the parallel-built index.
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 10;
+SELECT bool_and(bucket < 5) AS par_filter_correct_ef10
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket < 5) AS par_filter_correct_ef400,
+       count(*) = 10        AS par_returns_k
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+
+-- Parallel build + maintenance_work_mem spill: shared arena exhausts, the
+-- flusher spills, remaining tuples go through the serialized on-disk path.
+-- WARNING suppressed (numbers depend on nondeterministic interleaving).
+DROP INDEX items_par_idx;
+SET max_parallel_maintenance_workers = 2;
+SET maintenance_work_mem = '1MB';
+SET client_min_messages = error;
+CREATE INDEX items_parspill_idx ON items
+    USING acorn_hnsw (embedding vector_cosine_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_inline_vectors = true);
+RESET client_min_messages;
+RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
+
+SELECT c.reltuples::int AS spill_index_tuples
+FROM pg_class c WHERE c.relname = 'items_parspill_idx';
+
+-- Parity of the parallel-spill build against the serial twin.
+SELECT abs(acorn_recall('items', 400) - acorn_recall('items_ser', 400)) <= 0.2
+    AS parallel_spill_recall_parity_ef400;
+
+SET enable_seqscan = off;
+SET pg_acorn.ef_search = 400;
+SELECT bool_and(bucket < 5) AS spill_filter_correct,
+       count(*) = 10        AS spill_returns_k
+FROM (SELECT bucket FROM items WHERE bucket < 5
+      ORDER BY embedding <=> :'q'::vector LIMIT 10) r;
+RESET enable_seqscan;
+RESET pg_acorn.ef_search;
+
+DROP SCHEMA test_tier2_par CASCADE;
