@@ -222,7 +222,9 @@ def main():
             line = (f"  -> recall delta(off-on)={d_recall:+.3f}  "
                     f"pages ratio={ratio:.1f}x")
             ok = True
-            if d_recall > 0.01:
+            # 1e-9: float-representation guard at the exact 0.01 boundary
+            # (e.g. 0.92333... - 0.91333... = 0.010000000000000009)
+            if d_recall > 0.01 + 1e-9:
                 ok = False
                 failures.append(f"sel={sel} ef={ef}: recall delta {d_recall:.3f} > 0.01")
             if ef >= 200 and ratio < 10.0:

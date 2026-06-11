@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include <float.h>
+#include <math.h>
 
 #include "executor/executor.h"
 #include "executor/tuptable.h"
@@ -42,6 +43,15 @@ typedef struct AcornElem
 	ItemPointerData indextid;	/* index page (blkno, offno) */
 	ItemPointerData heaptid;	/* heap TID — for predicate evaluation */
 	double			distance;
+
+	/*
+	 * Lower bound on the EXACT distance.  Equal to `distance` everywhere
+	 * except inline-vector (SQ8) discoveries, where it subtracts the
+	 * worst-case quantization error.  The T2 result heap R orders on this,
+	 * so the exact re-rank provably pulls every candidate that could still
+	 * beat the current exact head before anything is emitted.
+	 */
+	double			lb;
 
 	/*
 	 * T2 single-read fast path: neighbor-tuple location + level captured at
@@ -79,6 +89,16 @@ pq_cmp_min(const pairingheap_node *a, const pairingheap_node *b,
 		   void *arg)
 {
 	return -pq_cmp_max(a, b, arg);
+}
+
+/* min-heap on the exact-distance LOWER BOUND (T2 result heap R only) */
+static int
+pq_cmp_lb_min(const pairingheap_node *a, const pairingheap_node *b,
+			  void *arg)
+{
+	double la = ((const AcornPQNode *) a)->elem.lb;
+	double lbv = ((const AcornPQNode *) b)->elem.lb;
+	return (la < lbv) ? 1 : (la > lbv) ? -1 : 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -987,13 +1007,15 @@ struct AcornT2StreamScan
 	/*
 	 * Vector co-location (acorn_inline_vectors index + scan_inline_vectors
 	 * GUC).  Discovery distances come from co-located SQ8 codes (approx);
-	 * C/Cm/R are then approx-ordered and Rx holds exact-rescored results.
+	 * C/Cm are approx-ordered, R is ordered by the exact-distance lower
+	 * bound, and Rx holds exact-rescored results.
 	 */
 	bool			inline_on;
 	int				inline_dim;		/* index dimensions (= code length) */
 	Size			inline_esz;		/* on-disk inline entry stride */
 	AcornSq8DistFn	sq8_direct;		/* NULL = dequantize + fmgr */
 	AcornPgVector  *dequant_scratch;	/* lazily allocated, in mcxt */
+	double			q_l1;			/* L1 norm of the query (IP error bound) */
 	pairingheap	   *Rx;			/* exact-reranked results, awaiting emit */
 	int				rx_count;
 };
@@ -1214,6 +1236,32 @@ acorn_t2_inline_distance(AcornT2StreamScan *s, const AcornT2InlineEntry *e)
 										s->query));
 }
 
+/*
+ * Worst-case lower bound on the exact distance given an SQ8 approximation.
+ *
+ * Per-coordinate reconstruction error is bounded by scale/2 (round to
+ * nearest), so:
+ *   neg IP:  |d_exact - d_approx| <= (scale/2) * ||q||_1
+ *   L2^2:    ||e||_2 <= (scale/2) * sqrt(dim)  ->
+ *            sqrt(d_exact) >= sqrt(d_approx) - ||e||_2
+ * Unknown opclasses (fmgr dequant path) have no usable bound; the re-rank
+ * then falls back to the fixed lookahead window.
+ */
+static inline double
+acorn_t2_inline_lb(AcornT2StreamScan *s, double dist, float scale)
+{
+	if (s->sq8_direct == acorn_dist_neg_ip_sq8)
+		return dist - 0.5 * (double) scale * s->q_l1;
+	if (s->sq8_direct == acorn_dist_l2sq_sq8)
+	{
+		double		en = 0.5 * (double) scale * sqrt((double) s->inline_dim);
+		double		lo = sqrt(Max(dist, 0.0)) - en;
+
+		return (lo > 0.0) ? lo * lo : 0.0;
+	}
+	return dist;				/* no bound available */
+}
+
 /* Discovery snapshot of one neighbor slot (stack-local during expansion) */
 typedef struct AcornInlineCand
 {
@@ -1223,6 +1271,7 @@ typedef struct AcornInlineCand
 	uint8			level;
 	bool			deleted;
 	bool			from_inline;	/* false: stale entry — read element page */
+	float			scale;			/* SQ8 scale (error bound), from_inline only */
 	int64			fval;
 	double			dist;
 } AcornInlineCand;
@@ -1348,6 +1397,7 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 				c->level       = e->level;
 				c->deleted     = (e->flags & ACORN_T2_INLINE_DELETED) != 0;
 				c->from_inline = true;
+				c->scale       = e->scale;
 				c->fval        = e->filter_val;
 				c->dist        = acorn_t2_inline_distance(s, e);
 			}
@@ -1400,6 +1450,9 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 		ItemPointerCopy(&c->indextid, &cn->elem.indextid);
 		ItemPointerSetInvalid(&cn->elem.heaptid);
 		cn->elem.distance = c->dist;
+		cn->elem.lb = c->from_inline
+			? acorn_t2_inline_lb(s, c->dist, c->scale)
+			: c->dist;
 		ItemPointerCopy(&c->nbrtid, &cn->elem.nbrtid);
 		cn->elem.level   = c->level;
 		cn->elem.has_nbr = true;
@@ -1413,6 +1466,9 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 			ItemPointerCopy(&c->indextid, &rn->elem.indextid);
 			ItemPointerCopy(&c->heaptid, &rn->elem.heaptid);
 			rn->elem.distance = c->dist;
+			rn->elem.lb = c->from_inline
+				? acorn_t2_inline_lb(s, c->dist, c->scale)
+				: c->dist;		/* element-page read: exact already */
 			rn->elem.has_nbr  = false;
 			pairingheap_add(s->R, &rn->ph_node);
 		}
@@ -1634,6 +1690,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 			ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
 			ItemPointerSetInvalid(&cn->elem.heaptid);
 			cn->elem.distance = nd;
+			cn->elem.lb       = nd;
 			if (acorn_scan_single_read)
 			{
 				ItemPointerCopy(&n_nbrtid, &cn->elem.nbrtid);
@@ -1652,6 +1709,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 				ItemPointerCopy(&neighbors[i], &rn->elem.indextid);
 				ItemPointerCopy(&nheaptid, &rn->elem.heaptid);
 				rn->elem.distance = nd;
+				rn->elem.lb       = nd;		/* exact (element page) */
 				pairingheap_add(s->R, &rn->ph_node);
 			}
 		}
@@ -1722,6 +1780,11 @@ acorn_t2_stream_begin(Relation index, Datum query,
 			else if (fn == acorn_dist_neg_ip)
 				s->sq8_direct = acorn_dist_neg_ip_sq8;
 		}
+
+		/* ||q||_1 for the neg-IP quantization error bound */
+		s->q_l1 = 0.0;
+		for (int i = 0; i < (int) q->dim; i++)
+			s->q_l1 += fabs((double) q->x[i]);
 	}
 
 	if (entry_level > 0)
@@ -1730,7 +1793,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 
 	s->C  = pairingheap_allocate(pq_cmp_min, NULL);	/* candidates, nearest-first */
 	s->Cm = pairingheap_allocate(pq_cmp_min, NULL);	/* passing candidates */
-	s->R  = pairingheap_allocate(pq_cmp_min, NULL);	/* results, nearest-first */
+	s->R  = pairingheap_allocate(pq_cmp_lb_min, NULL);	/* results, by lower bound */
 	s->Rx = pairingheap_allocate(pq_cmp_min, NULL);	/* exact-reranked results */
 	s->rx_count = 0;
 
@@ -1766,7 +1829,8 @@ acorn_t2_stream_begin(Relation index, Datum query,
 			ItemPointerCopy(&entry_tid, &cn->elem.indextid);
 			ItemPointerSetInvalid(&cn->elem.heaptid);
 			cn->elem.distance = d;
-			if (acorn_scan_single_read)
+			cn->elem.lb       = d;
+			if (acorn_scan_single_read || s->inline_on)
 			{
 				ItemPointerCopy(&nbrtid, &cn->elem.nbrtid);
 				cn->elem.level   = level;
@@ -1784,6 +1848,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 				ItemPointerCopy(&entry_tid, &rn->elem.indextid);
 				ItemPointerCopy(&heaptid, &rn->elem.heaptid);
 				rn->elem.distance = d;
+				rn->elem.lb       = d;		/* exact (element page) */
 				pairingheap_add(s->R, &rn->ph_node);
 			}
 		}
@@ -1822,8 +1887,17 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 
 	for (;;)
 	{
-		double r_dist = pairingheap_is_empty(s->R) ? DBL_MAX
-			: ((AcornPQNode *) pairingheap_first(s->R))->elem.distance;
+		/*
+		 * R is ordered by the exact-distance lower bound.  The EXPANSION
+		 * safety bound stays at the approx level (head's `distance`): using
+		 * the lb there stops exploration early and wastes the ef budget
+		 * (measured: -0.05 recall at 40% selectivity).  The lb is consulted
+		 * only for the re-rank refill decision below.
+		 */
+		AcornPQNode *rhead = pairingheap_is_empty(s->R) ? NULL
+			: (AcornPQNode *) pairingheap_first(s->R);
+		double r_dist = rhead ? rhead->elem.distance : DBL_MAX;
+		double r_lb   = rhead ? rhead->elem.lb       : DBL_MAX;
 		double rx_dist = (s->inline_on && !pairingheap_is_empty(s->Rx))
 			? ((AcornPQNode *) pairingheap_first(s->Rx))->elem.distance
 			: DBL_MAX;
@@ -1833,6 +1907,18 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 		double cm_dist = pairingheap_is_empty(s->Cm) ? DBL_MAX
 			: ((AcornPQNode *) pairingheap_first(s->Cm))->elem.distance;
 		double c_dist = Min(cf_dist, cm_dist);
+
+		/*
+		 * Expansion trigger uses the candidates' exact-distance lower bound
+		 * (== distance when not SQ8-approximated): keep exploring while a
+		 * candidate COULD truly beat the nearest result, so quantization
+		 * over-estimates cannot truncate discovery.  Budget-capped as ever.
+		 */
+		double cf_lb = pairingheap_is_empty(s->C) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->C))->elem.lb;
+		double cm_lb = pairingheap_is_empty(s->Cm) ? DBL_MAX
+			: ((AcornPQNode *) pairingheap_first(s->Cm))->elem.lb;
+		double c_lb = Min(cf_lb, cm_lb);
 
 		/*
 		 * Explore while a candidate may still beat the nearest result, but
@@ -1846,7 +1932,7 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 		 * both heaps, so a result is never emitted past a closer unexpanded
 		 * candidate of either kind.
 		 */
-		if (c_dist != DBL_MAX && c_dist <= r_bound
+		if (c_dist != DBL_MAX && c_lb <= r_bound
 			&& s->n_expansions < s->ef_search)
 		{
 			pairingheap *src;
@@ -1872,16 +1958,21 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 		}
 
 		/*
-		 * Inline mode: exact re-rank before emission.  Slide approx-ordered
-		 * results from R into the exact-keyed Rx until the lookahead window
-		 * is full AND no remaining approx head could beat the exact head;
-		 * then emit the exact-nearest.  One element-page read per re-ranked
-		 * candidate, bounded by window + one per emitted result.
+		 * Inline mode: exact re-rank before emission.  R is ordered by the
+		 * exact-distance lower bound, so re-ranking while lb(R head) <=
+		 * exact(Rx head) provably moves every candidate that could still
+		 * beat the current exact head into Rx — emission order among
+		 * emitted results is then exact, with no quantization misses.  The
+		 * fixed lookahead window only matters for opclasses without a
+		 * usable error bound (fmgr dequant path, where lb == approx).
 		 */
 		if (s->inline_on)
 		{
-			if (!pairingheap_is_empty(s->R) &&
-				(s->rx_count < ACORN_T2_RERANK_WINDOW || r_dist <= rx_dist))
+			bool	have_bound = (s->sq8_direct != NULL);
+
+			if (rhead != NULL &&
+				(r_lb <= rx_dist ||
+				 (!have_bound && s->rx_count < ACORN_T2_RERANK_WINDOW)))
 			{
 				acorn_t2_rerank_one(s);
 				continue;		/* re-derive all bounds */
