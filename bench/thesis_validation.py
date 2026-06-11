@@ -681,12 +681,17 @@ def report():
         nat = [(e, b) for e, b in rows if e in PG_NATIVE]
         aco = [(e, b) for e, b in rows if e in ACORN]
         if not nat and sel in BAR_PREFILTER_MED_MS:
-            # acceptance runs reuse the refuted-run pg-native bars
+            # no same-session native measurement: fall back to the
+            # refuted-run bar (reference only — flag in the verdict)
             nat = [("pg_prefilter(bar)",
                     {"med_ms": BAR_PREFILTER_MED_MS[sel], "recall": 1.0})]
             print(f"  {'pg_prefilter(bar)':22s} med="
                   f"{BAR_PREFILTER_MED_MS[sel]:8.2f}ms (reused bar, "
                   f"recall=1.000)")
+        elif sel in BAR_PREFILTER_MED_MS:
+            print(f"  (reference: refuted-run prefilter bar "
+                  f"{BAR_PREFILTER_MED_MS[sel]:.2f}ms — measured on a "
+                  f"noisier host, not used for the verdict)")
         if nat and aco:
             bn = min(nat, key=lambda r: r[1]["med_ms"])
             ba = min(aco, key=lambda r: r[1]["med_ms"])
@@ -738,14 +743,19 @@ def main():
         results["meta"] = prev.get("meta", {})
         stage_prefixes = {"prefilter": ["pg_prefilter"],
                           "prefilter_cal": ["pg_prefilter_cal"],
-                          "postfilter": ["pgv_post"], "free": ["pgv_free"],
-                          "acorn_g1": ["acorn_g1_"], "acorn_g2": ["acorn_g2_"],
+                          "postfilter": ["pgv_post*"], "free": ["pgv_free"],
+                          "acorn_g1": ["acorn_g1_*"],
+                          "acorn_g2": ["acorn_g2_*"],
                           "acorn_g1_inline": ["acorn_g1pe_mf_inline"],
                           "acorn_g2_inline": ["acorn_g2pe_mf_inline"]}
         drop = [p for s in stages for p in stage_prefixes.get(s, [])]
+
+        def dropped(eng):
+            return any(eng.startswith(p[:-1]) if p.endswith("*") else eng == p
+                       for p in drop)
+
         results["ops"] = [o for o in prev.get("ops", [])
-                          if not any(o["engine"].startswith(p)
-                                     for p in drop)]
+                          if not dropped(o["engine"])]
         print(f"[resume] kept {len(results['ops'])} prior ops from {OUT}",
               flush=True)
 
