@@ -1,0 +1,79 @@
+{
+ "meta": {
+  "protocol": "FAIR-1T re-measure, quiet host, passes=3, nq=40",
+  "started_utc": "2026-06-11T08:36:12Z",
+  "finished_utc": "2026-06-11T08:41:06Z"
+ },
+ "ops": [
+  {
+   "engine": "pg_prefilter",
+   "sel": 10,
+   "ef": null,
+   "recall": 1.0,
+   "med_ms": 224.92946003330871,
+   "p90_ms": 448.76280471216893,
+   "min_mean_ms": 147.04216680838726,
+   "plan_head": "Limit  (cost=20064.91..20064.94 rows=10 width=12)"
+  },
+  {
+   "engine": "pg_prefilter",
+   "sel": 20,
+   "ef": null,
+   "recall": 1.0,
+   "med_ms": 300.84674252429977,
+   "p90_ms": 642.5625063246117,
+   "min_mean_ms": 210.2859373029787,
+   "plan_head": "Limit  (cost=20406.33..20406.36 rows=10 width=12)"
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 10,
+   "ef": 400,
+   "recall": 0.9425000000000001,
+   "med_ms": 28.735806525219232,
+   "p90_ms": 185.17739594681188,
+   "min_mean_ms": 24.462679075077176,
+   "buffered_emission": true
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 10,
+   "ef": 800,
+   "recall": 0.99,
+   "med_ms": 130.30761445406824,
+   "p90_ms": 258.7249587872066,
+   "min_mean_ms": 71.7353727814043,
+   "buffered_emission": true
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 10,
+   "ef": 1600,
+   "recall": 1.0,
+   "med_ms": 335.0922284880653,
+   "p90_ms": 619.3303604144603,
+   "min_mean_ms": 164.8713197238976,
+   "buffered_emission": true
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 20,
+   "ef": 800,
+   "recall": 0.9600000000000002,
+   "med_ms": 163.47299295011908,
+   "p90_ms": 355.4422227200121,
+   "min_mean_ms": 82.66128814721014,
+   "buffered_emission": true
+  },
+  {
+   "engine": "acorn_g2pe_mf_inline",
+   "sel": 20,
+   "ef": 1600,
+   "recall": 1.0,
+   "med_ms": 322.8958719992079,
+   "p90_ms": 600.0367293367163,
+   "min_mean_ms": 203.9565762184793,
+   "buffered_emission": true
+  }
+ ]
+}
