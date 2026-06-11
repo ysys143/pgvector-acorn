@@ -38,6 +38,20 @@ int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
  */
 bool acorn_member_first = false;
 
+/*
+ * GUC: buffered emission for Tier 2 in-filter scans.  When on (default), the
+ * scan runs the expansion phase to completion FIRST — until the ef_search
+ * expansion budget is exhausted or the candidate frontier empties — and only
+ * then starts emitting, in exact-distance order.  The legacy eager mode
+ * (off) emits the greedy local minimum as soon as no unexpanded candidate is
+ * closer than the nearest discovered result, which violates the ORDER BY
+ * contract: a node with a smaller exact distance can still be UNDISCOVERED
+ * when the first row is emitted (measured: rank-0 emitted d=0.654 while an
+ * undiscovered d=0.000 node existed).  Buffering trades the LIMIT-k early
+ * exit (full budget ~2-14ms at inline ef=200-800) for zero inversions.
+ */
+bool acorn_buffered_emission = true;
+
 /* GUC: Tier 2 scan fast-path toggle — direct C distance kernel (fmgr bypass) */
 bool acorn_scan_direct_dist = true;
 
@@ -161,6 +175,21 @@ _PG_init(void)
 		NULL,
 		&acorn_member_first,
 		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.buffered_emission */
+	DefineCustomBoolVariable(
+		"pg_acorn.buffered_emission",
+		"Run the Tier 2 expansion phase to completion (full ef_search budget) "
+		"before emitting, so emitted distances are exactly ordered.  Off "
+		"restores the legacy eager emission (greedy local minimum; may emit "
+		"out of order before the budget is spent).",
+		NULL,
+		&acorn_buffered_emission,
+		true,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

@@ -11,6 +11,7 @@ extern int  acorn_default_gamma;
 extern bool acorn_enable_2hop;
 extern int  acorn_ef_search;
 extern bool acorn_member_first;
+extern bool acorn_buffered_emission;
 
 /* Build-path toggles */
 extern bool acorn_build_direct_dist;

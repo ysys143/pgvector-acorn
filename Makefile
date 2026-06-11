@@ -33,6 +33,7 @@ REGRESS = \
 	tier2_payload_edges \
 	tier2_diversify \
 	tier2_inline_vectors \
+	tier2_emission_order \
 	no_regression \
 	recall_filter \
 	recall_gamma \

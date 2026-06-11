@@ -20,6 +20,7 @@
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "lib/pairingheap.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -1001,6 +1002,7 @@ struct AcornT2StreamScan
 	MemoryContext	mcxt;
 	bool			exhausted;
 	bool			member_first;	/* spend budget on passing candidates first */
+	bool			buffered;	/* finish expansion before first emission */
 	ScanKey			keys;		/* filter ScanKeys (lives in caller's memory) */
 	int				nkeys;
 
@@ -1743,6 +1745,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->n_expansions = 0;
 	s->exhausted    = false;
 	s->member_first = acorn_member_first;
+	s->buffered     = acorn_buffered_emission;
 	acorn_load_dist_proc(index, &s->dist_proc);
 	s->dist_direct = acorn_scan_direct_dist
 		? acorn_resolve_direct_dist(index) : NULL;
@@ -1865,15 +1868,22 @@ acorn_t2_stream_begin(Relation index, Datum query,
  * C for connectivity while passing nodes go to R.  The executor post-filters and
  * keeps pulling until its LIMIT is satisfied.
  *
- * ef_search bounds the number of node expansions (the work budget).  While the
- * budget remains, the scan explores best-first and only emits a result once no
- * unexpanded candidate is closer (exact ordering).  Once the budget is spent it
- * stops exploring and drains the discovered results in nearest-first order.
+ * ef_search bounds the number of node expansions (the work budget).  With
+ * buffered emission (pg_acorn.buffered_emission, default on) the scan spends
+ * the whole budget best-first BEFORE the first emission, then drains the
+ * discovered results in exact-distance order (lb-ordered R + exact re-rank) —
+ * the emitted sequence has zero inversions over the discovered set.  With
+ * eager emission (off; legacy) it emits as soon as no unexpanded candidate is
+ * closer than the nearest discovered result, which can emit a greedy local
+ * minimum before a truly closer node is discovered.
  * Larger ef_search explores more of the predicate subgraph — higher recall and
  * more page reads; smaller ef_search stops sooner.  This is the counted
  * candidate budget that the Tier 1 bounded search (acorn_layer0_search) deferred
  * to Tier 2: it works where the standard "nearest candidate beyond worst result"
  * HNSW termination does not, because ACORN keeps near filter-failing nodes in C.
+ *
+ * The Tier 1 stream (acorn_stream_next above) keeps eager emission: it has no
+ * expansion budget, so "buffering" there would expand the entire graph.
  */
 bool
 acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
@@ -1921,23 +1931,39 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 		double c_lb = Min(cf_lb, cm_lb);
 
 		/*
-		 * Explore while a candidate may still beat the nearest result, but
-		 * only within the ef_search expansion budget.
+		 * Expansion gate.
+		 *
+		 * Buffered emission (default): run the expansion phase to completion
+		 * FIRST — the ef_search budget (or an empty frontier) is the only
+		 * terminator.  The eager gate `c_lb <= r_bound` settles in a greedy
+		 * local minimum: it stops exploring as soon as no unexpanded
+		 * candidate is closer than the nearest DISCOVERED result, so a truly
+		 * closer node can still be undiscovered when the first row is
+		 * emitted (measured exact-distance inversions: rank-0 d=0.654 while
+		 * an undiscovered d=0.000 node existed).  Because expansion finishes
+		 * before anything is emitted, no later discovery can undercut an
+		 * already-emitted row — combined with the lb-ordered R / exact
+		 * re-rank below, the emitted sequence is exactly ordered.
+		 *
+		 * Eager (buffered_emission=off, legacy A/B path): explore only while
+		 * a candidate may still beat the nearest result, within the budget.
 		 *
 		 * Expansion choice: in member_first mode, spend the budget on the
 		 * nearest PASSING candidate whenever one is queued — the payload
 		 * subgraph keeps same-partition nodes connected, so this drains the
 		 * predicate subgraph instead of the (mostly failing) global
-		 * neighborhood.  Emission safety is unaffected: c_dist still covers
-		 * both heaps, so a result is never emitted past a closer unexpanded
-		 * candidate of either kind.
+		 * neighborhood.  Buffering only changes WHEN emission starts; the
+		 * member_first/Cm routing of WHICH nodes get expanded is unchanged.
 		 */
-		if (c_dist != DBL_MAX && c_lb <= r_bound
-			&& s->n_expansions < s->ef_search)
+		if (c_dist != DBL_MAX
+			&& s->n_expansions < s->ef_search
+			&& (s->buffered || c_lb <= r_bound))
 		{
 			pairingheap *src;
 			AcornPQNode *cn;
 			AcornElem	 ce;
+
+			CHECK_FOR_INTERRUPTS();
 
 			if (s->member_first && !pairingheap_is_empty(s->Cm))
 				src = s->Cm;
