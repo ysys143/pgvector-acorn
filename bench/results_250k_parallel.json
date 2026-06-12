@@ -1,0 +1,22 @@
+{
+ "meta": {
+  "n": 60000,
+  "dim": 128,
+  "stages": [
+   "confirm250k"
+  ],
+  "build_seed": 42,
+  "data_seed": 42,
+  "config": "m=16 efc=64 gamma=2 payload_edges inline",
+  "started_utc": "2026-06-12T02:35:58Z"
+ },
+ "confirm_250k": {
+  "workers": 4,
+  "build_s": 1653.1,
+  "size_mb": 4056,
+  "peak_parallel_workers": 4,
+  "baseline_single_thread_s": 4967.9,
+  "speedup": 3.01,
+  "gate_2000s": true
+ }
+}
