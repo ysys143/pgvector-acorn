@@ -52,6 +52,10 @@ class PgAcornTarget:
                     f"SET pg_acorn.enable_2hop = {'on' if self.enable_2hop else 'off'}"
                 )
 
+            # btree on the filter column so a free planner can choose a bitmap
+            # prefilter (exact) instead of the acorn_hnsw scan at high selectivity.
+            cur.execute("CREATE INDEX ON bench_items (bucket)")
+
     def query_filtered(self, query: np.ndarray, bucket_threshold: int, k: int) -> list[int]:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -87,6 +91,18 @@ class PgAcornTarget:
             else:
                 cur.execute("RESET enable_seqscan")
                 cur.execute("RESET enable_bitmapscan")
+
+    def set_ef_search(self, n: int) -> None:
+        """Runtime recall/latency knob. Tier 2 reads pg_acorn.ef_search (bounded
+        streaming scan); Tier 1 rides the standard HNSW hook via hnsw.ef_search.
+        SET cannot bind parameters, so inline the integer-validated value."""
+        ef = int(n)
+        with self.conn.cursor() as cur:
+            if self.tier == 2:
+                cur.execute(f"SET pg_acorn.ef_search = {ef}")
+            else:
+                # Tier 1 rides pgvector's HNSW, whose ef_search caps at 1000.
+                cur.execute(f"SET hnsw.ef_search = {min(ef, 1000)}")
 
     def insert_batch(self, vectors: np.ndarray, metadata: list[dict]) -> None:
         with self.conn.cursor() as cur:

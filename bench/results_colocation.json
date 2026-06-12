@@ -1,0 +1,227 @@
+{
+ "n": 60000,
+ "dim": 128,
+ "nq": 30,
+ "k": 10,
+ "gamma": 2,
+ "payload_edges": true,
+ "member_first": true,
+ "repeats": 7,
+ "selectivity": {
+  "1": 0.011033333333333332,
+  "10": 0.10583333333333333,
+  "40": 0.41696666666666665
+ },
+ "cells": {
+  "1_100": {
+   "off": {
+    "pages_per_query": 4001.0,
+    "recall": 1.0,
+    "lat_ms_median": 19.520099507644773,
+    "lat_ms_min_mean": 4.6890085718284045
+   },
+   "on": {
+    "pages_per_query": 355.6666666666667,
+    "recall": 1.0,
+    "lat_ms_median": 1.9655515789054334,
+    "lat_ms_min_mean": 1.196074167576929
+   }
+  },
+  "1_200": {
+   "off": {
+    "pages_per_query": 6921.466666666666,
+    "recall": 1.0,
+    "lat_ms_median": 13.177087530493736,
+    "lat_ms_min_mean": 5.493154400028288
+   },
+   "on": {
+    "pages_per_query": 555.6666666666666,
+    "recall": 1.0,
+    "lat_ms_median": 3.054536005947739,
+    "lat_ms_min_mean": 1.6273916349746287
+   }
+  },
+  "1_400": {
+   "off": {
+    "pages_per_query": 12271.1,
+    "recall": 1.0,
+    "lat_ms_median": 78.69120704708621,
+    "lat_ms_min_mean": 19.27279805919776
+   },
+   "on": {
+    "pages_per_query": 955.6666666666666,
+    "recall": 1.0,
+    "lat_ms_median": 9.368734492454678,
+    "lat_ms_min_mean": 3.5560788703151047
+   }
+  },
+  "1_800": {
+   "off": {
+    "pages_per_query": 23918.233333333334,
+    "recall": 1.0,
+    "lat_ms_median": 209.6113445586525,
+    "lat_ms_min_mean": 84.60159299429506
+   },
+   "on": {
+    "pages_per_query": 1755.6666666666667,
+    "recall": 1.0,
+    "lat_ms_median": 50.18201400525868,
+    "lat_ms_min_mean": 14.970894732202092
+   }
+  },
+  "1_1600": {
+   "off": {
+    "pages_per_query": 43357.6,
+    "recall": 1.0,
+    "lat_ms_median": 345.4314289847389,
+    "lat_ms_min_mean": 169.3306981197869
+   },
+   "on": {
+    "pages_per_query": 3355.6666666666665,
+    "recall": 1.0,
+    "lat_ms_median": 142.18405401334167,
+    "lat_ms_min_mean": 46.08050448975216
+   }
+  },
+  "10_100": {
+   "off": {
+    "pages_per_query": 5396.733333333334,
+    "recall": 0.7766666666666666,
+    "lat_ms_median": 9.122749965172261,
+    "lat_ms_min_mean": 4.276868200395256
+   },
+   "on": {
+    "pages_per_query": 356.26666666666665,
+    "recall": 0.7799999999999998,
+    "lat_ms_median": 2.6506365393288434,
+    "lat_ms_min_mean": 1.435155258513987
+   }
+  },
+  "10_200": {
+   "off": {
+    "pages_per_query": 9471.466666666667,
+    "recall": 0.9566666666666666,
+    "lat_ms_median": 26.003535487689078,
+    "lat_ms_min_mean": 8.611890599907687
+   },
+   "on": {
+    "pages_per_query": 556.6333333333333,
+    "recall": 0.9566666666666666,
+    "lat_ms_median": 4.112080961931497,
+    "lat_ms_min_mean": 2.215382383049776
+   }
+  },
+  "10_400": {
+   "off": {
+    "pages_per_query": 15558.933333333332,
+    "recall": 1.0,
+    "lat_ms_median": 100.31274653738365,
+    "lat_ms_min_mean": 29.937854036688805
+   },
+   "on": {
+    "pages_per_query": 956.7666666666667,
+    "recall": 1.0,
+    "lat_ms_median": 13.994771928992122,
+    "lat_ms_min_mean": 8.101102022919804
+   }
+  },
+  "10_800": {
+   "off": {
+    "pages_per_query": 24247.233333333334,
+    "recall": 1.0,
+    "lat_ms_median": 194.5698640192859,
+    "lat_ms_min_mean": 67.76705894153565
+   },
+   "on": {
+    "pages_per_query": 1756.7666666666667,
+    "recall": 1.0,
+    "lat_ms_median": 98.189419019036,
+    "lat_ms_min_mean": 18.63246045152967
+   }
+  },
+  "10_1600": {
+   "off": {
+    "pages_per_query": 36393.833333333336,
+    "recall": 1.0,
+    "lat_ms_median": 323.70296597946435,
+    "lat_ms_min_mean": 140.12312346215668
+   },
+   "on": {
+    "pages_per_query": 3356.766666666667,
+    "recall": 1.0,
+    "lat_ms_median": 139.41717153647915,
+    "lat_ms_min_mean": 35.28808917617425
+   }
+  },
+  "40_100": {
+   "off": {
+    "pages_per_query": 5798.2,
+    "recall": 0.7166666666666668,
+    "lat_ms_median": 7.7984745148569345,
+    "lat_ms_min_mean": 5.022076067204276
+   },
+   "on": {
+    "pages_per_query": 356.5,
+    "recall": 0.7233333333333334,
+    "lat_ms_median": 3.3168955123983324,
+    "lat_ms_min_mean": 1.3159865979105234
+   }
+  },
+  "40_200": {
+   "off": {
+    "pages_per_query": 10651.933333333332,
+    "recall": 0.8866666666666666,
+    "lat_ms_median": 43.74926048330963,
+    "lat_ms_min_mean": 10.809689589465657
+   },
+   "on": {
+    "pages_per_query": 556.5333333333333,
+    "recall": 0.8866666666666666,
+    "lat_ms_median": 5.744793452322483,
+    "lat_ms_min_mean": 2.296717488206923
+   }
+  },
+  "40_400": {
+   "off": {
+    "pages_per_query": 18548.266666666666,
+    "recall": 0.9733333333333333,
+    "lat_ms_median": 118.58566955197603,
+    "lat_ms_min_mean": 36.243813318045184
+   },
+   "on": {
+    "pages_per_query": 957.1,
+    "recall": 0.9733333333333333,
+    "lat_ms_median": 32.21657848916948,
+    "lat_ms_min_mean": 11.904444320437808
+   }
+  },
+  "40_800": {
+   "off": {
+    "pages_per_query": 29476.333333333332,
+    "recall": 1.0,
+    "lat_ms_median": 247.63875553617254,
+    "lat_ms_min_mean": 87.17405271794027
+   },
+   "on": {
+    "pages_per_query": 1757.3,
+    "recall": 1.0,
+    "lat_ms_median": 117.28386196773499,
+    "lat_ms_min_mean": 32.68413543313121
+   }
+  },
+  "40_1600": {
+   "off": {
+    "pages_per_query": 41912.46666666667,
+    "recall": 1.0,
+    "lat_ms_median": 339.8418005090207,
+    "lat_ms_min_mean": 161.57462286452454
+   },
+   "on": {
+    "pages_per_query": 3357.3,
+    "recall": 1.0,
+    "lat_ms_median": 267.15932798106223,
+    "lat_ms_min_mean": 81.55906576430425
+   }
+  }
+ }
+}

@@ -35,7 +35,13 @@
 /* In-filter: pages per expanded graph node (element page + neighbor page) */
 #define ACORN_T2_PAGES_PER_NODE		2.0
 
-/* In-filter: typical ef_search value used to bound expansion count */
+/* In-filter: typical ef_search value used to bound expansion count.
+ * NOTE: deliberately a constant, not the live pg_acorn.ef_search GUC. Using the
+ * real ef would make the planner abandon the acorn scan for a bitmap prefilter
+ * at high ef even in the mid-selectivity band where acorn is empirically 6-8x
+ * faster (n=30K correlated: g4 0.955@203qps vs bitmap 1.0@23qps at 40%). The
+ * cost model has no recall signal, so a naive ef-aware cost mis-trades speed
+ * for an unneeded exact path. Revisit as a deliberate recall-aware calibration. */
 #define ACORN_T2_EF_SEARCH_EST		40.0
 
 void

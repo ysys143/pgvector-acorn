@@ -56,6 +56,30 @@ acorn_am_init(void)
 					  "ACORN gamma: store m*gamma neighbors per node",
 					  ACORN_DEFAULT_GAMMA, ACORN_MIN_GAMMA, ACORN_MAX_GAMMA,
 					  AccessExclusiveLock);
+	add_bool_reloption(acorn_relopt_kind, "acorn_payload_edges",
+					   "Split layer-0 neighbor slots: half global nearest, "
+					   "half nearest within the same payload partition",
+					   false,
+					   AccessExclusiveLock);
+	/*
+	 * Default OFF: the 50K 10-seed audit (bench/results_graph_audit.json)
+	 * showed the heuristic statistically indistinguishable from nearest-only
+	 * selection on the correlated fixture (unf_rr50 0.402 vs 0.408) at
+	 * 1.4-2x build cost; the thesis-band raw ceilings proved to be bound by
+	 * the t2 stream's emission rule, not neighbor selection.  Kept available
+	 * for clustered workloads where it measurably reconnects layer 0
+	 * (tier2_diversify.sql island fixture: unfiltered 0.700 -> 1.000).
+	 */
+	add_bool_reloption(acorn_relopt_kind, "acorn_diversify",
+					   "Apply the HNSW diversity heuristic (Malkov Alg. 4 with "
+					   "keepPrunedConnections) in neighbor selection",
+					   false,
+					   AccessExclusiveLock);
+	add_bool_reloption(acorn_relopt_kind, "acorn_inline_vectors",
+					   "Co-locate quantized vectors + filter metadata in the "
+					   "layer-0 neighbor lists (vector co-location)",
+					   false,
+					   AccessExclusiveLock);
 }
 
 static bytea *
@@ -65,6 +89,9 @@ acorn_options(Datum reloptions, bool validate)
 		{"m", RELOPT_TYPE_INT, offsetof(AcornOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(AcornOptions, efConstruction)},
 		{"acorn_gamma", RELOPT_TYPE_INT, offsetof(AcornOptions, gamma)},
+		{"acorn_payload_edges", RELOPT_TYPE_BOOL, offsetof(AcornOptions, payloadEdges)},
+		{"acorn_diversify", RELOPT_TYPE_BOOL, offsetof(AcornOptions, diversify)},
+		{"acorn_inline_vectors", RELOPT_TYPE_BOOL, offsetof(AcornOptions, inlineVectors)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
@@ -133,17 +160,16 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 }
 
 /*
- * acorn_gettuple — iterative scan with ef expansion.
+ * acorn_gettuple — bounded ACORN streaming scan.
  *
- * On the first call, search with ef = ACORN_DEFAULT_EF_SEARCH (40) and
- * buffer the results.  Return heap TIDs one at a time to the executor,
- * which post-filters on the WHERE predicate.  When the buffer is exhausted
- * before the executor stops asking, double ef and search again, skipping TIDs
- * already returned (tracked in so->seen).  Stop when ef >= ACORN_EF_SEARCH_MAX
- * or an expansion produces no new TIDs.
+ * On the first call, acorn_t2_stream_begin sets up the frontier and the first
+ * acorn_t2_stream_next runs a single bounded best-first traversal capped at
+ * pg_acorn.ef_search (the GUC acorn_ef_search), materializing the ef_search
+ * closest filter-passing nodes.  Subsequent calls emit those heap TIDs one at
+ * a time in nearest-first order until the executor's LIMIT is met.
  *
- * This lifts Tier 2 recall at low selectivity: at 1% selectivity with k=10
- * the executor needs ~1000 candidates, requiring ~5 doublings from ef=40.
+ * ef_search is the recall/latency knob (mirrors hnsw.ef_search): raise it to
+ * explore more of the graph at low selectivity, lower it for fewer page reads.
  */
 static bool
 acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
@@ -173,6 +199,7 @@ acorn_gettuple(IndexScanDesc scan, ScanDirection dir)
 			PG_DETOAST_DATUM(scan->orderByData->sk_argument));
 		so->stream = acorn_t2_stream_begin(scan->indexRelation, so->query,
 										   scan->keyData, scan->numberOfKeys,
+										   acorn_ef_search,
 										   scan->xs_snapshot, so->tmpCtx);
 		so->first = false;
 
@@ -342,7 +369,7 @@ acorn_hnsw_handler(PG_FUNCTION_ARGS)
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
 #if PG_VERSION_NUM >= 170000
-	amroutine->amcanbuildparallel = false;
+	amroutine->amcanbuildparallel = true;
 #endif
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = false;

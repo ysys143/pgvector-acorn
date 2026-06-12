@@ -17,6 +17,12 @@ class PgvectorTarget:
         dim = vectors.shape[1]
         with self.conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            # pg_acorn is in shared_preload_libraries, so its Tier-1
+            # set_rel_pathlist_hook is active by default and would intercept
+            # this baseline's filtered queries with an AcornScan CustomScan.
+            # Disable it so "pgvector" measures *vanilla* HNSW + postfilter, not
+            # ACORN-1. (GUC comes from the preloaded library; no extension needed.)
+            cur.execute("SET pg_acorn.enable_hook = off")
             cur.execute("DROP TABLE IF EXISTS bench_items CASCADE")
             cur.execute(f"""
                 CREATE TABLE bench_items (
@@ -31,6 +37,9 @@ class PgvectorTarget:
                 USING hnsw (embedding vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64)
             """)
+            # btree on the filter column so a free planner can choose a bitmap
+            # prefilter (exact) over the HNSW postfilter at high selectivity.
+            cur.execute("CREATE INDEX ON bench_items (bucket)")
 
     def query_filtered(self, query: np.ndarray, bucket_threshold: int, k: int) -> list[int]:
         with self.conn.cursor() as cur:
@@ -67,6 +76,15 @@ class PgvectorTarget:
             else:
                 cur.execute("RESET enable_seqscan")
                 cur.execute("RESET enable_bitmapscan")
+
+    def set_ef_search(self, n: int) -> None:
+        """Runtime recall/latency knob: HNSW dynamic candidate list size.
+        SET is a utility statement and cannot bind parameters, so inline the
+        (integer-validated) value. pgvector caps hnsw.ef_search at 1000, so the
+        sweep's higher values saturate there (pgvector's frontier tops out)."""
+        ef = min(int(n), 1000)
+        with self.conn.cursor() as cur:
+            cur.execute(f"SET hnsw.ef_search = {ef}")
 
     def insert_batch(self, vectors: np.ndarray, metadata: list[dict]) -> None:
         with self.conn.cursor() as cur:

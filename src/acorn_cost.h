@@ -8,9 +8,11 @@
  * amcostestimate for acorn_hnsw.
  *
  * Uses clauselist_selectivity() to obtain the fraction of rows matching the
- * filter predicates, then scales the index scan cost accordingly.  A highly
- * selective filter (small fraction) results in lower cost than a full HNSW
- * scan, so the planner automatically prefers acorn_hnsw over seq scan.
+ * filter predicates.  In-filter cost ~ ef_search / selectivity: a highly
+ * selective filter makes the acorn scan MORE expensive (it must expand through
+ * many filter-failing nodes to collect enough passing results), so the planner
+ * prefers a bitmap prefilter at high selectivity and the acorn_hnsw scan only
+ * in the looser mid/low-selectivity range.
  */
 void acorn_hnsw_costestimate(PlannerInfo *root,
 							 IndexPath *path,

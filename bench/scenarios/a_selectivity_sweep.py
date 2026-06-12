@@ -12,6 +12,7 @@ import numpy as np
 
 
 SELECTIVITIES = [1, 5, 10, 40, 80]  # percent — bucket < N gives N% selectivity
+EF_SEARCHES = [10, 40, 100, 200, 400, 800, 1600]  # recall/QPS knob swept per selectivity
 K = 10
 N_QUERIES = 100
 N_EXPLAIN = 20  # queries sampled for page-I/O (EXPLAIN BUFFERS), outside timing
@@ -26,14 +27,16 @@ def brute_force(target, query: np.ndarray, bucket_threshold: int, k: int) -> lis
     return target.query_filtered(query, bucket_threshold, k)
 
 
-def run(target, queries: np.ndarray, ground_truth: dict) -> dict:
+def run(target, queries: np.ndarray, ground_truth: dict, force_index: bool = True) -> dict:
     results = {}
 
-    # Force the vector index: with a small table at low selectivity the planner
-    # may pick a seq scan, which makes pages_per_query (and recall) reflect the
-    # scan, not the index. Forcing it keeps every target on its index for an
-    # apples-to-apples comparison. Ground truth uses a separate connection.
-    force = getattr(target, "force_index_scan", None)
+    # force_index=True pins each target on its vector index (apples-to-apples
+    # index comparison). force_index=False (--free-planner) lets the planner
+    # choose freely — e.g. a bitmap prefilter on the filter column at high
+    # selectivity — which is the realistic, production behavior and the regime
+    # where the exact-fallback lever shows up. Ground truth uses a separate
+    # connection and is unaffected.
+    force = getattr(target, "force_index_scan", None) if force_index else None
     if force:
         force(True)
     try:
@@ -44,27 +47,37 @@ def run(target, queries: np.ndarray, ground_truth: dict) -> dict:
 
 
 def _run_inner(target, queries: np.ndarray, ground_truth: dict, results: dict) -> dict:
+    # ef_search is the recall/QPS knob. Targets that expose set_ef_search (pgvector,
+    # pg_acorn tier2, qdrant) are swept; targets without it (none currently) yield a
+    # single point under ef=None.
+    set_ef = getattr(target, "set_ef_search", None)
+    ef_values = EF_SEARCHES if set_ef else [None]
+
     for sel in SELECTIVITIES:
-        recalls, latencies = [], []
+        results[sel] = {}
+        for ef in ef_values:
+            if set_ef and ef is not None:
+                set_ef(ef)
 
-        for i, q in enumerate(queries[:N_QUERIES]):
-            t0 = time.perf_counter()
-            ids = target.query_filtered(q, sel, K)
-            latencies.append(time.perf_counter() - t0)
+            recalls, latencies = [], []
+            for i, q in enumerate(queries[:N_QUERIES]):
+                t0 = time.perf_counter()
+                ids = target.query_filtered(q, sel, K)
+                latencies.append(time.perf_counter() - t0)
 
-            truth = ground_truth[(sel, i)]
-            recalls.append(compute_recall(ids, truth))
+                truth = ground_truth[(sel, i)]
+                recalls.append(compute_recall(ids, truth))
 
-        results[sel] = {
-            "recall_mean": float(np.mean(recalls)),
-            "recall_min":  float(np.min(recalls)),
-            "qps":         N_QUERIES / sum(latencies),
-            "p99_ms":      float(np.percentile(latencies, 99) * 1000),
-        }
-
-        # page-I/O: separate, non-timed sample pass (EXPLAIN ANALYZE executes the
-        # query, so it must stay out of the wall-clock loop above).
-        results[sel].update(_measure_page_io(target, queries, sel))
+            point = {
+                "recall_mean": float(np.mean(recalls)),
+                "recall_min":  float(np.min(recalls)),
+                "qps":         N_QUERIES / sum(latencies),
+                "p99_ms":      float(np.percentile(latencies, 99) * 1000),
+            }
+            # page-I/O: separate, non-timed sample pass (EXPLAIN ANALYZE executes
+            # the query, so it must stay out of the wall-clock loop above).
+            point.update(_measure_page_io(target, queries, sel))
+            results[sel][ef] = point
 
     return results
 
