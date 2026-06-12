@@ -1,6 +1,7 @@
 # Design: Per-Index Shared-Memory SQ8 Code Cache (Phase C / C-1)
 
-Status: PROPOSED (2026-06-12). Prereq reading: `bench/REPORT_index_size.md`.
+Status: M1 (read) + M2 (write) IMPLEMENTED and merged to main (2026-06-13);
+cache defaults OFF pending M3. Prereq reading: `bench/REPORT_index_size.md`.
 
 ## 1. Problem
 
@@ -182,3 +183,39 @@ gap vs inline to NARROW at n >= 1M where inline thrashes.
 - Persistent "code fork"/sidecar pages without shmem: still one buffer
   access per neighbor (~20 us) -> non-inline speed; adds format + WAL
   surface for no latency win.
+
+## 10. Field stability: the ef=1600 cache crash (root-caused 2026-06-13)
+
+Symptom during the 250K G2 A/B runs: a backend in cache mode at sel=1%
+ef=1600 died with `exited with exit code 2` and no preceding ERROR/PANIC,
+forcing a postmaster crash-restart. Observed twice, both under heavy host
+contention (a co-tenant container, ezis, pinned at ~267% CPU; the same runs
+show p90 latencies 30-60x their medians and the postmaster issuing SIGKILL
+to "recalcitrant children").
+
+Root cause: NOT a defect in the code-cache path; environmental
+(host-contention-induced sibling-process death on the shared Docker VM).
+Evidence:
+
+- `exited with exit code 2` from a PG17 backend is reachable only via
+  `quickdie()` — the SIGQUIT handler. A backend exits 2 because the
+  postmaster broadcast SIGQUIT after ANOTHER process died, never from a
+  segfault in the exiting backend itself. No `signal 11`/`signal 6` (the
+  signatures a real cache-path memory bug would produce) was ever logged.
+- Controlled quiet-host repro (`bench/cc_ef1600_repro.py`, ezis paused):
+  600 ef=1600 cache queries at 250K across sel 1/10/20% — zero crashes,
+  rig healthy. The M1.5 60K hammer (300 ef=1600 cache queries) was likewise
+  clean.
+- Memory headroom: the VM has 9.69 GB usable; co-tenant Postgres containers
+  commit ~4.2 GB of `shared_buffers` alone (bench 2 GB + z4 2 GB +
+  pgvec 128 MB) before any query work, so contention-driven memory pressure
+  is a credible trigger for an OOM kill of one backend whose SIGQUIT
+  collateral then reads as the observed exit-2 on the others.
+- M2 additionally removed M1's only dangling-pointer risk (the lookup that
+  returned a direct shared-memory pointer) by switching to seqlock copy-out,
+  so even a latent torn-read path no longer exists.
+
+Operating guidance: ef<=800 is unaffected; ef=1600 cache is stable given
+adequate host headroom. A definitive contention-repro (deliberately
+overcommitting the VM until exit-2 recurs) was NOT run — it would crash the
+rig and the co-tenant project repeatedly for no additional design signal.
