@@ -24,12 +24,13 @@
 
 /* entry flags */
 #define ACORN_CC_DELETED		0x01
+#define ACORN_CC_PRESENT		0x02	/* slot holds a loaded entry */
 
 /*
  * Cached per-element entry — mirrors AcornT2InlineEntry minus the per-edge
- * indextid (the dshash key identifies the element instead).  Codes are
- * produced by acorn_sq8_encode, so they are bit-identical to the codes the
- * inline build co-locates.
+ * indextid (the entry's position in the per-block directory identifies the
+ * element instead).  Codes are produced by acorn_sq8_encode, so they are
+ * bit-identical to the codes the inline build co-locates.
  */
 typedef struct AcornCodeCacheEntry
 {

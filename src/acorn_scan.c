@@ -1032,6 +1032,18 @@ struct AcornT2StreamScan
 	 */
 	AcornCodeCacheScan *cc;		/* NULL = cache not serving this scan */
 	bool			approx;		/* inline_on || cc != NULL */
+
+#ifdef ACORN_CC_DEBUG
+	/* temporary M1.5 instrumentation */
+	uint64			dbg_neigh_iters;	/* per-neighbor loop iterations */
+	uint64			dbg_discoveries;	/* unique (unvisited) neighbors */
+	uint64			dbg_cc_hits;		/* cache hits */
+	uint64			dbg_loads;			/* element-page load_node calls */
+	uint64			dbg_reranks;		/* rerank_one calls */
+	uint64			dbg_emits;			/* tuples emitted */
+	uint64			dbg_next_iters;		/* for(;;) iterations in stream_next */
+	bool			dbg_dumped;
+#endif
 };
 
 /*
@@ -1397,6 +1409,9 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 			const AcornT2InlineEntry *e;
 			AcornInlineCand *c;
 
+#ifdef ACORN_CC_DEBUG
+			s->dbg_neigh_iters++;
+#endif
 			if (covered[j])
 				continue;
 			covered[j] = true;
@@ -1446,6 +1461,9 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 	}
 
 	/* Resolve stale slots, then push candidates/results */
+#ifdef ACORN_CC_DEBUG
+	s->dbg_discoveries += n_c;
+#endif
 	for (int i = 0; i < n_c; i++)
 	{
 		AcornInlineCand *c = &cands[i];
@@ -1454,6 +1472,9 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 
 		if (!c->from_inline)
 		{
+#ifdef ACORN_CC_DEBUG
+			s->dbg_loads++;
+#endif
 			ItemPointerData nbrtid;
 			uint8			level;
 
@@ -1676,6 +1697,9 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 		uint8			n_level;
 		AcornPQNode	   *cn;
 
+#ifdef ACORN_CC_DEBUG
+		s->dbg_neigh_iters++;
+#endif
 		if (!ItemPointerIsValid(&neighbors[i]))
 			continue;
 		if (acorn_scan_visited_oneprobe)
@@ -1692,6 +1716,10 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 
 		nblkno = ItemPointerGetBlockNumber(&neighbors[i]);
 		noffno = ItemPointerGetOffsetNumber(&neighbors[i]);
+
+#ifdef ACORN_CC_DEBUG
+		s->dbg_discoveries++;
+#endif
 
 		/*
 		 * Shared-memory code cache hit: everything the element page would
@@ -1712,6 +1740,10 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 			{
 				double	ad = acorn_t2_sq8_distance(s, e->code,
 												   e->scale, e->offset);
+
+#ifdef ACORN_CC_DEBUG
+				s->dbg_cc_hits++;
+#endif
 				double	alb = acorn_t2_inline_lb(s, ad, e->scale);
 				bool	cpasses = (e->flags & ACORN_CC_DELETED) == 0 &&
 					acorn_t2_eval_filter(s->keys, s->nkeys, e->filter_val);
@@ -1742,6 +1774,9 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 			}
 		}
 
+#ifdef ACORN_CC_DEBUG
+		s->dbg_loads++;
+#endif
 		nd = acorn_t2_load_node(s, nblkno, noffno,
 								 &nheaptid, &ndeleted, &nfilter_val,
 								 &n_nbrtid, &n_level);
@@ -1982,6 +2017,9 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 
 	for (;;)
 	{
+#ifdef ACORN_CC_DEBUG
+		s->dbg_next_iters++;
+#endif
 		/*
 		 * R is ordered by the exact-distance lower bound.  The EXPANSION
 		 * safety bound stays at the approx level (head's `distance`): using
@@ -2086,6 +2124,9 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 				(r_lb <= rx_dist ||
 				 (!have_bound && s->rx_count < ACORN_T2_RERANK_WINDOW)))
 			{
+#ifdef ACORN_CC_DEBUG
+				s->dbg_reranks++;
+#endif
 				acorn_t2_rerank_one(s);
 				continue;		/* re-derive all bounds */
 			}
@@ -2103,6 +2144,20 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 				s->rx_count--;
 				*heaptid_out = rn->elem.heaptid;
 				pfree(rn);
+#ifdef ACORN_CC_DEBUG
+				s->dbg_emits++;
+				if (!s->dbg_dumped)
+				{
+					s->dbg_dumped = true;
+					elog(NOTICE, "acorn_cc_dbg: exp=%d next_iters=" UINT64_FORMAT
+						 " neigh=" UINT64_FORMAT " disc=" UINT64_FORMAT
+						 " hits=" UINT64_FORMAT " loads=" UINT64_FORMAT
+						 " reranks=" UINT64_FORMAT,
+						 s->n_expansions, s->dbg_next_iters, s->dbg_neigh_iters,
+						 s->dbg_discoveries, s->dbg_cc_hits, s->dbg_loads,
+						 s->dbg_reranks);
+				}
+#endif
 				MemoryContextSwitchTo(old);
 				return true;
 			}
@@ -2119,6 +2174,20 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			AcornPQNode *rn = (AcornPQNode *) pairingheap_remove_first(s->R);
 			*heaptid_out = rn->elem.heaptid;
 			pfree(rn);
+#ifdef ACORN_CC_DEBUG
+			s->dbg_emits++;
+			if (!s->dbg_dumped)
+			{
+				s->dbg_dumped = true;
+				elog(NOTICE, "acorn_cc_dbg: exp=%d next_iters=" UINT64_FORMAT
+					 " neigh=" UINT64_FORMAT " disc=" UINT64_FORMAT
+					 " hits=" UINT64_FORMAT " loads=" UINT64_FORMAT
+					 " reranks=" UINT64_FORMAT,
+					 s->n_expansions, s->dbg_next_iters, s->dbg_neigh_iters,
+					 s->dbg_discoveries, s->dbg_cc_hits, s->dbg_loads,
+					 s->dbg_reranks);
+			}
+#endif
 			MemoryContextSwitchTo(old);
 			return true;
 		}

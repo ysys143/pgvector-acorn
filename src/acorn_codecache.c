@@ -3,9 +3,19 @@
  *
  * Registry: one named DSM segment ("pg_acorn_cc", PG17 dsm_registry) holds a
  * directory of per-index slots keyed by (dboid, relfilenumber).  Each slot
- * owns a DSA area containing a dshash keyed by the element's index TID
- * packed into a uint64, mapping to the dsa_pointer of an immutable entry
- * (heaptid, nbrtid, level, flags, filter_val, SQ8 scale/offset/code).
+ * owns a DSA area containing a flat per-block directory: a dsa_pointer array
+ * indexed by block number, each pointing to a fixed-stride array of entries
+ * indexed by (offno - 1).  An entry holds heaptid, nbrtid, level, flags,
+ * filter_val and the SQ8 scale/offset/code.
+ *
+ * The flat layout replaces the dshash the design doc sketched: a lookup is
+ * two dependent loads with NO lock and NO hashing, which matters because the
+ * scan does one lookup per discovered neighbor (measured at 60K/dim=128:
+ * dshash_find + per-entry dsa pointer chase cost ~0.9 us per discovery and
+ * put cache-mode at ~2.5x inline-mode latency; the flat directory is the
+ * same access pattern as the inline path's in-page entry read).  M2's write
+ * path fits the layout: upsert writes a slot in place, vacuum invalidation
+ * clears the PRESENT flag, both under entry versioning.
  *
  * Loading is lazy and non-blocking: the first scan that finds a slot EMPTY
  * CASes it to LOADING and walks the index main fork, quantizing every
@@ -14,7 +24,15 @@
  * scans never wait: while LOADING and on any miss they use the element-page
  * fallback (design G4 — correctness never depends on cache state).  If the
  * pg_acorn.code_cache_size budget is exceeded mid-load the slot becomes
- * PARTIAL: present entries serve, misses fall back.
+ * PARTIAL: present blocks serve, misses fall back.
+ *
+ * Locking contract: dir->lock (exclusive) protects slot claiming and handle
+ * publication, (shared) handle reads.  Slot state transitions go through
+ * the atomic only: EMPTY -> LOADING by CAS (single loader), LOADING ->
+ * READY|PARTIAL by the loader after a write barrier.  Per-slot storage
+ * needs no locks at all: it has a single writer (the LOADING owner) and is
+ * immutable once the state leaves LOADING; readers attach only after
+ * observing READY/PARTIAL.
  *
  * M1 caveats (fixed in M2 — do not rely on the cache for correctness):
  *   - no insert upsert: elements inserted after the load are misses, which
@@ -28,7 +46,6 @@
 
 #include "postgres.h"
 
-#include "lib/dshash.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
@@ -59,16 +76,23 @@
 #define ACORN_CC_STATE_READY	2
 #define ACORN_CC_STATE_PARTIAL	3
 
-/*
- * Estimated per-entry cost beyond the payload: dshash item header + dsa
- * chunk overhead.  Used only for budget accounting (admission is advisory;
- * exceeding the estimate degrades to PARTIAL, never to an error).
- */
-#define ACORN_CC_PER_ENTRY_OVERHEAD	48
+/* fixed entry stride: keeps filter_val 8-aligned in the per-page array */
+#define ACORN_CC_ENTRY_STRIDE(dim) \
+	MAXALIGN(offsetof(AcornCodeCacheEntry, code) + (dim))
 
-/* pack an element index TID into the dshash key */
-#define ACORN_CC_KEY(blkno, offno) \
-	(((uint64) (blkno) << 16) | (uint16) (offno))
+/* per-page entry array: 8-byte header, then nslots entries of fixed stride */
+typedef struct AcornCCPageHdr
+{
+	uint16		nslots;			/* entries indexed by offno-1, < nslots+1 */
+	uint16		reserved;
+	uint32		reserved2;
+} AcornCCPageHdr;
+
+#define ACORN_CC_PAGE_SIZE(nslots, stride) \
+	(sizeof(AcornCCPageHdr) + (Size) (nslots) * (stride))
+#define ACORN_CC_PAGE_ENTRY(hdr, offno, stride) \
+	((AcornCodeCacheEntry *) ((char *) (hdr) + sizeof(AcornCCPageHdr) + \
+							  (Size) ((offno) - 1) * (stride)))
 
 typedef struct AcornCodeCacheSlot
 {
@@ -77,37 +101,21 @@ typedef struct AcornCodeCacheSlot
 	pg_atomic_uint32 state;			/* ACORN_CC_STATE_* */
 	uint32			generation;		/* bumped per (re)load */
 	uint32			nelems;
-	uint64			bytes;			/* accounted bytes (payload + overhead) */
-	int				dim;			/* code length; entries are 32 + dim B */
+	uint64			bytes;			/* accounted bytes */
+	int				dim;			/* code length; stride = 32 + dim aligned */
+	uint32			nblocks;		/* length of the block directory */
 	dsa_handle		area_handle;
-	dshash_table_handle table_handle;
+	dsa_pointer		blocks;			/* dsa_pointer[nblocks] page arrays */
 } AcornCodeCacheSlot;
 
 typedef struct AcornCodeCacheDirectory
 {
-	/*
-	 * Locking contract: dir->lock (exclusive) protects slot claiming
-	 * (dboid/relnumber assignment) and handle publication; (shared) protects
-	 * handle reads.  Slot state transitions go through the atomic only:
-	 * EMPTY -> LOADING by CAS (single loader), LOADING -> READY|PARTIAL by
-	 * the loader after a write barrier.  Handles are published under the
-	 * lock BEFORE the state leaves LOADING, so any backend that observes
-	 * READY/PARTIAL and then takes the lock reads valid handles.
-	 */
 	LWLock			lock;
 	int				lock_tranche;
 	int				dsa_tranche;
-	int				dshash_tranche;
 	pg_atomic_uint64 total_bytes;	/* global accounted bytes, all slots */
 	AcornCodeCacheSlot slots[ACORN_CC_NSLOTS];
 } AcornCodeCacheDirectory;
-
-/* dshash entry: packed element TID -> dsa_pointer of AcornCodeCacheEntry */
-typedef struct AcornCCMapEntry
-{
-	uint64			key;
-	dsa_pointer		entry;
-} AcornCCMapEntry;
 
 /* -----------------------------------------------------------------------
  * Backend-local state
@@ -116,7 +124,9 @@ typedef struct AcornCCMapEntry
 struct AcornCodeCacheScan
 {
 	dsa_area	   *area;
-	dshash_table   *table;
+	dsa_pointer    *blocks;			/* mapped block directory */
+	uint32			nblocks;
+	Size			stride;
 };
 
 typedef struct AcornCCAttachKey
@@ -134,15 +144,6 @@ typedef struct AcornCCAttachEntry
 static AcornCodeCacheDirectory *acorn_cc_dir = NULL;
 static HTAB *acorn_cc_attached = NULL;
 
-static const dshash_parameters acorn_cc_hash_params = {
-	sizeof(uint64),
-	sizeof(AcornCCMapEntry),
-	dshash_memcmp,
-	dshash_memhash,
-	dshash_memcpy,
-	0							/* tranche_id filled in at runtime */
-};
-
 /* -----------------------------------------------------------------------
  * Directory attach
  * ----------------------------------------------------------------------- */
@@ -155,7 +156,6 @@ acorn_cc_dir_init(void *ptr)
 	memset(dir, 0, sizeof(AcornCodeCacheDirectory));
 	dir->lock_tranche = LWLockNewTrancheId();
 	dir->dsa_tranche = LWLockNewTrancheId();
-	dir->dshash_tranche = LWLockNewTrancheId();
 	LWLockInitialize(&dir->lock, dir->lock_tranche);
 	pg_atomic_init_u64(&dir->total_bytes, 0);
 	for (int i = 0; i < ACORN_CC_NSLOTS; i++)
@@ -175,7 +175,6 @@ acorn_cc_get_dir(void)
 							   acorn_cc_dir_init, &found);
 		LWLockRegisterTranche(acorn_cc_dir->lock_tranche, "pg_acorn_cc_dir");
 		LWLockRegisterTranche(acorn_cc_dir->dsa_tranche, "pg_acorn_cc_dsa");
-		LWLockRegisterTranche(acorn_cc_dir->dshash_tranche, "pg_acorn_cc_hash");
 	}
 	return acorn_cc_dir;
 }
@@ -249,7 +248,8 @@ acorn_cc_attach_find(Oid dboid, RelFileNumber relnumber, bool *found)
 
 static AcornCCAttachEntry *
 acorn_cc_attach_store(Oid dboid, RelFileNumber relnumber,
-					  dsa_area *area, dshash_table *table)
+					  dsa_area *area, dsa_pointer *blocks,
+					  uint32 nblocks, Size stride)
 {
 	AcornCCAttachKey key;
 	AcornCCAttachEntry *e;
@@ -262,14 +262,17 @@ acorn_cc_attach_store(Oid dboid, RelFileNumber relnumber,
 	e = (AcornCCAttachEntry *)
 		hash_search(acorn_cc_attached, &key, HASH_ENTER, &found);
 	e->scan.area = area;
-	e->scan.table = table;
+	e->scan.blocks = blocks;
+	e->scan.nblocks = nblocks;
+	e->scan.stride = stride;
 	return e;
 }
 
 /*
- * Attach this backend to a READY/PARTIAL slot's DSA area and dshash table.
- * Attachments are pinned for the backend's lifetime (dsa_pin_mapping) and
- * cached, so each backend pays the attach cost once per index.
+ * Attach this backend to a READY/PARTIAL slot's DSA area and map the block
+ * directory.  Attachments are pinned for the backend's lifetime
+ * (dsa_pin_mapping) and cached, so each backend pays the attach cost once
+ * per index.
  */
 static AcornCodeCacheScan *
 acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
@@ -278,10 +281,11 @@ acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 	AcornCCAttachEntry *e;
 	bool		found;
 	dsa_handle	area_handle;
-	dshash_table_handle table_handle;
+	dsa_pointer blocks_dp;
+	uint32		nblocks;
+	int			dim;
 	dsa_area   *area;
-	dshash_table *table;
-	dshash_parameters params = acorn_cc_hash_params;
+	dsa_pointer *blocks;
 	MemoryContext old;
 
 	e = acorn_cc_attach_find(dboid, relnumber, &found);
@@ -290,17 +294,19 @@ acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 
 	LWLockAcquire(&dir->lock, LW_SHARED);
 	area_handle = slot->area_handle;
-	table_handle = slot->table_handle;
-	params.tranche_id = dir->dshash_tranche;
+	blocks_dp = slot->blocks;
+	nblocks = slot->nblocks;
+	dim = slot->dim;
 	LWLockRelease(&dir->lock);
 
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	area = dsa_attach(area_handle);
 	dsa_pin_mapping(area);
-	table = dshash_attach(area, &params, table_handle, NULL);
 	MemoryContextSwitchTo(old);
+	blocks = (dsa_pointer *) dsa_get_address(area, blocks_dp);
 
-	e = acorn_cc_attach_store(dboid, relnumber, area, table);
+	e = acorn_cc_attach_store(dboid, relnumber, area, blocks, nblocks,
+							  ACORN_CC_ENTRY_STRIDE(dim));
 	return &e->scan;
 }
 
@@ -309,58 +315,58 @@ acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
  * ----------------------------------------------------------------------- */
 
 /*
- * Load all element tuples of `index` into the slot's table.  Caller owns
- * the LOADING claim (won the EMPTY -> LOADING CAS).  On return the slot is
- * READY, or PARTIAL when the budget ran out; on error the slot is published
- * PARTIAL with whatever loaded (entries are fully built before they become
- * reachable, so partial content is always servable) and the error is
- * re-thrown.
+ * Load all element tuples of `index` into the slot's block directory.
+ * Caller owns the LOADING claim (won the EMPTY -> LOADING CAS).  On return
+ * the slot is READY, or PARTIAL when the budget ran out; on error the slot
+ * is published PARTIAL with whatever loaded (a block's entry array is fully
+ * built before its directory pointer is set, so partial content is always
+ * servable) and the error is re-thrown.
  */
 static void
 acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 			  Relation index, int dim)
 {
 	dsa_area   *area;
-	dshash_table *table;
-	dshash_parameters params = acorn_cc_hash_params;
 	MemoryContext old;
 	uint64		budget = (uint64) acorn_code_cache_size_mb * 1024 * 1024;
 	uint64		other_bytes;
-	Size		esize = offsetof(AcornCodeCacheEntry, code) + dim;
-	Size		ecost = MAXALIGN(esize) + ACORN_CC_PER_ENTRY_OVERHEAD;
+	Size		stride = ACORN_CC_ENTRY_STRIDE(dim);
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	dsa_pointer blocks_dp;
+	dsa_pointer *blocks;
 	volatile uint64 bytes = 0;
 	volatile uint32 nelems = 0;
 	volatile uint32 final_state = ACORN_CC_STATE_READY;
-
-	params.tranche_id = dir->dshash_tranche;
 
 	/* backend-local control structs must outlive the transaction */
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	area = dsa_create(dir->dsa_tranche);
 	dsa_pin(area);
 	dsa_pin_mapping(area);
-	table = dshash_create(area, &params, NULL);
 	MemoryContextSwitchTo(old);
+
+	blocks_dp = dsa_allocate0(area, (Size) nblocks * sizeof(dsa_pointer));
+	blocks = (dsa_pointer *) dsa_get_address(area, blocks_dp);
+	bytes += (Size) nblocks * sizeof(dsa_pointer);
 
 	/* publish handles before the state can leave LOADING */
 	LWLockAcquire(&dir->lock, LW_EXCLUSIVE);
 	slot->area_handle = dsa_get_handle(area);
-	slot->table_handle = dshash_get_hash_table_handle(table);
+	slot->blocks = blocks_dp;
+	slot->nblocks = nblocks;
 	slot->dim = dim;
 	slot->generation++;
 	LWLockRelease(&dir->lock);
 
 	/* the loading backend is attached by construction */
-	acorn_cc_attach_init();
 	acorn_cc_attach_store(index->rd_locator.dbOid,
-						  index->rd_locator.relNumber, area, table);
+						  index->rd_locator.relNumber, area, blocks,
+						  nblocks, stride);
 
 	other_bytes = pg_atomic_read_u64(&dir->total_bytes);
 
 	PG_TRY();
 	{
-		BlockNumber nblocks = RelationGetNumberOfBlocks(index);
-
 		for (BlockNumber blkno = HNSW_METAPAGE_BLKNO + 1;
 			 blkno < nblocks && final_state == ACORN_CC_STATE_READY;
 			 blkno++)
@@ -368,6 +374,10 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 			Buffer		buf;
 			Page		page;
 			OffsetNumber maxoff;
+			dsa_pointer page_dp = InvalidDsaPointer;
+			AcornCCPageHdr *ph = NULL;
+			Size		page_sz = 0;
+			uint32		page_elems = 0;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -383,10 +393,6 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 				AcornT2ElementTuple etup;
 				AcornPgVector *vec;
 				AcornCodeCacheEntry *e;
-				AcornCCMapEntry *m;
-				dsa_pointer p;
-				uint64		key;
-				bool		found;
 
 				if (!ItemIdIsUsed(iid) || !ItemIdHasStorage(iid))
 					continue;
@@ -397,50 +403,58 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 				if ((int) vec->dim != dim)
 					continue;	/* defensive: never cache a malformed code */
 
-				if (other_bytes + bytes + ecost > budget)
+				if (ph == NULL)
 				{
-					final_state = ACORN_CC_STATE_PARTIAL;
-					break;
+					/* lazy per-page array, sized for this page's offsets */
+					page_sz = ACORN_CC_PAGE_SIZE(maxoff, stride);
+					if (other_bytes + bytes + page_sz > budget)
+					{
+						final_state = ACORN_CC_STATE_PARTIAL;
+						break;
+					}
+					page_dp = dsa_allocate_extended(area, page_sz,
+													DSA_ALLOC_NO_OOM |
+													DSA_ALLOC_ZERO);
+					if (!DsaPointerIsValid(page_dp))
+					{
+						final_state = ACORN_CC_STATE_PARTIAL;
+						break;
+					}
+					ph = (AcornCCPageHdr *) dsa_get_address(area, page_dp);
+					ph->nslots = maxoff;
+					bytes += page_sz;
 				}
 
-				p = dsa_allocate_extended(area, esize, DSA_ALLOC_NO_OOM);
-				if (!DsaPointerIsValid(p))
-				{
-					final_state = ACORN_CC_STATE_PARTIAL;
-					break;
-				}
-
-				/*
-				 * Build the entry completely BEFORE it becomes reachable
-				 * through the dshash, so concurrent readers (the slot may
-				 * be observed PARTIAL after an error) never see a torn
-				 * entry.
-				 */
-				e = (AcornCodeCacheEntry *) dsa_get_address(area, p);
+				e = ACORN_CC_PAGE_ENTRY(ph, offno, stride);
 				e->heaptid = etup->heaptids[0];
 				e->nbrtid = etup->neighbortid;
 				e->level = etup->level;
-				e->flags = (etup->deleted != 0) ? ACORN_CC_DELETED : 0;
+				e->flags = ACORN_CC_PRESENT |
+					((etup->deleted != 0) ? ACORN_CC_DELETED : 0);
 				e->filter_val = etup->filter_val;
 				acorn_sq8_encode(dim, vec->x, e->code, &e->scale, &e->offset);
-
-				key = ACORN_CC_KEY(blkno, offno);
-				m = (AcornCCMapEntry *)
-					dshash_find_or_insert(table, &key, &found);
-				m->entry = p;
-				dshash_release_lock(table, m);
-
-				bytes += ecost;
-				nelems++;
+				page_elems++;
 			}
 
 			UnlockReleaseBuffer(buf);
+
+			/*
+			 * Publish the block only after its entries are complete, so a
+			 * PARTIAL slot (budget stop or error) never exposes a torn
+			 * page array.  The array is allocated lazily on the page's
+			 * first element tuple, so page_elems > 0 whenever one exists.
+			 */
+			if (page_elems > 0)
+			{
+				blocks[blkno] = page_dp;
+				nelems += page_elems;
+			}
 		}
 	}
 	PG_CATCH();
 	{
 		/*
-		 * Publish what loaded so far as PARTIAL: every inserted entry is
+		 * Publish what loaded so far as PARTIAL: every published block is
 		 * complete, and misses fall back (G4).  The slot never returns to
 		 * EMPTY in M1, so the create-vs-reuse branch does not exist.
 		 */
@@ -472,9 +486,21 @@ acorn_codecache_begin_scan(Relation index, int dim)
 	Oid			dboid = index->rd_locator.dbOid;
 	RelFileNumber relnumber = index->rd_locator.relNumber;
 	uint32		state;
+	AcornCCAttachEntry *att;
+	bool		found;
 
 	if (!acorn_scan_code_cache || acorn_code_cache_size_mb <= 0 || dim <= 0)
 		return NULL;
+
+	/*
+	 * Steady state: an existing attachment stays valid for the backend's
+	 * lifetime in M1 (no eviction, slot states never regress, REINDEX
+	 * changes the relfilenumber key), so repeat scans skip the directory
+	 * lock entirely.
+	 */
+	att = acorn_cc_attach_find(dboid, relnumber, &found);
+	if (found)
+		return &att->scan;
 
 	dir = acorn_cc_get_dir();
 	slot = acorn_cc_slot_lookup(dir, dboid, relnumber);
@@ -508,20 +534,26 @@ const AcornCodeCacheEntry *
 acorn_codecache_lookup(AcornCodeCacheScan *cc,
 					   BlockNumber blkno, OffsetNumber offno)
 {
-	uint64		key = ACORN_CC_KEY(blkno, offno);
-	AcornCCMapEntry *m;
+	dsa_pointer page_dp;
+	AcornCCPageHdr *ph;
 	const AcornCodeCacheEntry *e;
 
-	m = (AcornCCMapEntry *) dshash_find(cc->table, &key, false);
-	if (m == NULL)
+	if (blkno >= cc->nblocks)
 		return NULL;
-	e = (const AcornCodeCacheEntry *) dsa_get_address(cc->area, m->entry);
-	dshash_release_lock(cc->table, m);
+	page_dp = cc->blocks[blkno];
+	if (!DsaPointerIsValid(page_dp))
+		return NULL;
+	ph = (AcornCCPageHdr *) dsa_get_address(cc->area, page_dp);
+	if (offno < 1 || offno > ph->nslots)
+		return NULL;
+	e = ACORN_CC_PAGE_ENTRY(ph, offno, cc->stride);
+	if ((e->flags & ACORN_CC_PRESENT) == 0)
+		return NULL;
 
 	/*
-	 * Safe to dereference after releasing the partition lock: M1 entries
-	 * are immutable and never freed (no eviction, no vacuum invalidation).
-	 * M2 entry versioning revisits this contract.
+	 * Safe to dereference after return: M1 entries are immutable and never
+	 * freed (no eviction, no vacuum invalidation).  M2 entry versioning
+	 * revisits this contract.
 	 */
 	return e;
 }
