@@ -18,7 +18,7 @@ import psycopg
 DSN = os.environ.get("PG_DSN", "host=localhost dbname=bench user=postgres")
 N, DIM, NQ, K = 250_000, 128, 40, 10
 SELS = [1, 2, 5, 10, 20]
-EFS = [40, 100, 200, 400, 800, 1600]
+EFS = [40, 100, 200, 400, 800]
 RNG_DATA = np.random.default_rng(42)
 RNG_QUERY = np.random.default_rng(99)
 NWARM = 3
