@@ -26,6 +26,12 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
 SET search_path = test_cc_evict, public;
 
+-- Clean slate: the code-cache directory is shared across the whole regression
+-- postmaster, so earlier suites leave orphan slots (dropped indexes with no
+-- surviving regclass).  Clear them so this test's slot-count and LRU-victim
+-- assertions are deterministic.  Count is discarded (it depends on prior runs).
+DO $$ BEGIN PERFORM pg_acorn_code_cache_reset(); END $$;
+
 SELECT setseed(0.815);
 SET pg_acorn.build_seed = 815;
 SET max_parallel_maintenance_workers = 0;

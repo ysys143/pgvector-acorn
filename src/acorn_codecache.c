@@ -1489,6 +1489,7 @@ acorn_codecache_invalidate(Relation index,
 PG_FUNCTION_INFO_V1(pg_acorn_code_cache_stats);
 PG_FUNCTION_INFO_V1(pg_acorn_code_cache_summary);
 PG_FUNCTION_INFO_V1(pg_acorn_code_cache_evict);
+PG_FUNCTION_INFO_V1(pg_acorn_code_cache_reset);
 
 /*
  * pg_acorn_code_cache_stats() -> SETOF record, one row per occupied slot.
@@ -1661,4 +1662,52 @@ pg_acorn_code_cache_evict(PG_FUNCTION_ARGS)
 	LWLockRelease(&dir->lock);
 
 	PG_RETURN_BOOL(evicted);
+}
+
+/*
+ * pg_acorn_code_cache_reset() -> int.  Force-evict every evictable slot
+ * (READY/PARTIAL with no active scan) across the whole directory, returning
+ * the count evicted.  Slots mid-LOADING or with an active scan are left
+ * untouched (evict_slot self-guards and defers a raced free).  This is the
+ * only way to clear ORPHAN slots left by dropped indexes — those have no
+ * surviving regclass, so pg_acorn_code_cache_evict() cannot name them — and
+ * is the clean-slate primitive for ops and deterministic tests.  Restricted
+ * to superusers and members of pg_maintain.
+ */
+Datum
+pg_acorn_code_cache_reset(PG_FUNCTION_ARGS)
+{
+	AcornCodeCacheDirectory *dir;
+	int			n = 0;
+
+	if (!superuser() &&
+		!has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser or have privileges of pg_maintain "
+						"to reset the acorn code cache")));
+
+	/*
+	 * Attach the directory even if this backend never used the cache: the
+	 * orphan/foreign slots we must clear were created by other backends and
+	 * live in the shared DSM segment.
+	 */
+	dir = acorn_cc_get_dir();
+
+	LWLockAcquire(&dir->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < ACORN_CC_NSLOTS; i++)
+	{
+		AcornCodeCacheSlot *s = &dir->slots[i];
+		uint32		st = pg_atomic_read_u32(&s->state);
+
+		if ((st == ACORN_CC_STATE_READY || st == ACORN_CC_STATE_PARTIAL) &&
+			pg_atomic_read_u32(&s->active_scans) == 0)
+		{
+			acorn_cc_evict_slot(dir, s);
+			n++;
+		}
+	}
+	LWLockRelease(&dir->lock);
+
+	PG_RETURN_INT32(n);
 }

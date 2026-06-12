@@ -138,6 +138,17 @@ COMMENT ON FUNCTION pg_acorn_code_cache_evict(regclass) IS
 
 REVOKE ALL ON FUNCTION pg_acorn_code_cache_evict(regclass) FROM PUBLIC;
 
+CREATE FUNCTION pg_acorn_code_cache_reset()
+    RETURNS integer
+    AS 'MODULE_PATHNAME', 'pg_acorn_code_cache_reset'
+    LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION pg_acorn_code_cache_reset() IS
+    'Force-evict every evictable acorn_hnsw code-cache slot (incl. orphans from '
+    'dropped indexes); returns the count evicted.';
+
+REVOKE ALL ON FUNCTION pg_acorn_code_cache_reset() FROM PUBLIC;
+
 -- GUCs (loaded via _PG_init, declared here for documentation)
 -- pg_acorn.enable_hook       boolean  default true   (Tier 1 hook)
 -- pg_acorn.default_gamma     integer  default 1      (ACORN-1 by default)

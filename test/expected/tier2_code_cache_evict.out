@@ -25,6 +25,11 @@ NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_acorn;
 NOTICE:  extension "pg_acorn" already exists, skipping
 SET search_path = test_cc_evict, public;
+-- Clean slate: the code-cache directory is shared across the whole regression
+-- postmaster, so earlier suites leave orphan slots (dropped indexes with no
+-- surviving regclass).  Clear them so this test's slot-count and LRU-victim
+-- assertions are deterministic.  Count is discarded (it depends on prior runs).
+DO $$ BEGIN PERFORM pg_acorn_code_cache_reset(); END $$;
 SELECT setseed(0.815);
  setseed 
 ---------
@@ -86,16 +91,15 @@ SELECT topk('a', true) = (SELECT ids FROM truth_a) AS a_warm_correct;
 SELECT count(*) = 1 AS one_slot_after_a FROM pg_acorn_code_cache_stats();
  one_slot_after_a 
 ------------------
- f
+ t
 (1 row)
 
 SELECT indexrelid = 'a_idx'::regclass AS a_is_resident
 FROM pg_acorn_code_cache_stats();
  a_is_resident 
 ---------------
- 
  t
-(2 rows)
+(1 row)
 
 -- Warm B: admission must evict the LRU (A) to make room.
 SELECT topk('b', true) = (SELECT ids FROM truth_b) AS b_warm_correct;
