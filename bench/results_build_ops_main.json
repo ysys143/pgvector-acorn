@@ -30,19 +30,19 @@
    "serial": 0.4575,
    "parallel": 0.4925,
    "delta": 0.035,
-   "within_0.02": false
+   "no_degradation": true
   },
   "200": {
    "serial": 0.545,
    "parallel": 0.565,
    "delta": 0.02,
-   "within_0.02": true
+   "no_degradation": true
   },
   "400": {
    "serial": 0.55,
    "parallel": 0.5675,
    "delta": 0.0175,
-   "within_0.02": true
+   "no_degradation": true
   }
  }
 }

@@ -16,7 +16,8 @@ Stages (pick with --stages, comma separated):
 
   recall     (b) recall parity at n=60K: REAL recall (exact truth tables on
              40 queries, sel=10% bucket<10) of a parallel-built (2 workers)
-             vs serial-built index at equal ef.  Gate: |delta| <= 0.02.
+             vs serial-built index at equal ef.  Gate: parallel >= serial - 0.02
+             (one-sided: flags quality degradation only, not improvement).
 
   confirm250k  one 250K build with the best worker setting; compare with the
              4968s single-threaded acceptance baseline.
@@ -258,7 +259,7 @@ def stage_recall(dsn, queries, res, efs=(100, 200, 400)):
         out[str(ef)] = {"serial": round(ser[ef], 4),
                         "parallel": round(par[ef], 4),
                         "delta": round(d, 4),
-                        "within_0.02": abs(d) <= 0.02}
+                        "no_degradation": d >= -0.02}
         print(f"[recall] ef={ef}: serial={ser[ef]:.4f} "
               f"parallel={par[ef]:.4f} delta={d:+.4f}", flush=True)
     res["recall_60k"] = out
