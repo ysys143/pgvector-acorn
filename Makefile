@@ -9,7 +9,19 @@ OBJS = \
 	src/acorn_am.o \
 	src/acorn_build.o \
 	src/acorn_scan.o \
-	src/acorn_cost.o
+	src/acorn_cost.o \
+	src/acorn_dist.o
+
+# Distance kernels must compile exactly like pgvector 0.8.0 (same flags ->
+# same auto-vectorized summation order -> bit-identical distances vs fmgr).
+# Mirrors pgvector's Makefile OPTFLAGS logic (no -march=native on Darwin/arm).
+DIST_OPTFLAGS = -march=native
+ifeq ($(shell uname -s), Darwin)
+	ifeq ($(shell uname -p), arm)
+		DIST_OPTFLAGS =
+	endif
+endif
+src/acorn_dist.o: CFLAGS += $(DIST_OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 
 REGRESS = \
 	smoke \
@@ -18,6 +30,10 @@ REGRESS = \
 	tier2_infilter \
 	tier2_2hop \
 	tier2_ef_search \
+	tier2_payload_edges \
+	tier2_diversify \
+	tier2_inline_vectors \
+	tier2_emission_order \
 	no_regression \
 	recall_filter \
 	recall_gamma \
@@ -37,9 +53,10 @@ include $(PGXS)
 src/pg_acorn.o:   src/acorn_hook.h src/acorn_am.h
 src/acorn_hook.o: src/acorn_hook.h src/acorn_scan.h
 src/acorn_am.o:   src/acorn_am.h   src/acorn_scan.h src/acorn_cost.h
-src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h src/acorn_t2_page.h
-src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h
+src/acorn_build.o: src/acorn_am.h   src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h src/acorn_scan.h
+src/acorn_scan.o:  src/acorn_scan.h src/hnsw_compat.h src/acorn_t2_page.h src/pg_acorn.h src/acorn_dist.h
 src/acorn_cost.o:  src/acorn_cost.h src/acorn_am.h
+src/acorn_dist.o:  src/acorn_dist.h
 
 # Unit tests — standalone C binaries, no PostgreSQL dependency.
 # Tests cover algorithm logic extracted in test/unit/*.c (self-contained stubs).

@@ -1,0 +1,171 @@
+-- tier2_emission_order.sql: ORDER BY contract for the Tier 2 streaming scan.
+--
+-- Eager emission (legacy) emits the greedy local minimum as soon as no
+-- unexpanded candidate is closer than the nearest discovered result — a
+-- truly closer node can still be UNDISCOVERED at that point, so emitted
+-- distances could invert (measured: rank-0 d=0.654 before an undiscovered
+-- d=0.000).  Buffered emission (pg_acorn.buffered_emission, default on)
+-- finishes the expansion phase first, then emits in exact-distance order.
+--
+-- Tests: emitted distances are monotonically non-decreasing (lead() window
+-- over the emitted rows) for filtered and unfiltered scans, with the inline
+-- (SQ8 + exact re-rank) path on AND off, buffered on; and REAL recall
+-- (exact seqscan truth table) of buffered >= eager at equal ef.
+--
+-- vector_l2_ops on the inline index: l2 has a provable SQ8 quantization
+-- error bound, so the lb-driven re-rank guarantees exact emission order.
+-- Deterministic: fixed data seed (setseed) + fixed graph (build_seed).
+\set ON_ERROR_STOP on
+\set q '[0.62,0.31,0.47,0.55,0.28,0.73,0.41,0.66]'
+CREATE SCHEMA test_t2_emission;
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_acorn;
+NOTICE:  extension "pg_acorn" already exists, skipping
+SET search_path = test_t2_emission, public;
+SELECT setseed(0.7);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE items (
+    id        serial PRIMARY KEY,
+    bucket    int,
+    embedding vector(8)
+);
+-- 3000 rows, 10 buckets -> bucket < 1 = ~10% selectivity
+INSERT INTO items (bucket, embedding) SELECT
+    (i % 10),
+    ('[' || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ','
+          || (random())::text || ',' || (random())::text || ']')::vector
+FROM generate_series(1, 3000) i;
+SET pg_acorn.build_seed = 42;
+CREATE INDEX items_emit_idx ON items
+    USING acorn_hnsw (embedding vector_l2_ops, bucket int4_acorn_ops)
+    WITH (m = 16, ef_construction = 64, acorn_gamma = 2,
+          acorn_inline_vectors = true);
+RESET pg_acorn.build_seed;
+-- Exact ground truth (seqscan) for the recall comparison.
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE truth_f AS
+    SELECT id FROM items WHERE bucket < 1
+    ORDER BY embedding <-> :'q'::vector LIMIT 10;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+-- Emitted distances must be monotonically non-decreasing: lead() window over
+-- the rows in index-emission order (the subquery's ORDER BY is served by the
+-- index scan, so any inversion in what the AM emits surfaces here).
+CREATE OR REPLACE FUNCTION emitted_monotone(filtered bool, lim int)
+RETURNS boolean AS $$
+DECLARE
+    ok boolean;
+BEGIN
+    SET enable_seqscan = off;
+    EXECUTE format(
+        'SELECT coalesce(bool_and(d <= next_d), true) FROM (
+             SELECT d, lead(d) OVER () AS next_d FROM (
+                 SELECT embedding <-> %L::vector AS d
+                 FROM items %s
+                 ORDER BY embedding <-> %L::vector
+                 LIMIT %s) emit) w
+         WHERE next_d IS NOT NULL',
+        '[0.62,0.31,0.47,0.55,0.28,0.73,0.41,0.66]',
+        CASE WHEN filtered THEN 'WHERE bucket < 1' ELSE '' END,
+        '[0.62,0.31,0.47,0.55,0.28,0.73,0.41,0.66]',
+        lim)
+    INTO ok;
+    RESET enable_seqscan;
+    RETURN ok;
+END;
+$$ LANGUAGE plpgsql;
+SET pg_acorn.buffered_emission = on;
+SET pg_acorn.ef_search = 200;
+-- inline path ON: filtered and unfiltered emission order
+SET pg_acorn.scan_inline_vectors = on;
+SELECT emitted_monotone(true,  50) AS inline_filtered_monotone;
+ inline_filtered_monotone 
+--------------------------
+ t
+(1 row)
+
+SELECT emitted_monotone(false, 50) AS inline_unfiltered_monotone;
+ inline_unfiltered_monotone 
+----------------------------
+ t
+(1 row)
+
+-- inline path OFF (classic per-neighbor element-page reads, exact distances)
+SET pg_acorn.scan_inline_vectors = off;
+SELECT emitted_monotone(true,  50) AS classic_filtered_monotone;
+ classic_filtered_monotone 
+---------------------------
+ t
+(1 row)
+
+SELECT emitted_monotone(false, 50) AS classic_unfiltered_monotone;
+ classic_unfiltered_monotone 
+-----------------------------
+ t
+(1 row)
+
+RESET pg_acorn.scan_inline_vectors;
+-- member_first routing must not break the ordering contract
+SET pg_acorn.member_first = on;
+SELECT emitted_monotone(true, 50) AS member_first_filtered_monotone;
+ member_first_filtered_monotone 
+--------------------------------
+ t
+(1 row)
+
+RESET pg_acorn.member_first;
+-- REAL recall: buffered >= eager at equal ef (same index, same query).
+CREATE OR REPLACE FUNCTION emit_recall(buffered bool, ef int)
+RETURNS numeric AS $$
+DECLARE
+    matched int;
+BEGIN
+    EXECUTE format('SET pg_acorn.buffered_emission = %s', buffered);
+    EXECUTE format('SET pg_acorn.ef_search = %s', ef);
+    SET enable_seqscan = off;
+    SELECT count(*) INTO matched FROM (
+        SELECT id FROM items WHERE bucket < 1
+        ORDER BY embedding <-> '[0.62,0.31,0.47,0.55,0.28,0.73,0.41,0.66]'::vector
+        LIMIT 10) r JOIN truth_f USING (id);
+    RESET enable_seqscan;
+    RESET pg_acorn.buffered_emission;
+    RETURN matched / 10.0;
+END;
+$$ LANGUAGE plpgsql;
+SELECT emit_recall(true, 80)  >= emit_recall(false, 80)
+    AS buffered_ge_eager_ef80;
+ buffered_ge_eager_ef80 
+------------------------
+ t
+(1 row)
+
+SELECT emit_recall(true, 400) >= emit_recall(false, 400)
+    AS buffered_ge_eager_ef400;
+ buffered_ge_eager_ef400 
+-------------------------
+ t
+(1 row)
+
+-- Buffered emission at a saturating ef must find the exact filtered top-10.
+SELECT emit_recall(true, 1000) = 1.0 AS buffered_exact_at_ef1000;
+ buffered_exact_at_ef1000 
+--------------------------
+ t
+(1 row)
+
+RESET pg_acorn.ef_search;
+RESET pg_acorn.buffered_emission;
+DROP SCHEMA test_t2_emission CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table items
+drop cascades to table truth_f
+drop cascades to function emitted_monotone(boolean,integer)
+drop cascades to function emit_recall(boolean,integer)

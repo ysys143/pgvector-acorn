@@ -56,6 +56,30 @@ acorn_am_init(void)
 					  "ACORN gamma: store m*gamma neighbors per node",
 					  ACORN_DEFAULT_GAMMA, ACORN_MIN_GAMMA, ACORN_MAX_GAMMA,
 					  AccessExclusiveLock);
+	add_bool_reloption(acorn_relopt_kind, "acorn_payload_edges",
+					   "Split layer-0 neighbor slots: half global nearest, "
+					   "half nearest within the same payload partition",
+					   false,
+					   AccessExclusiveLock);
+	/*
+	 * Default OFF: the 50K 10-seed audit (bench/results_graph_audit.json)
+	 * showed the heuristic statistically indistinguishable from nearest-only
+	 * selection on the correlated fixture (unf_rr50 0.402 vs 0.408) at
+	 * 1.4-2x build cost; the thesis-band raw ceilings proved to be bound by
+	 * the t2 stream's emission rule, not neighbor selection.  Kept available
+	 * for clustered workloads where it measurably reconnects layer 0
+	 * (tier2_diversify.sql island fixture: unfiltered 0.700 -> 1.000).
+	 */
+	add_bool_reloption(acorn_relopt_kind, "acorn_diversify",
+					   "Apply the HNSW diversity heuristic (Malkov Alg. 4 with "
+					   "keepPrunedConnections) in neighbor selection",
+					   false,
+					   AccessExclusiveLock);
+	add_bool_reloption(acorn_relopt_kind, "acorn_inline_vectors",
+					   "Co-locate quantized vectors + filter metadata in the "
+					   "layer-0 neighbor lists (vector co-location)",
+					   false,
+					   AccessExclusiveLock);
 }
 
 static bytea *
@@ -65,6 +89,9 @@ acorn_options(Datum reloptions, bool validate)
 		{"m", RELOPT_TYPE_INT, offsetof(AcornOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(AcornOptions, efConstruction)},
 		{"acorn_gamma", RELOPT_TYPE_INT, offsetof(AcornOptions, gamma)},
+		{"acorn_payload_edges", RELOPT_TYPE_BOOL, offsetof(AcornOptions, payloadEdges)},
+		{"acorn_diversify", RELOPT_TYPE_BOOL, offsetof(AcornOptions, diversify)},
+		{"acorn_inline_vectors", RELOPT_TYPE_BOOL, offsetof(AcornOptions, inlineVectors)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

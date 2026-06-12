@@ -57,6 +57,22 @@
 			 ((level) + 2) * (m) * sizeof(ItemPointerData))
 
 /* -----------------------------------------------------------------------
+ * pgvector `vector` datum layout (pgvector 0.8.0 src/vector.h)
+ *
+ * The inline vector in element tuples and the detoasted query datum are
+ * both this varlena struct.  Used by the direct distance kernels
+ * (acorn_dist.c) to bypass fmgr.
+ * ----------------------------------------------------------------------- */
+
+typedef struct AcornPgVector
+{
+	int32		vl_len_;		/* varlena header (do not touch directly) */
+	int16		dim;			/* number of dimensions */
+	int16		unused;			/* reserved for future use, always zero */
+	float		x[FLEXIBLE_ARRAY_MEMBER];
+} AcornPgVector;
+
+/* -----------------------------------------------------------------------
  * Page opaque — at PageGetSpecialPointer(page)
  * ----------------------------------------------------------------------- */
 
