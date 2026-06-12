@@ -103,6 +103,13 @@ extern bool acorn_codecache_lookup(AcornCodeCacheScan *cc,
 								   AcornCodeCacheHit *out);
 
 /*
+ * Release the active-scan reference taken by begin_scan (M3).  The AM must
+ * call this once per begin_scan at endscan; it is NULL-safe and idempotent.
+ * Dropping the last active scan on a slot reclaims its retired growth arrays.
+ */
+extern void acorn_codecache_end_scan(AcornCodeCacheScan *cc);
+
+/*
  * Write path (M2).  Both are no-ops unless a READY/PARTIAL slot for the
  * index already exists in this postmaster — they never trigger a load, so
  * an unwarmed index keeps the M1 "load lazily on first scan" behavior.

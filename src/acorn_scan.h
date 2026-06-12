@@ -91,4 +91,12 @@ AcornT2StreamScan *acorn_t2_stream_begin(Relation index,
 bool acorn_t2_stream_next(AcornT2StreamScan *stream,
 						   ItemPointerData *heaptid_out);
 
+/*
+ * Release any shared-memory code-cache active-scan reference held by the
+ * stream (M3).  NULL-safe and idempotent; the AM calls it at rescan and
+ * endscan so the per-slot active_scans refcount is balanced even when the
+ * stream's memory context is reset/destroyed without a normal drain.
+ */
+void acorn_t2_stream_end(AcornT2StreamScan *stream);
+
 #endif /* ACORN_SCAN_H */
