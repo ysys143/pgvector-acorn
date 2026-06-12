@@ -34,6 +34,8 @@ REGRESS = \
 	tier2_diversify \
 	tier2_inline_vectors \
 	tier2_emission_order \
+	tier2_build_mwm \
+	tier2_build_parallel \
 	no_regression \
 	recall_filter \
 	recall_gamma \

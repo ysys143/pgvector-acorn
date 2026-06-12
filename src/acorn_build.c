@@ -28,17 +28,29 @@
 #include "access/amapi.h"
 #include "access/generic_xlog.h"
 #include "access/genam.h"
+#include "access/parallel.h"
 #include "access/relscan.h"
+#include "access/table.h"
 #include "access/tableam.h"
+#include "access/xact.h"
+#include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
+#include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/condition_variable.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
+#include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/wait_event.h"
 
 #include "pg_acorn.h"
 #include "acorn_am.h"
@@ -53,6 +65,38 @@
  *   HNSW_NEIGHBOR_TUPLE_SIZE(6, 100) = 4 + 8*100*6 = 4804 bytes < HNSW_MAX_SIZE
  */
 #define ACORN_MAX_LEVEL  6
+
+/* shm_toc keys for the parallel build (mirrors pgvector hnswbuild.c) */
+#define PARALLEL_KEY_ACORN_SHARED	UINT64CONST(0xB000000000000001)
+#define PARALLEL_KEY_ACORN_AREA		UINT64CONST(0xB000000000000002)
+#define PARALLEL_KEY_QUERY_TEXT		UINT64CONST(0xB000000000000003)
+
+/*
+ * LWLock tranche for parallel-build locks.  The tranche id lives in a tiny
+ * shared-memory struct (allocated from PostgreSQL's small-allocation slop,
+ * exactly like pgvector's HnswInitLockTranche) so that one id is shared by
+ * every backend; each backend additionally registers the id locally.
+ */
+static int acorn_lock_tranche_id = 0;
+
+static void
+acorn_init_lock_tranche(void)
+{
+	int		   *tranche_ids;
+	bool		found;
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	tranche_ids = ShmemInitStruct("pg_acorn LWLock ids",
+								  sizeof(int) * 1,
+								  &found);
+	if (!found)
+		tranche_ids[0] = LWLockNewTrancheId();
+	acorn_lock_tranche_id = tranche_ids[0];
+	LWLockRelease(AddinShmemInitLock);
+
+	/* Per-backend registration of the tranche ID */
+	LWLockRegisterTranche(acorn_lock_tranche_id, "AcornBuild");
+}
 
 /* -----------------------------------------------------------------------
  * Options
@@ -552,8 +596,16 @@ build_create_visited(void)
 	memset(&info, 0, sizeof(info));
 	info.keysize   = sizeof(ItemPointerData);
 	info.entrysize = sizeof(ItemPointerData) + 1;
+	info.hcxt      = CurrentMemoryContext;
+
+	/*
+	 * HASH_CONTEXT is essential: without it dynahash parks the table under
+	 * TopMemoryContext, so it outlives the per-search temp context and leaks
+	 * ~100KB per on-disk insert (measured 1.26GB peak RssAnon during a 60K
+	 * maintenance_work_mem spill tail vs 87MB for the full in-memory build).
+	 */
 	return hash_create("acorn_build_visited", 512, &info,
-					   HASH_ELEM | HASH_BLOBS);
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 static bool
@@ -584,40 +636,167 @@ build_mark_visited(HTAB *visited, const ItemPointerData *tid)
  *
  * A page-packing simulation (acorn_mem_preassign_tids) assigns every tuple's
  * on-disk location before any write, breaking the circular TID dependency.
+ *
+ * MEMORY BUDGET (maintenance_work_mem): the graph may only grow while its
+ * total allocation fits maintenance_work_mem.  When the next node would not
+ * fit, the graph built so far is flushed and every remaining tuple goes
+ * through the per-element on-disk insert path (pgvector's two-phase build
+ * pattern).  In a serial build a running byte counter tracks the actual
+ * allocations; in a parallel build the graph lives in one fixed-size shared
+ * memory arena, so exhaustion of the arena is the same condition.
+ *
+ * PARALLEL BUILD: the node array + vectors + neighbor arrays live in a DSM
+ * arena mapped at a different address in each participant, so graph-internal
+ * references are stored as arena offsets (AcornBuildPtr dual-mode pointers,
+ * pgvector's relptr pattern).  Concurrency control mirrors pgvector
+ * hnswbuild.c:
+ *
+ *   - allocatorLock:  node-id + arena bump allocation
+ *   - entryLock/entryWaitLock: entry point reads (shared) and updates
+ *     (exclusive, with the wait-lock dance to avoid starvation)
+ *   - flushLock:      shared while inserting in memory; exclusive to flush
+ *     and for each (serialized) on-disk insert after spill — the acorn
+ *     on-disk insert path is NOT concurrency-safe, so correctness over
+ *     speed for the spilled portion
+ *   - partLock:       payload partition entry map
+ *   - per-node lock:  a node's neighbor slots are read (slot-range copy)
+ *     under LW_SHARED and mutated under LW_EXCLUSIVE
+ *
+ * A new node is published to other participants only by the first reverse
+ * edge that stores its id (taken under the target's exclusive lock), so its
+ * own level/vector/forward slots are complete before anyone can reach it.
  * ----------------------------------------------------------------------- */
+
+/* Dual-mode graph pointer: absolute in serial builds, arena offset in parallel */
+typedef union AcornBuildPtr
+{
+	void	   *ptr;
+	Size		off;
+} AcornBuildPtr;
 
 typedef struct AcornMemNode
 {
 	int				 level;
 	int64			 filter_val;
-	Datum			 vec;			/* palloc'd copy in build_ctx */
+	AcornBuildPtr	 vec;			/* vector varlena copy */
 	Size			 vsize;
-	int				*nbr;			/* flat (level+2)*m_eff int IDs; -1=empty */
+	AcornBuildPtr	 nbr;			/* flat (level+2)*m_eff int IDs; -1=empty */
 	ItemPointerData  heaptid;
+	LWLock			 lock;			/* parallel build: protects nbr slots */
 	BlockNumber		 nbr_blkno;		/* assigned by acorn_mem_preassign_tids */
 	OffsetNumber	 nbr_offno;
 	BlockNumber		 elem_blkno;
 	OffsetNumber	 elem_offno;
-	ItemPointerData *cont_tids;		/* inline-vector continuation chunk TIDs */
+	ItemPointerData *cont_tids;		/* inline-vector continuation chunk TIDs
+									 * (flusher-private allocation) */
 	int				 n_conts;
 } AcornMemNode;
 
+/*
+ * Shared state for a parallel build.  Lives at the start of the DSM segment;
+ * the ParallelTableScanDesc follows at a BUFFERALIGN'd offset, and the graph
+ * arena is a separate shm_toc chunk.
+ */
+typedef struct AcornShared
+{
+	/* Immutable state */
+	Oid			heaprelid;
+	Oid			indexrelid;
+	bool		isconcurrent;
+	Size		arena_size;		/* total bytes of the graph arena */
+	int			max_nodes;		/* capacity of the node array */
+
+	/* Worker progress (under mutex) */
+	slock_t		mutex;
+	int			nparticipantsdone;
+	double		reltuples;
+	double		indtuples;
+	ConditionVariable workersdonecv;
+
+	/* Graph state */
+	LWLock		allocatorLock;
+	LWLock		entryLock;
+	LWLock		entryWaitLock;
+	LWLock		flushLock;
+	LWLock		partLock;
+	int			n_nodes;		/* under allocatorLock */
+	Size		arena_used;		/* bump offset, under allocatorLock */
+	int			entry_id;		/* under entryLock; -1 = none */
+	int			entry_level;
+	bool		flushed;		/* under flushLock */
+	int			part_entry[ACORN_PAYLOAD_PARTITIONS];	/* under partLock */
+} AcornShared;
+
+#define ParallelTableScanFromAcornShared(shared) \
+	((ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(AcornShared))))
+
 typedef struct AcornMemBuild
 {
-	AcornMemNode   *nodes;
-	int				n_nodes;
-	int				capacity;
-	int				entry_id;		/* -1 = no entry yet */
+	AcornMemNode   *nodes;			/* serial: palloc'd; parallel: in arena */
+	char		   *base;			/* arena base; NULL = serial (absolute ptrs) */
+	AcornShared	   *shared;			/* NULL = serial build */
+	int				n_nodes;		/* serial only (parallel: shared->n_nodes) */
+	int				capacity;		/* serial: growable; parallel: max_nodes */
+	int				entry_id;		/* serial only; -1 = no entry yet */
 	int				entry_level;
-	uint32		   *visit_gen;		/* size = capacity; generation-based visited set */
+	uint32		   *visit_gen;		/* per-process generation-based visited set */
 	uint32			cur_gen;
 	bool			payload_edges;	/* split layer-0 slots global/partition halves */
 	bool			inline_vectors;	/* co-locate SQ8 vectors in neighbor lists */
 	int				dims;			/* vector dimensions (inline mode) */
 	Size			entry_size;		/* inline entry stride (inline mode) */
-	int			   *part_entry;		/* partition -> first member node id, -1 = none */
+	int			   *part_entry;		/* partition -> first member node id, -1 = none
+									 * (parallel: points at shared->part_entry) */
 	MemoryContext	build_ctx;
+	/* maintenance_work_mem accounting (serial; parallel uses the arena) */
+	Size			mem_used;		/* bytes allocated for the graph so far */
+	Size			mem_total;		/* budget = maintenance_work_mem in bytes */
 } AcornMemBuild;
+
+/* Graph-internal pointer access (relptr pattern; see block comment above) */
+static inline Datum
+acorn_node_vec(const AcornMemBuild *mb, const AcornMemNode *node)
+{
+	return mb->base ? PointerGetDatum(mb->base + node->vec.off)
+		: PointerGetDatum(node->vec.ptr);
+}
+
+static inline int *
+acorn_node_nbr(const AcornMemBuild *mb, const AcornMemNode *node)
+{
+	return mb->base ? (int *) (mb->base + node->nbr.off)
+		: (int *) node->nbr.ptr;
+}
+
+/* Per-node neighbor-slot locks (no-ops in a serial build) */
+static inline void
+acorn_node_lock(AcornMemBuild *mb, AcornMemNode *node, LWLockMode mode)
+{
+	if (mb->shared)
+		LWLockAcquire(&node->lock, mode);
+}
+
+static inline void
+acorn_node_unlock(AcornMemBuild *mb, AcornMemNode *node)
+{
+	if (mb->shared)
+		LWLockRelease(&node->lock);
+}
+
+/*
+ * Copy `count` neighbor slots of `node` starting at flat slot index `start`
+ * into out[].  Readers must never chase another node's slot array in place:
+ * a concurrent insert may be mutating it (parallel build), so the slots are
+ * snapshotted under the node's shared lock.
+ */
+static inline void
+acorn_mem_copy_slots(AcornMemBuild *mb, AcornMemNode *node,
+					 int start, int count, int *out)
+{
+	acorn_node_lock(mb, node, LW_SHARED);
+	memcpy(out, acorn_node_nbr(mb, node) + start, count * sizeof(int));
+	acorn_node_unlock(mb, node);
+}
 
 /* Min/max-heap comparators for in-memory beam search (integer node IDs) */
 typedef struct MemPQNode
@@ -658,36 +837,106 @@ acorn_mem_build_init(MemoryContext ctx)
 	mb->part_entry  = palloc(ACORN_PAYLOAD_PARTITIONS * sizeof(int));
 	for (int p = 0; p < ACORN_PAYLOAD_PARTITIONS; p++)
 		mb->part_entry[p] = -1;
+	mb->mem_used    = mb->capacity * (sizeof(AcornMemNode) + sizeof(uint32))
+		+ sizeof(AcornMemBuild) + ACORN_PAYLOAD_PARTITIONS * sizeof(int);
+	mb->mem_total   = (Size) maintenance_work_mem * 1024;
 	MemoryContextSwitchTo(old);
 	return mb;
 }
 
-static void
-acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize,
-					int64 filter_val, ItemPointer heaptid)
+/*
+ * Bytes the graph grows by when node `level` with a `vsize` vector is pushed.
+ * Used both for the serial maintenance_work_mem check (against the running
+ * counter of the same charges) and for the next-node projection.
+ */
+static inline Size
+acorn_mem_node_cost(const AcornMemBuild *mb, int level, Size vsize, int m_eff)
 {
-	MemoryContext  old  = MemoryContextSwitchTo(mb->build_ctx);
-	AcornMemNode  *node;
+	Size cost = MAXALIGN(vsize)
+		+ MAXALIGN((Size) (level + 2) * m_eff * sizeof(int));
 
-	if (mb->n_nodes >= mb->capacity)
+	/* serial: account the capacity doubling this push would trigger */
+	if (!mb->shared && mb->n_nodes >= mb->capacity)
+		cost += (Size) mb->capacity * (sizeof(AcornMemNode) + sizeof(uint32));
+	return cost;
+}
+
+/*
+ * Append a node to the graph: node slot + vector copy + neighbor array
+ * (all slots initialized to -1).  The level must already be assigned.
+ * Returns the new node id, or -1 when a parallel build's shared arena
+ * cannot fit the node (the caller flushes and spills to the disk path).
+ * Serial builds never return -1: the caller checks the budget first.
+ */
+static int
+acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize, int level,
+					int64 filter_val, ItemPointer heaptid, int m_eff)
+{
+	AcornMemNode  *node;
+	int			   id;
+	int			   n_slots = (level + 2) * m_eff;
+	int			  *nbr;
+	void		  *vdst;
+
+	if (mb->shared)
 	{
-		int old_cap   = mb->capacity;
-		mb->capacity *= 2;
-		mb->nodes     = repalloc(mb->nodes,
-								  mb->capacity * sizeof(AcornMemNode));
-		mb->visit_gen = repalloc(mb->visit_gen,
-								  mb->capacity * sizeof(uint32));
-		memset(mb->visit_gen + old_cap, 0,
-			   (mb->capacity - old_cap) * sizeof(uint32));
+		AcornShared *sh = mb->shared;
+		Size		 vbytes = MAXALIGN(vsize);
+		Size		 nbytes = MAXALIGN((Size) n_slots * sizeof(int));
+
+		LWLockAcquire(&sh->allocatorLock, LW_EXCLUSIVE);
+		if (sh->n_nodes >= sh->max_nodes ||
+			sh->arena_used + vbytes + nbytes > sh->arena_size)
+		{
+			LWLockRelease(&sh->allocatorLock);
+			return -1;
+		}
+		id = sh->n_nodes++;
+		node = &mb->nodes[id];
+		MemSet(node, 0, sizeof(AcornMemNode));
+		node->vec.off = sh->arena_used;
+		sh->arena_used += vbytes;
+		node->nbr.off = sh->arena_used;
+		sh->arena_used += nbytes;
+		LWLockRelease(&sh->allocatorLock);
+
+		LWLockInitialize(&node->lock, acorn_lock_tranche_id);
+		vdst = mb->base + node->vec.off;
+		nbr  = (int *) (mb->base + node->nbr.off);
+	}
+	else
+	{
+		MemoryContext old = MemoryContextSwitchTo(mb->build_ctx);
+
+		if (mb->n_nodes >= mb->capacity)
+		{
+			int old_cap   = mb->capacity;
+			mb->capacity *= 2;
+			mb->nodes     = repalloc(mb->nodes,
+									  mb->capacity * sizeof(AcornMemNode));
+			mb->visit_gen = repalloc(mb->visit_gen,
+									  mb->capacity * sizeof(uint32));
+			memset(mb->visit_gen + old_cap, 0,
+				   (mb->capacity - old_cap) * sizeof(uint32));
+			mb->mem_used += (Size) old_cap *
+				(sizeof(AcornMemNode) + sizeof(uint32));
+		}
+
+		id = mb->n_nodes++;
+		node = &mb->nodes[id];
+		MemSet(node, 0, sizeof(AcornMemNode));
+		vdst = palloc(vsize);
+		node->vec.ptr = vdst;
+		nbr = palloc(n_slots * sizeof(int));
+		node->nbr.ptr = nbr;
+		mb->mem_used += MAXALIGN(vsize)
+			+ MAXALIGN((Size) n_slots * sizeof(int));
+		MemoryContextSwitchTo(old);
 	}
 
-	node             = &mb->nodes[mb->n_nodes];
-	node->level      = -1;
+	node->level      = level;
 	node->filter_val = filter_val;
 	node->vsize      = vsize;
-	node->vec        = PointerGetDatum(
-						   memcpy(palloc(vsize), DatumGetPointer(vec), vsize));
-	node->nbr        = NULL;
 	node->heaptid    = *heaptid;
 	node->nbr_blkno  = InvalidBlockNumber;
 	node->nbr_offno  = InvalidOffsetNumber;
@@ -695,9 +944,11 @@ acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize,
 	node->elem_offno = InvalidOffsetNumber;
 	node->cont_tids  = NULL;
 	node->n_conts    = 0;
+	memcpy(vdst, DatumGetPointer(vec), vsize);
+	for (int k = 0; k < n_slots; k++)
+		nbr[k] = -1;
 
-	mb->n_nodes++;
-	MemoryContextSwitchTo(old);
+	return id;
 }
 
 /* In-memory greedy descent from from_level down to to_level+1 */
@@ -706,6 +957,8 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 						  int *ep_id, Datum query,
 						  int from_level, int to_level)
 {
+	int slots[HNSW_MAX_NEIGHBORS];
+
 	for (int lc = from_level; lc > to_level; lc--)
 	{
 		bool improved;
@@ -713,19 +966,23 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 		do {
 			int           cur      = *ep_id;
 			AcornMemNode *node     = &mb->nodes[cur];
-			double        cur_dist = acorn_dist(dist, node->vec, query);
+			double        cur_dist = acorn_dist(dist, acorn_node_vec(mb, node),
+												query);
 			int           start    = HnswNeighborStart(m_eff, node->level, lc);
 			int           layer_m  = HnswGetLayerM(m_eff, lc);
+
+			acorn_mem_copy_slots(mb, node, start, layer_m, slots);
 
 			improved = false;
 			for (int j = 0; j < layer_m; j++)
 			{
-				int    nbr_id = node->nbr[start + j];
+				int    nbr_id = slots[j];
 				double nd;
 
 				if (nbr_id < 0)
 					continue;	/* payload split may leave gaps between halves */
-				nd = acorn_dist(dist, mb->nodes[nbr_id].vec, query);
+				nd = acorn_dist(dist, acorn_node_vec(mb, &mb->nodes[nbr_id]),
+								query);
 				if (nd < cur_dist)
 				{
 					cur_dist = nd;
@@ -761,7 +1018,8 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 
 	/* Seed with entry_id */
 	{
-		double    ep_dist = acorn_dist(dist, mb->nodes[entry_id].vec, query);
+		double    ep_dist = acorn_dist(dist, acorn_node_vec(mb, &mb->nodes[entry_id]),
+									   query);
 		MemPQNode *cn, *wn;
 
 		mb->visit_gen[entry_id] = mb->cur_gen;
@@ -780,6 +1038,7 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 		AcornMemNode *c_data = &mb->nodes[c_id];
 		double		  f_dist;
 		int			  start, layer_m;
+		int			  slots[HNSW_MAX_NEIGHBORS];
 
 		f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 		if (c_dist > f_dist && W_count >= ef)
@@ -791,9 +1050,11 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 		start   = HnswNeighborStart(m_eff, c_data->level, layer);
 		layer_m = HnswGetLayerM(m_eff, layer);
 
+		acorn_mem_copy_slots(mb, c_data, start, layer_m, slots);
+
 		for (int j = 0; j < layer_m; j++)
 		{
-			int    nbr_id = c_data->nbr[start + j];
+			int    nbr_id = slots[j];
 			double nd;
 
 			if (nbr_id < 0)
@@ -804,7 +1065,8 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 				continue;
 			mb->visit_gen[nbr_id] = mb->cur_gen;
 
-			nd     = acorn_dist(dist, mb->nodes[nbr_id].vec, query);
+			nd     = acorn_dist(dist, acorn_node_vec(mb, &mb->nodes[nbr_id]),
+								query);
 			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 
 			if (nd < f_dist || W_count < ef)
@@ -872,7 +1134,8 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 	W = pairingheap_allocate(mem_cmp_max, NULL);
 
 	{
-		double     ep_dist = acorn_dist(dist, mb->nodes[entry_id].vec, query);
+		double     ep_dist = acorn_dist(dist, acorn_node_vec(mb, &mb->nodes[entry_id]),
+										query);
 		MemPQNode *cn, *wn;
 
 		Assert(acorn_payload_partition(mb->nodes[entry_id].filter_val) == part);
@@ -892,6 +1155,7 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 		AcornMemNode *c_data = &mb->nodes[c_id];
 		double		  f_dist;
 		int			  start, layer_m;
+		int			  slots[HNSW_MAX_NEIGHBORS];
 
 		f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 		if (c_dist > f_dist && W_count >= ef)
@@ -900,9 +1164,11 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 		start   = HnswNeighborStart(m_eff, c_data->level, 0);
 		layer_m = HnswGetLayerM(m_eff, 0);
 
+		acorn_mem_copy_slots(mb, c_data, start, layer_m, slots);
+
 		for (int j = 0; j < layer_m; j++)
 		{
-			int    nbr_id = c_data->nbr[start + j];
+			int    nbr_id = slots[j];
 			double nd;
 
 			if (nbr_id < 0)
@@ -914,7 +1180,8 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 			if (acorn_payload_partition(mb->nodes[nbr_id].filter_val) != part)
 				continue;	/* restricted to the partition subgraph */
 
-			nd     = acorn_dist(dist, mb->nodes[nbr_id].vec, query);
+			nd     = acorn_dist(dist, acorn_node_vec(mb, &mb->nodes[nbr_id]),
+								query);
 			f_dist = ((MemPQNode *) pairingheap_first(W))->dist;
 
 			if (nd < f_dist || W_count < ef)
@@ -987,8 +1254,9 @@ acorn_mem_select_diverse(AcornMemBuild *mb, const AcornDistCtx *dist,
 
 		for (int j = 0; j < n_kept; j++)
 		{
-			double d = acorn_dist(dist, mb->nodes[cand_ids[i]].vec,
-								  mb->nodes[kept_out[j]].vec);
+			double d = acorn_dist(dist,
+								  acorn_node_vec(mb, &mb->nodes[cand_ids[i]]),
+								  acorn_node_vec(mb, &mb->nodes[kept_out[j]]));
 
 			if (d <= cand_dists[i])
 			{
@@ -1032,16 +1300,25 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 {
 	AcornMemNode *nbr_node = &mb->nodes[nbr_id];
 	AcornMemNode *node     = &mb->nodes[new_id];
+	int			 *nbr_slots;
 	int			  free_slot = -1;
 	int			  nonmember_slot = -1;
 	double		  nonmember_d = -DBL_MAX;
 
+	/*
+	 * The whole read-modify-write runs under the target's exclusive lock
+	 * (parallel build); reads of other nodes' vectors below are lock-free
+	 * (vectors are immutable after publication).
+	 */
+	acorn_node_lock(mb, nbr_node, LW_EXCLUSIVE);
+	nbr_slots = acorn_node_nbr(mb, nbr_node) + slot_base;
+
 	for (int j = 0; j < slot_count; j++)
 	{
-		int eid = nbr_node->nbr[slot_base + j];
+		int eid = nbr_slots[j];
 
 		if (eid == new_id)
-			return;				/* already connected */
+			goto done;			/* already connected */
 		if (eid < 0)
 		{
 			if (free_slot < 0)
@@ -1051,7 +1328,8 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 		if (part >= 0 &&
 			acorn_payload_partition(mb->nodes[eid].filter_val) != part)
 		{
-			double d = acorn_dist(dist, nbr_node->vec, mb->nodes[eid].vec);
+			double d = acorn_dist(dist, acorn_node_vec(mb, nbr_node),
+								  acorn_node_vec(mb, &mb->nodes[eid]));
 
 			if (d > nonmember_d)
 			{
@@ -1063,14 +1341,14 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 
 	if (free_slot >= 0)
 	{
-		nbr_node->nbr[slot_base + free_slot] = new_id;
-		return;
+		nbr_slots[free_slot] = new_id;
+		goto done;
 	}
 
 	if (nonmember_slot >= 0)
 	{
-		nbr_node->nbr[slot_base + nonmember_slot] = new_id;
-		return;
+		nbr_slots[nonmember_slot] = new_id;
+		goto done;
 	}
 
 	if (diversify)
@@ -1090,11 +1368,13 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 
 		for (int j = 0; j < slot_count; j++)
 		{
-			ids[j]   = nbr_node->nbr[slot_base + j];
-			dists[j] = acorn_dist(dist, nbr_node->vec, mb->nodes[ids[j]].vec);
+			ids[j]   = nbr_slots[j];
+			dists[j] = acorn_dist(dist, acorn_node_vec(mb, nbr_node),
+								  acorn_node_vec(mb, &mb->nodes[ids[j]]));
 		}
 		ids[slot_count]   = new_id;
-		dists[slot_count] = acorn_dist(dist, nbr_node->vec, node->vec);
+		dists[slot_count] = acorn_dist(dist, acorn_node_vec(mb, nbr_node),
+									   acorn_node_vec(mb, node));
 
 		/* insertion sort ascending by distance (slot_count <= 2*m_eff) */
 		for (int i = 1; i < n_cands; i++)
@@ -1129,7 +1409,7 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 			/* replace the single existing occupant that was dropped */
 			for (int j = 0; j < slot_count; j++)
 			{
-				int  eid     = nbr_node->nbr[slot_base + j];
+				int  eid     = nbr_slots[j];
 				bool in_kept = false;
 
 				for (int i = 0; i < n_kept; i++)
@@ -1142,7 +1422,7 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 				}
 				if (!in_kept)
 				{
-					nbr_node->nbr[slot_base + j] = new_id;
+					nbr_slots[j] = new_id;
 					break;
 				}
 			}
@@ -1150,19 +1430,21 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 		pfree(ids);
 		pfree(dists);
 		pfree(kept);
-		return;
+		goto done;
 	}
 
 	/* Full: replace the furthest existing neighbor if the new node is closer */
 	{
-		double d_new      = acorn_dist(dist, nbr_node->vec, node->vec);
+		double d_new      = acorn_dist(dist, acorn_node_vec(mb, nbr_node),
+									   acorn_node_vec(mb, node));
 		double furthest_d = -DBL_MAX;
 		int    furthest_j = -1;
 
 		for (int j = 0; j < slot_count; j++)
 		{
-			int    eid = nbr_node->nbr[slot_base + j];
-			double d   = acorn_dist(dist, nbr_node->vec, mb->nodes[eid].vec);
+			int    eid = nbr_slots[j];
+			double d   = acorn_dist(dist, acorn_node_vec(mb, nbr_node),
+									acorn_node_vec(mb, &mb->nodes[eid]));
 
 			if (d > furthest_d)
 			{
@@ -1171,58 +1453,136 @@ acorn_mem_add_reverse_edge(AcornMemBuild *mb, const AcornDistCtx *dist,
 			}
 		}
 		if (d_new < furthest_d)
-			nbr_node->nbr[slot_base + furthest_j] = new_id;
+			nbr_slots[furthest_j] = new_id;
 	}
+
+done:
+	acorn_node_unlock(mb, nbr_node);
+}
+
+/* Deferred reverse edge (applied after all of the new node's layers are wired) */
+typedef struct AcornRevEdge
+{
+	int		target;			/* node receiving the reverse edge */
+	int		slot_base;		/* flat slot index of the range start */
+	int		slot_count;		/* range length */
+	int		part;			/* payload partition, -1 = none */
+} AcornRevEdge;
+
+/* Register new_id as a partition entry point if its partition has none yet */
+static void
+acorn_mem_register_part_entry(AcornMemBuild *mb, AcornMemNode *node, int new_id)
+{
+	int part;
+
+	if (!mb->payload_edges)
+		return;
+	part = acorn_payload_partition(node->filter_val);
+	if (mb->shared)
+		LWLockAcquire(&mb->shared->partLock, LW_EXCLUSIVE);
+	if (mb->part_entry[part] < 0)
+		mb->part_entry[part] = new_id;
+	if (mb->shared)
+		LWLockRelease(&mb->shared->partLock);
 }
 
 /*
- * In-memory HNSW insert for node new_id.
- * Assigns level, allocates nbr array, runs greedy descent + beam search,
- * fills neighbor IDs, and writes reverse edges with fixed-slot retry.
+ * In-memory HNSW insert for node new_id (level + neighbor array already
+ * assigned by acorn_mem_push_node).  Runs greedy descent + beam search,
+ * fills the node's own neighbor IDs layer by layer, then applies all reverse
+ * edges (fixed-slot retry / diversity re-selection).
+ *
+ * Reverse edges are deferred until every layer of the new node is wired:
+ * within one insert the orderings are equivalent (a reverse edge at layer lc
+ * only touches layer-lc slot ranges, which no lower-layer search of the same
+ * insert reads), and in a parallel build the first reverse edge is what
+ * publishes the node to other participants — deferral guarantees the node's
+ * own slots are complete before it becomes reachable.
+ *
+ * Parallel entry-point protocol (mirrors pgvector InsertTupleInMemory):
+ * the entry is read under entryLock LW_SHARED held for the whole insert;
+ * when this node will (or may) update the entry, the lock is taken
+ * LW_EXCLUSIVE instead, with entryWaitLock preventing starvation.
  */
 static void
 acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
-					  int m_eff, int efc, bool diversify,
-					  unsigned short rand_state[3], int new_id)
+					  int m_eff, int efc, bool diversify, int new_id)
 {
 	AcornMemNode *node    = &mb->nodes[new_id];
-	int			  level   = acorn_assign_level(m_eff, rand_state);
-	int			  n_slots = (level + 2) * m_eff;
+	int			  level   = node->level;
+	int			 *my_nbr  = acorn_node_nbr(mb, node);
+	Datum		  q       = acorn_node_vec(mb, node);
 	int			 *out_ids;
 	double		 *out_dists;
 	int			  ep_id;
+	int			  entry_id;
+	int			  entry_level;
+	AcornShared  *sh = mb->shared;
+	AcornRevEdge *rev;
+	int			  n_rev = 0;
 
-	node->level = level;
-	node->nbr   = (int *) MemoryContextAlloc(mb->build_ctx,
-											   n_slots * sizeof(int));
-	for (int k = 0; k < n_slots; k++)
-		node->nbr[k] = -1;
-
-	if (mb->entry_id < 0)
+	/* --- Read the entry point (locked dance in a parallel build) --- */
+	if (sh)
 	{
-		mb->entry_id    = new_id;
-		mb->entry_level = level;
-		if (mb->payload_edges &&
-			mb->part_entry[acorn_payload_partition(node->filter_val)] < 0)
-			mb->part_entry[acorn_payload_partition(node->filter_val)] = new_id;
+		LWLockAcquire(&sh->entryWaitLock, LW_EXCLUSIVE);
+		LWLockRelease(&sh->entryWaitLock);
+
+		LWLockAcquire(&sh->entryLock, LW_SHARED);
+		entry_id    = sh->entry_id;
+		entry_level = sh->entry_level;
+
+		if (entry_id < 0 || level > entry_level)
+		{
+			LWLockRelease(&sh->entryLock);
+
+			LWLockAcquire(&sh->entryWaitLock, LW_EXCLUSIVE);
+			LWLockAcquire(&sh->entryLock, LW_EXCLUSIVE);
+			LWLockRelease(&sh->entryWaitLock);
+
+			entry_id    = sh->entry_id;
+			entry_level = sh->entry_level;
+		}
+	}
+	else
+	{
+		entry_id    = mb->entry_id;
+		entry_level = mb->entry_level;
+	}
+
+	if (entry_id < 0)
+	{
+		/* First node: it becomes the entry point (exclusive lock held) */
+		if (sh)
+		{
+			sh->entry_id    = new_id;
+			sh->entry_level = level;
+			LWLockRelease(&sh->entryLock);
+		}
+		else
+		{
+			mb->entry_id    = new_id;
+			mb->entry_level = level;
+		}
+		acorn_mem_register_part_entry(mb, node, new_id);
 		return;
 	}
 
-	ep_id = mb->entry_id;
+	ep_id = entry_id;
 
-	if (mb->entry_level > level)
+	if (entry_level > level)
 		acorn_mem_greedy_descend(mb, dist, m_eff, &ep_id,
-								  node->vec, mb->entry_level, level);
+								  q, entry_level, level);
 
 	out_ids   = palloc(sizeof(int)    * efc);
 	out_dists = palloc(sizeof(double) * efc);
+	rev       = palloc(sizeof(AcornRevEdge) * (Size) (level + 2) * m_eff);
 
-	for (int lc = Min(mb->entry_level, level); lc >= 0; lc--)
+	for (int lc = Min(entry_level, level); lc >= 0; lc--)
 	{
 		int layer_m = HnswGetLayerM(m_eff, lc);
 		int start   = HnswNeighborStart(m_eff, level, lc);
 		int n_cands = acorn_mem_search_layer(mb, dist, m_eff,
-											  ep_id, node->vec, lc, efc,
+											  ep_id, q, lc, efc,
 											  out_ids, out_dists);
 
 		if (lc == 0 && mb->payload_edges)
@@ -1234,6 +1594,7 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			int  g_half   = layer_m / 2;	/* = m_eff */
 			int  p_half   = layer_m - g_half;
 			int  part     = acorn_payload_partition(node->filter_val);
+			int  part_ep;
 			int  n_global;
 			int  p_filled = 0;
 			int *g_sel    = palloc(sizeof(int) * g_half);
@@ -1249,15 +1610,21 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 				memcpy(g_sel, out_ids, n_global * sizeof(int));
 			}
 			for (int i = 0; i < n_global; i++)
-				node->nbr[start + i] = g_sel[i];
+				my_nbr[start + i] = g_sel[i];
 
-			if (mb->part_entry[part] >= 0)
+			if (sh)
+				LWLockAcquire(&sh->partLock, LW_SHARED);
+			part_ep = mb->part_entry[part];
+			if (sh)
+				LWLockRelease(&sh->partLock);
+
+			if (part_ep >= 0)
 			{
 				int    *p_ids   = palloc(sizeof(int) * efc);
 				double *p_dists = palloc(sizeof(double) * efc);
 				int     n_part  = acorn_mem_search_partition(mb, dist, m_eff,
-															 mb->part_entry[part],
-															 node->vec, part, efc,
+															 part_ep,
+															 q, part, efc,
 															 p_ids, p_dists);
 				int     n_avail = 0;
 				int    *p_sel   = palloc(sizeof(int) * p_half);
@@ -1295,13 +1662,16 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 
 				for (int i = 0; i < n_sel; i++)
 				{
-					node->nbr[start + g_half + p_filled] = p_sel[i];
+					my_nbr[start + g_half + p_filled] = p_sel[i];
 					p_filled++;
 
 					/* bidirectional: reverse edge into the member's payload half */
-					acorn_mem_add_reverse_edge(mb, dist, p_sel[i], new_id,
-						HnswNeighborStart(m_eff, mb->nodes[p_sel[i]].level, 0) + g_half,
-						p_half, part, diversify);
+					rev[n_rev].target     = p_sel[i];
+					rev[n_rev].slot_base  =
+						HnswNeighborStart(m_eff, mb->nodes[p_sel[i]].level, 0) + g_half;
+					rev[n_rev].slot_count = p_half;
+					rev[n_rev].part       = part;
+					n_rev++;
 				}
 				pfree(p_sel);
 				pfree(p_ids);
@@ -1327,20 +1697,25 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 				}
 				for (int j = 0; !used && j < p_filled; j++)
 				{
-					if (node->nbr[start + g_half + j] == out_ids[i])
+					if (my_nbr[start + g_half + j] == out_ids[i])
 						used = true;
 				}
 				if (used)
 					continue;
-				node->nbr[start + g_half + p_filled] = out_ids[i];
+				my_nbr[start + g_half + p_filled] = out_ids[i];
 				p_filled++;
 			}
 
 			/* Reverse edges for the global half into neighbors' global halves */
 			for (int i = 0; i < n_global; i++)
-				acorn_mem_add_reverse_edge(mb, dist, g_sel[i], new_id,
-					HnswNeighborStart(m_eff, mb->nodes[g_sel[i]].level, 0),
-					g_half, -1, diversify);
+			{
+				rev[n_rev].target     = g_sel[i];
+				rev[n_rev].slot_base  =
+					HnswNeighborStart(m_eff, mb->nodes[g_sel[i]].level, 0);
+				rev[n_rev].slot_count = g_half;
+				rev[n_rev].part       = -1;
+				n_rev++;
+			}
 			pfree(g_sel);
 		}
 		else
@@ -1358,13 +1733,18 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			}
 
 			for (int i = 0; i < n_sel; i++)
-				node->nbr[start + i] = sel[i];
+				my_nbr[start + i] = sel[i];
 
 			/* Reverse edges with fixed-slot retry over the whole layer range */
 			for (int i = 0; i < n_sel; i++)
-				acorn_mem_add_reverse_edge(mb, dist, sel[i], new_id,
-					HnswNeighborStart(m_eff, mb->nodes[sel[i]].level, lc),
-					layer_m, -1, diversify);
+			{
+				rev[n_rev].target     = sel[i];
+				rev[n_rev].slot_base  =
+					HnswNeighborStart(m_eff, mb->nodes[sel[i]].level, lc);
+				rev[n_rev].slot_count = layer_m;
+				rev[n_rev].part       = -1;
+				n_rev++;
+			}
 			pfree(sel);
 		}
 
@@ -1372,37 +1752,37 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			ep_id = out_ids[0];
 	}
 
+	/*
+	 * Apply the deferred reverse edges.  The first one published makes the
+	 * node reachable by other participants; everything above is complete.
+	 */
+	for (int i = 0; i < n_rev; i++)
+		acorn_mem_add_reverse_edge(mb, dist, rev[i].target, new_id,
+								   rev[i].slot_base, rev[i].slot_count,
+								   rev[i].part, diversify);
+
+	pfree(rev);
 	pfree(out_ids);
 	pfree(out_dists);
 
-	if (level > mb->entry_level)
+	if (level > entry_level)
 	{
-		mb->entry_level = level;
-		mb->entry_id    = new_id;
+		/* exclusive entryLock held in a parallel build (taken above) */
+		if (sh)
+		{
+			sh->entry_id    = new_id;
+			sh->entry_level = level;
+		}
+		else
+		{
+			mb->entry_id    = new_id;
+			mb->entry_level = level;
+		}
 	}
+	if (sh)
+		LWLockRelease(&sh->entryLock);
 
-	if (mb->payload_edges &&
-		mb->part_entry[acorn_payload_partition(node->filter_val)] < 0)
-		mb->part_entry[acorn_payload_partition(node->filter_val)] = new_id;
-}
-
-/* Run in-memory HNSW construction for all collected nodes. */
-static void
-acorn_mem_build_graph(AcornMemBuild *mb, Relation index,
-					  unsigned short rand_state[3])
-{
-	int          m_eff = acorn_m_eff(index);
-	int          efc   = acorn_opt_ef_construction(index);
-	bool         diversify = acorn_opt_diversify(index);
-	AcornDistCtx dist;
-
-	acorn_dist_ctx_init(index, &dist);
-
-	for (int i = 0; i < mb->n_nodes; i++)
-	{
-		CHECK_FOR_INTERRUPTS();
-		acorn_mem_insert_node(mb, &dist, m_eff, efc, diversify, rand_state, i);
-	}
+	acorn_mem_register_part_entry(mb, node, new_id);
 }
 
 /* -----------------------------------------------------------------------
@@ -1545,7 +1925,7 @@ static void
 acorn_mem_fill_inline_entry(AcornMemBuild *mb, AcornT2InlineEntry *e, int nbr_id)
 {
 	AcornMemNode   *t = &mb->nodes[nbr_id];
-	AcornPgVector  *v = (AcornPgVector *) DatumGetPointer(t->vec);
+	AcornPgVector  *v = (AcornPgVector *) DatumGetPointer(acorn_node_vec(mb, t));
 
 	if ((int) v->dim != mb->dims)
 		ereport(ERROR,
@@ -1574,6 +1954,7 @@ acorn_mem_flush_inline_node(AcornMemBuild *mb, Relation index,
 							ForkNumber forkNum, int m_eff, int i)
 {
 	AcornMemNode *node     = &mb->nodes[i];
+	int			 *my_nbr   = acorn_node_nbr(mb, node);
 	Size		  esz      = mb->entry_size;
 	int			  layer0_n = HnswGetLayerM(m_eff, 0);
 	int			  n1       = Min(layer0_n,
@@ -1608,7 +1989,7 @@ acorn_mem_flush_inline_node(AcornMemBuild *mb, Relation index,
 		entries = AcornT2InlineHdrEntries(hdr);
 		for (int j = 0; j < n1; j++)
 		{
-			int nbr_id = node->nbr[start0 + j];
+			int nbr_id = my_nbr[start0 + j];
 
 			if (nbr_id < 0)
 				continue;		/* palloc0: flags == 0 == invalid entry */
@@ -1644,7 +2025,7 @@ acorn_mem_flush_inline_node(AcornMemBuild *mb, Relation index,
 
 		for (int j = 0; j < n_here; j++)
 		{
-			int nbr_id = node->nbr[start0 + done + j];
+			int nbr_id = my_nbr[start0 + done + j];
 
 			if (nbr_id < 0)
 				continue;
@@ -1677,14 +2058,19 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 {
 	BlockNumber  blkno_out;
 	OffsetNumber off_out;
+	int			 n_nodes  = mb->shared ? mb->shared->n_nodes : mb->n_nodes;
+	int			 entry_id = mb->shared ? mb->shared->entry_id : mb->entry_id;
 
-	if (mb->n_nodes == 0)
+	if (n_nodes == 0)
 		return;
+
+	/* keep the serial fields coherent for the helpers below */
+	mb->n_nodes = n_nodes;
 
 	acorn_mem_preassign_tids(mb, m_eff);
 
 	/* Pass 1: write all neighbor tuples */
-	for (int i = 0; i < mb->n_nodes; i++)
+	for (int i = 0; i < n_nodes; i++)
 	{
 		if (mb->inline_vectors)
 		{
@@ -1709,7 +2095,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	}
 
 	/* Pass 2: write all element tuples */
-	for (int i = 0; i < mb->n_nodes; i++)
+	for (int i = 0; i < n_nodes; i++)
 	{
 		AcornMemNode       *node    = &mb->nodes[i];
 		Size                etup_sz = ACORN_T2_ELEMENT_TUPLE_SIZE(node->vsize);
@@ -1724,7 +2110,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 		ItemPointerSet(&etup->neighbortid, node->nbr_blkno, node->nbr_offno);
 		etup->filter_val  = node->filter_val;
 		memcpy(AcornT2ElementTupleGetVector(etup),
-			   DatumGetPointer(node->vec), node->vsize);
+			   DatumGetPointer(acorn_node_vec(mb, node)), node->vsize);
 
 		acorn_append_tuple(index, forkNum, (Item) etup, etup_sz,
 						   &blkno_out, &off_out, false);
@@ -1733,9 +2119,10 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	}
 
 	/* Pass 3: patch neighbor TID slots with element TIDs */
-	for (int i = 0; i < mb->n_nodes; i++)
+	for (int i = 0; i < n_nodes; i++)
 	{
-		AcornMemNode *node = &mb->nodes[i];
+		AcornMemNode *node   = &mb->nodes[i];
+		int			 *my_nbr = acorn_node_nbr(mb, node);
 
 		for (int lc = node->level; lc >= 0; lc--)
 		{
@@ -1744,7 +2131,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 
 			for (int j = 0; j < layer_m; j++)
 			{
-				int               nbr_id = node->nbr[start + j];
+				int               nbr_id = my_nbr[start + j];
 				Buffer            buf;
 				Page              page;
 				HnswNeighborTuple ntup;
@@ -1769,9 +2156,9 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 	}
 
 	/* Update meta entry point */
-	if (mb->entry_id >= 0)
+	if (entry_id >= 0)
 	{
-		AcornMemNode *ep = &mb->nodes[mb->entry_id];
+		AcornMemNode *ep = &mb->nodes[entry_id];
 		acorn_maybe_update_entry(index, ep->elem_blkno, ep->elem_offno,
 								  ep->level, false);
 	}
@@ -2122,7 +2509,7 @@ static void
 acorn_t2_inline_write_entry(Relation index, ForkNumber forkNum,
 							BlockNumber nbr_blk, OffsetNumber nbr_off,
 							int slot, const AcornT2InlineEntry *e_entry,
-							Size esz)
+							Size esz, bool use_wal)
 {
 	BlockNumber		chunk_blk = nbr_blk;
 	OffsetNumber	chunk_off = nbr_off;
@@ -2189,7 +2576,7 @@ acorn_t2_inline_write_entry(Relation index, ForkNumber forkNum,
 		buf = ReadBufferExtended(index, forkNum, chunk_blk, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-		if (RelationNeedsWAL(index))
+		if (use_wal)
 		{
 			GenericXLogState *state = GenericXLogStart(index);
 
@@ -2232,7 +2619,8 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 								 int m_eff, int layer,
 								 int range_off, int range_len, int part,
 								 bool diversify,
-								 const AcornT2InlineEntry *e_entry, Size e_esz)
+								 const AcornT2InlineEntry *e_entry, Size e_esz,
+								 bool use_wal)
 {
 	int				  n_level;
 	BlockNumber		  n_nbr_blk;
@@ -2452,7 +2840,7 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 	buf = ReadBufferExtended(index, forkNum, n_nbr_blk, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-	if (RelationNeedsWAL(index))
+	if (use_wal)
 	{
 		GenericXLogState *state;
 
@@ -2477,7 +2865,8 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 	/* Vector co-location: sync N's inline entry for the written slot */
 	if (e_entry != NULL && layer == 0)
 		acorn_t2_inline_write_entry(index, forkNum, n_nbr_blk, n_nbr_off,
-									range_off + target, e_entry, e_esz);
+									range_off + target, e_entry, e_esz,
+									use_wal);
 }
 
 /* -----------------------------------------------------------------------
@@ -2500,7 +2889,8 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 static void
 acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					 int64 filter_val,
-					 ItemPointer heaptid, unsigned short rand_state[3])
+					 ItemPointer heaptid, unsigned short rand_state[3],
+					 bool use_wal)
 {
 	int					m_eff    = acorn_m_eff(index);
 	int					efc      = acorn_opt_ef_construction(index);
@@ -2813,7 +3203,7 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 				   (Size) n_here * esz);
 
 			acorn_append_tuple(index, forkNum, (Item) cont, csz,
-							   &c_blk, &c_off, RelationNeedsWAL(index));
+							   &c_blk, &c_off, use_wal);
 			ItemPointerSet(&next_tid, c_blk, c_off);
 			pfree(cont);
 		}
@@ -2834,14 +3224,14 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 			memcpy(AcornT2InlineHdrEntries(hdr), lentries, (Size) n1 * esz);
 
 			acorn_append_tuple(index, forkNum, (Item) intup, isz,
-							   &n_blk, &n_off, RelationNeedsWAL(index));
+							   &n_blk, &n_off, use_wal);
 			pfree(intup);
 		}
 		pfree(lentries);
 	}
 	else
 		acorn_append_tuple(index, forkNum, (Item) ntup, ntupSize, &n_blk, &n_off,
-						   RelationNeedsWAL(index));
+						   use_wal);
 
 	/* Step 6: write element tuple (level, heaptids, neighbortid, filter_val, vector) */
 	etup              = palloc0(etupSize);
@@ -2858,10 +3248,10 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	memcpy(AcornT2ElementTupleGetVector(etup), DatumGetPointer(value), vsize);
 
 	acorn_append_tuple(index, forkNum, (Item) etup, etupSize, &e_blk, &e_off,
-					   RelationNeedsWAL(index));
+					   use_wal);
 
 	/* Step 7: update meta entry point if this element has the highest level */
-	acorn_maybe_update_entry(index, e_blk, e_off, l_new, RelationNeedsWAL(index));
+	acorn_maybe_update_entry(index, e_blk, e_off, l_new, use_wal);
 
 	/* E's own inline entry, applied to reverse-edge targets' layer-0 chunks */
 	if (inline_on)
@@ -2902,7 +3292,7 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 													 e_blk, e_off,
 													 value, dist, m_eff, lc,
 													 0, g_half, -1, diversify,
-													 e_self, esz);
+													 e_self, esz, use_wal);
 				}
 
 				/*
@@ -2919,7 +3309,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 													 e_blk, e_off,
 													 value, dist, m_eff, lc,
 													 g_half, p_half, part,
-													 diversify, e_self, esz);
+													 diversify, e_self, esz,
+													 use_wal);
 				}
 			}
 			else
@@ -2933,7 +3324,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 													 e_blk, e_off,
 													 value, dist, m_eff, lc,
 													 0, layer_m, -1, diversify,
-													 (lc == 0) ? e_self : NULL, esz);
+													 (lc == 0) ? e_self : NULL, esz,
+													 use_wal);
 				}
 			}
 		}
@@ -2945,16 +3337,266 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 
 /* -----------------------------------------------------------------------
  * Build callback + entry points
+ *
+ * The build runs in two phases (pgvector hnswbuild.c pattern):
+ *
+ *   1. In-memory phase — each scanned tuple is inserted into the in-memory
+ *      graph while the graph fits maintenance_work_mem.
+ *   2. On-disk phase — once the budget is exhausted, the graph is flushed
+ *      and every remaining tuple goes through the per-element on-disk
+ *      insert path (acorn_insert_element), un-WAL-logged; the whole index
+ *      is WAL-logged once at the end via log_newpage_range.
+ *
+ * A parallel build (amcanbuildparallel) holds the graph in a DSM arena and
+ * runs the heap scan in the leader + max_parallel_maintenance_workers
+ * workers; see the AcornShared comment for the locking protocol.
  * ----------------------------------------------------------------------- */
+
+typedef struct AcornLeader
+{
+	ParallelContext *pcxt;
+	int				 nparticipants;	/* launched workers + participating leader */
+	AcornShared		*shared;
+	Snapshot		 snapshot;
+	char			*area;
+} AcornLeader;
 
 typedef struct AcornBuildState
 {
+	Relation		 heap;
+	Relation		 index;
+	IndexInfo		*indexInfo;
 	ForkNumber		 forkNum;
-	double			 ntuples;
-	unsigned short	 rand_state[3];	/* pg_erand48 state for level assignment */
+	int				 m_eff;
+	int				 efc;
+	bool			 diversify;
 	bool			 has_filter;	/* true if index has a scalar filter column */
-	AcornMemBuild	*mb;			/* in-memory graph accumulator */
+	double			 reltuples;
+	double			 indtuples;
+	unsigned short	 rand_state[3];	/* pg_erand48 state for level assignment */
+	AcornDistCtx	 dist;
+	MemoryContext	 graph_ctx;		/* serial graph allocations (freed on spill) */
+	MemoryContext	 tmp_ctx;		/* per-tuple transient allocations */
+	AcornMemBuild	*mb;			/* in-memory graph accessor */
+	bool			 flushed;		/* serial: on-disk phase from now on */
+	bool			 mwm_warned;
+	AcornShared		*shared;		/* NULL = serial build */
+	AcornLeader		*leader;		/* set in the leader of a parallel build */
 } AcornBuildState;
+
+/*
+ * Seed the level RNG.  participant 0 = serial build / parallel leader;
+ * parallel workers use participant = ParallelWorkerNumber + 1 so each
+ * participant draws an independent deterministic stream from build_seed.
+ *
+ * NOTE on determinism: with pg_acorn.build_seed >= 0, SERIAL builds are
+ * fully deterministic (same data + same seed -> identical graph).  Parallel
+ * builds are NOT: the parallel table scan hands out blocks dynamically, so
+ * the insertion order (and therefore the graph) varies run to run even at a
+ * fixed seed and worker count.  Set max_parallel_maintenance_workers = 0
+ * when a reproducible graph is required.
+ */
+static void
+acorn_build_init_rand(unsigned short rand_state[3], int participant)
+{
+	if (acorn_build_seed >= 0)
+	{
+		uint32 seed = (uint32) acorn_build_seed + (uint32) participant * 7919;
+
+		rand_state[0] = (unsigned short) (seed & 0xFFFF);
+		rand_state[1] = (unsigned short) ((seed >> 16) & 0xFFFF);
+		rand_state[2] = 0x1234;
+	}
+	else
+	{
+		/* Legacy: seed from process ID; different level sequences per build */
+		rand_state[0] = (unsigned short) (MyProcPid & 0xFFFF);
+		rand_state[1] = (unsigned short) (MyProcPid >> 16);
+		rand_state[2] = 0x1234;
+	}
+}
+
+static void
+acorn_init_build_state(AcornBuildState *bs, Relation heap, Relation index,
+					   IndexInfo *indexInfo, ForkNumber forkNum, int participant)
+{
+	int dims = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
+
+	if (dims < 0)
+		dims = 0;
+
+	bs->heap       = heap;
+	bs->index      = index;
+	bs->indexInfo  = indexInfo;
+	bs->forkNum    = forkNum;
+	bs->m_eff      = acorn_m_eff(index);
+	bs->efc        = acorn_opt_ef_construction(index);
+	bs->diversify  = acorn_opt_diversify(index);
+	bs->has_filter = (RelationGetDescr(index)->natts > 1);
+	bs->reltuples  = 0;
+	bs->indtuples  = 0;
+	acorn_build_init_rand(bs->rand_state, participant);
+	acorn_dist_ctx_init(index, &bs->dist);
+
+	bs->graph_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										  "acorn build graph",
+										  ALLOCSET_DEFAULT_SIZES);
+	bs->tmp_ctx   = AllocSetContextCreate(CurrentMemoryContext,
+										  "acorn build temp",
+										  ALLOCSET_DEFAULT_SIZES);
+
+	bs->mb = acorn_mem_build_init(bs->graph_ctx);
+	/* payload edges need a filter column to partition on */
+	bs->mb->payload_edges  = acorn_opt_payload_edges(index) && bs->has_filter;
+	bs->mb->inline_vectors = acorn_opt_inline_vectors(index);
+	bs->mb->dims           = dims;
+	bs->mb->entry_size     = bs->mb->inline_vectors
+		? ACORN_T2_INLINE_ENTRY_SIZE(dims) : 0;
+
+	bs->flushed    = false;
+	bs->mwm_warned = false;
+	bs->shared     = NULL;
+	bs->leader     = NULL;
+}
+
+/* Point a participant's graph accessor at the shared DSM graph */
+static void
+acorn_attach_shared(AcornBuildState *bs, AcornShared *shared, char *area)
+{
+	AcornMemBuild *mb = bs->mb;
+
+	bs->shared     = shared;
+	mb->shared     = shared;
+	mb->base       = area;
+	mb->nodes      = (AcornMemNode *) area;	/* node array at arena start */
+	mb->capacity   = shared->max_nodes;
+	mb->part_entry = shared->part_entry;
+	/* per-process visited generations sized to the shared capacity */
+	mb->visit_gen  = (uint32 *)
+		MemoryContextAllocZero(mb->build_ctx,
+							   (Size) shared->max_nodes * sizeof(uint32));
+	mb->cur_gen    = 1;
+}
+
+/*
+ * Size the shared node array: expected per-node bytes = node struct +
+ * vector varlena + expected neighbor slots ((E[level] + 2) * m_eff ints).
+ * Misestimation is safe in both directions — whichever resource (node
+ * slots or bump area) runs out first triggers the on-disk spill.
+ */
+static int
+acorn_estimate_max_nodes(Relation index, Size arena_size, int m_eff)
+{
+	int		dims = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
+	Size	vsize;
+	Size	per_node;
+	double	e_level = 1.0 / log((double) Max(m_eff, 2));
+
+	if (dims <= 0)
+		dims = 128;				/* untyped vector column: assume mid-size */
+	vsize = offsetof(AcornPgVector, x) + sizeof(float) * (Size) dims;
+
+	per_node = MAXALIGN(sizeof(AcornMemNode)) + MAXALIGN(vsize)
+		+ MAXALIGN((Size) ((e_level + 2.1) * m_eff) * sizeof(int));
+
+	return (int) Min((Size) INT_MAX, arena_size / per_node);
+}
+
+static void acorn_build_mwm_warning(double indtuples, Size used, Size total);
+
+/*
+ * Insert one scanned tuple: in-memory while the budget holds, on-disk after.
+ */
+static void
+acorn_build_insert_tuple(AcornBuildState *bs, Datum value, Size vsize,
+						 int64 filter_val, ItemPointer tid)
+{
+	AcornMemBuild *mb = bs->mb;
+	int			   level;
+	int			   id;
+
+	if (bs->shared)
+	{
+		AcornShared *sh = bs->shared;
+
+		LWLockAcquire(&sh->flushLock, LW_SHARED);
+		if (!sh->flushed)
+		{
+			level = acorn_assign_level(bs->m_eff, bs->rand_state);
+			id = acorn_mem_push_node(mb, value, vsize, level, filter_val,
+									 tid, bs->m_eff);
+			if (id >= 0)
+			{
+				acorn_mem_insert_node(mb, &bs->dist, bs->m_eff, bs->efc,
+									  bs->diversify, id);
+				LWLockRelease(&sh->flushLock);
+				return;
+			}
+		}
+		LWLockRelease(&sh->flushLock);
+
+		/*
+		 * Arena exhausted (or graph already flushed): on-disk phase.  The
+		 * acorn on-disk insert path assumes a single writer, so every
+		 * spilled insert runs under the exclusive flush lock — serialized,
+		 * correctness over speed.
+		 */
+		LWLockAcquire(&sh->flushLock, LW_EXCLUSIVE);
+		if (!sh->flushed)
+		{
+			double indtuples;
+
+			SpinLockAcquire(&sh->mutex);
+			indtuples = sh->indtuples;
+			SpinLockRelease(&sh->mutex);
+
+			acorn_build_mwm_warning(indtuples, sh->arena_used, sh->arena_size);
+			acorn_mem_flush(mb, bs->index, bs->forkNum, bs->m_eff);
+			sh->flushed = true;
+		}
+		acorn_insert_element(bs->index, bs->forkNum, value, filter_val, tid,
+							 bs->rand_state, false);
+		LWLockRelease(&sh->flushLock);
+	}
+	else
+	{
+		if (!bs->flushed)
+		{
+			Size needed;
+
+			level  = acorn_assign_level(bs->m_eff, bs->rand_state);
+			needed = acorn_mem_node_cost(mb, level, vsize, bs->m_eff);
+			if (mb->mem_used + needed <= mb->mem_total)
+			{
+				id = acorn_mem_push_node(mb, value, vsize, level, filter_val,
+										 tid, bs->m_eff);
+				acorn_mem_insert_node(mb, &bs->dist, bs->m_eff, bs->efc,
+									  bs->diversify, id);
+				return;
+			}
+
+			/* Budget exhausted: flush, free the graph, switch to disk */
+			acorn_build_mwm_warning(bs->indtuples, mb->mem_used, mb->mem_total);
+			acorn_mem_flush(mb, bs->index, bs->forkNum, bs->m_eff);
+			bs->flushed = true;
+			bs->mb = NULL;
+			MemoryContextDelete(bs->graph_ctx);
+			bs->graph_ctx = NULL;
+		}
+		acorn_insert_element(bs->index, bs->forkNum, value, filter_val, tid,
+							 bs->rand_state, false);
+	}
+}
+
+static void
+acorn_build_mwm_warning(double indtuples, Size used, Size total)
+{
+	ereport(WARNING,
+			(errmsg("acorn_hnsw graph no longer fits in maintenance_work_mem after %.0f tuples: %zu kB used of %zu kB budget",
+					indtuples, used / 1024, total / 1024),
+			 errdetail("Remaining tuples will be inserted through the on-disk path; building will take significantly more time."),
+			 errhint("Increase maintenance_work_mem to speed up builds.")));
+}
 
 static void
 acorn_build_callback(Relation index, ItemPointer tid, Datum *values,
@@ -2963,8 +3605,8 @@ acorn_build_callback(Relation index, ItemPointer tid, Datum *values,
 	AcornBuildState *bs = (AcornBuildState *) state;
 	int64			 filter_val = 0;
 	Datum			 detoasted;
-	void			*raw;
 	Size			 vsize;
+	MemoryContext	 oldCtx;
 
 	if (isnull[0])
 		return;
@@ -2972,15 +3614,355 @@ acorn_build_callback(Relation index, ItemPointer tid, Datum *values,
 	if (bs->has_filter && !isnull[1])
 		filter_val = (int64) values[1];
 
-	detoasted = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
-	raw       = DatumGetPointer(detoasted);
-	vsize     = VARSIZE_ANY(raw);
-	acorn_mem_push_node(bs->mb, detoasted, vsize, filter_val, tid);
-	bs->ntuples += 1;
+	oldCtx = MemoryContextSwitchTo(bs->tmp_ctx);
 
-	if (raw != DatumGetPointer(values[0]))
-		pfree(raw);
+	detoasted = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
+	vsize     = VARSIZE_ANY(DatumGetPointer(detoasted));
+	acorn_build_insert_tuple(bs, detoasted, vsize, filter_val, tid);
+
+	if (bs->shared)
+	{
+		SpinLockAcquire(&bs->shared->mutex);
+		bs->shared->indtuples += 1;
+		SpinLockRelease(&bs->shared->mutex);
+	}
+	bs->indtuples += 1;
+
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextReset(bs->tmp_ctx);
 }
+
+/* -----------------------------------------------------------------------
+ * Parallel build (mirrors pgvector 0.8.0 hnswbuild.c)
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Perform a participant's portion of the parallel scan + insert.
+ */
+static void
+acorn_parallel_scan_and_insert(Relation heap, Relation index,
+							   AcornShared *shared, char *area, bool progress)
+{
+	AcornBuildState bs;
+	TableScanDesc	scan;
+	double			reltuples;
+	IndexInfo	   *indexInfo;
+	int				participant =
+		IsParallelWorker() ? ParallelWorkerNumber + 1 : 0;
+
+	/* Join parallel scan */
+	indexInfo = BuildIndexInfo(index);
+	indexInfo->ii_Concurrent = shared->isconcurrent;
+	acorn_init_build_state(&bs, heap, index, indexInfo, MAIN_FORKNUM,
+						   participant);
+	acorn_attach_shared(&bs, shared, area);
+
+	scan = table_beginscan_parallel(heap,
+									ParallelTableScanFromAcornShared(shared));
+	reltuples = table_index_build_scan(heap, index, indexInfo, true, progress,
+									   acorn_build_callback, (void *) &bs,
+									   scan);
+
+	/* Record statistics */
+	SpinLockAcquire(&shared->mutex);
+	shared->nparticipantsdone++;
+	shared->reltuples += reltuples;
+	SpinLockRelease(&shared->mutex);
+
+	ereport(DEBUG1,
+			(errmsg("acorn_hnsw %s processed %.0f tuples",
+					progress ? "leader" : "worker", reltuples)));
+
+	/* Notify leader */
+	ConditionVariableSignal(&shared->workersdonecv);
+
+	if (bs.graph_ctx)
+		MemoryContextDelete(bs.graph_ctx);
+	MemoryContextDelete(bs.tmp_ctx);
+}
+
+/*
+ * Perform work within a launched parallel worker.
+ */
+PGDLLEXPORT void AcornParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+
+void
+AcornParallelBuildMain(dsm_segment *seg, shm_toc *toc)
+{
+	char	   *sharedquery;
+	AcornShared *shared;
+	char	   *area;
+	Relation	heapRel;
+	Relation	indexRel;
+	LOCKMODE	heapLockmode;
+	LOCKMODE	indexLockmode;
+
+	/* Set debug_query_string for individual workers first */
+	sharedquery = shm_toc_lookup(toc, PARALLEL_KEY_QUERY_TEXT, true);
+	debug_query_string = sharedquery;
+
+	/* Report the query string from leader */
+	pgstat_report_activity(STATE_RUNNING, debug_query_string);
+
+	/* Look up shared state */
+	shared = shm_toc_lookup(toc, PARALLEL_KEY_ACORN_SHARED, false);
+
+	/* Open relations using lock modes known to be obtained by index.c */
+	if (!shared->isconcurrent)
+	{
+		heapLockmode  = ShareLock;
+		indexLockmode = AccessExclusiveLock;
+	}
+	else
+	{
+		heapLockmode  = ShareUpdateExclusiveLock;
+		indexLockmode = RowExclusiveLock;
+	}
+
+	/* Open relations within worker */
+	heapRel  = table_open(shared->heaprelid, heapLockmode);
+	indexRel = index_open(shared->indexrelid, indexLockmode);
+
+	area = shm_toc_lookup(toc, PARALLEL_KEY_ACORN_AREA, false);
+
+	/* Register the LWLock tranche before touching any graph lock */
+	acorn_init_lock_tranche();
+
+	/* Perform inserts */
+	acorn_parallel_scan_and_insert(heapRel, indexRel, shared, area, false);
+
+	/* Close relations within worker */
+	index_close(indexRel, indexLockmode);
+	table_close(heapRel, heapLockmode);
+}
+
+/*
+ * Within leader, wait for the end of the parallel heap scan.
+ */
+static double
+acorn_parallel_heapscan(AcornBuildState *bs)
+{
+	AcornShared *shared = bs->leader->shared;
+	int			 nparticipants = bs->leader->nparticipants;
+	double		 reltuples;
+
+	for (;;)
+	{
+		SpinLockAcquire(&shared->mutex);
+		if (shared->nparticipantsdone == nparticipants)
+		{
+			bs->indtuples = shared->indtuples;
+			reltuples = shared->reltuples;
+			SpinLockRelease(&shared->mutex);
+			break;
+		}
+		SpinLockRelease(&shared->mutex);
+
+		ConditionVariableSleep(&shared->workersdonecv,
+							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+	}
+
+	ConditionVariableCancelSleep();
+
+	return reltuples;
+}
+
+/*
+ * End the parallel build.
+ */
+static void
+acorn_end_parallel(AcornLeader *leader)
+{
+	/* Shutdown worker processes */
+	WaitForParallelWorkersToFinish(leader->pcxt);
+
+	/* Free last reference to MVCC snapshot, if one was used */
+	if (IsMVCCSnapshot(leader->snapshot))
+		UnregisterSnapshot(leader->snapshot);
+	DestroyParallelContext(leader->pcxt);
+	ExitParallelMode();
+}
+
+/*
+ * Begin the parallel build: DSM segment = AcornShared + parallel scan desc
+ * + the graph arena (sized from maintenance_work_mem, so (a)'s budget also
+ * bounds the parallel graph).
+ */
+static void
+acorn_begin_parallel(AcornBuildState *bs, bool isconcurrent, int request)
+{
+	ParallelContext *pcxt;
+	Snapshot	snapshot;
+	Size		estshared;
+	Size		estarea;
+	Size		estother;
+	AcornShared *shared;
+	char	   *area;
+	AcornLeader *leader = (AcornLeader *) palloc0(sizeof(AcornLeader));
+	bool		leaderparticipates = true;
+	int			querylen;
+	int			max_nodes;
+
+	acorn_init_lock_tranche();
+
+	/* Enter parallel mode and create context */
+	EnterParallelMode();
+	Assert(request > 0);
+	pcxt = CreateParallelContext("pg_acorn", "AcornParallelBuildMain", request);
+
+	/* Get snapshot for table scan */
+	if (!isconcurrent)
+		snapshot = SnapshotAny;
+	else
+		snapshot = RegisterSnapshot(GetTransactionSnapshot());
+
+	/* Estimate size of workspaces */
+	estshared = add_size(BUFFERALIGN(sizeof(AcornShared)),
+						 table_parallelscan_estimate(bs->heap, snapshot));
+	shm_toc_estimate_chunk(&pcxt->estimator, estshared);
+
+	/*
+	 * Leave space for other objects in shared memory (pgvector does the
+	 * same: Docker's default 64MB shm_size equals the default
+	 * maintenance_work_mem, so the arena must come in under the budget).
+	 */
+	estarea  = (Size) maintenance_work_mem * 1024;
+	estother = 3 * 1024 * 1024;
+	if (estarea > estother)
+		estarea -= estother;
+
+	shm_toc_estimate_chunk(&pcxt->estimator, estarea);
+	shm_toc_estimate_keys(&pcxt->estimator, 2);
+
+	/* Finally, estimate PARALLEL_KEY_QUERY_TEXT space */
+	if (debug_query_string)
+	{
+		querylen = strlen(debug_query_string);
+		shm_toc_estimate_chunk(&pcxt->estimator, querylen + 1);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+	else
+		querylen = 0;			/* keep compiler quiet */
+
+	/* Everyone's had a chance to ask for space, so now create the DSM */
+	InitializeParallelDSM(pcxt);
+
+	/* If no DSM segment was available, back out (do serial build) */
+	if (pcxt->seg == NULL)
+	{
+		if (IsMVCCSnapshot(snapshot))
+			UnregisterSnapshot(snapshot);
+		DestroyParallelContext(pcxt);
+		ExitParallelMode();
+		return;
+	}
+
+	/* Store shared build state, for which we reserved space */
+	shared = (AcornShared *) shm_toc_allocate(pcxt->toc, estshared);
+	shared->heaprelid    = RelationGetRelid(bs->heap);
+	shared->indexrelid   = RelationGetRelid(bs->index);
+	shared->isconcurrent = isconcurrent;
+	ConditionVariableInit(&shared->workersdonecv);
+	SpinLockInit(&shared->mutex);
+	shared->nparticipantsdone = 0;
+	shared->reltuples = 0;
+	shared->indtuples = 0;
+	table_parallelscan_initialize(bs->heap,
+								  ParallelTableScanFromAcornShared(shared),
+								  snapshot);
+
+	area = (char *) shm_toc_allocate(pcxt->toc, estarea);
+	/* Report less than allocated so initialization never overruns */
+	shared->arena_size = (estarea > 1024 * 1024) ? estarea - 1024 * 1024 : 0;
+	max_nodes = acorn_estimate_max_nodes(bs->index, shared->arena_size,
+										 bs->m_eff);
+	shared->max_nodes   = max_nodes;
+	shared->n_nodes     = 0;
+	shared->arena_used  = MAXALIGN((Size) max_nodes * sizeof(AcornMemNode));
+	shared->entry_id    = -1;
+	shared->entry_level = -1;
+	shared->flushed     = false;
+	LWLockInitialize(&shared->allocatorLock, acorn_lock_tranche_id);
+	LWLockInitialize(&shared->entryLock, acorn_lock_tranche_id);
+	LWLockInitialize(&shared->entryWaitLock, acorn_lock_tranche_id);
+	LWLockInitialize(&shared->flushLock, acorn_lock_tranche_id);
+	LWLockInitialize(&shared->partLock, acorn_lock_tranche_id);
+	for (int p = 0; p < ACORN_PAYLOAD_PARTITIONS; p++)
+		shared->part_entry[p] = -1;
+
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_ACORN_SHARED, shared);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_ACORN_AREA, area);
+
+	/* Store query string for workers */
+	if (debug_query_string)
+	{
+		char	   *sharedquery;
+
+		sharedquery = (char *) shm_toc_allocate(pcxt->toc, querylen + 1);
+		memcpy(sharedquery, debug_query_string, querylen + 1);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_QUERY_TEXT, sharedquery);
+	}
+
+	/* Launch workers, saving status for leader/caller */
+	LaunchParallelWorkers(pcxt);
+	leader->pcxt = pcxt;
+	leader->nparticipants = pcxt->nworkers_launched;
+	if (leaderparticipates)
+		leader->nparticipants++;
+	leader->shared   = shared;
+	leader->snapshot = snapshot;
+	leader->area     = area;
+
+	/* If no workers were successfully launched, back out (do serial build) */
+	if (pcxt->nworkers_launched == 0)
+	{
+		acorn_end_parallel(leader);
+		return;
+	}
+
+	/* Log participants */
+	ereport(DEBUG1, (errmsg("acorn_hnsw build using %d parallel workers",
+							pcxt->nworkers_launched)));
+
+	/* Save leader state now that it's clear build will be parallel */
+	bs->leader = leader;
+
+	/* Join heap scan ourselves */
+	if (leaderparticipates)
+		acorn_parallel_scan_and_insert(bs->heap, bs->index, shared, area,
+									   true);
+
+	/* Wait for all launched workers */
+	WaitForParallelWorkersToAttach(pcxt);
+}
+
+/*
+ * Compute parallel workers (pgvector ComputeParallelWorkers): respects
+ * plan_create_index_workers' safety checks, the table's parallel_workers
+ * storage parameter, and max_parallel_maintenance_workers.
+ */
+static int
+acorn_plan_parallel_workers(Relation heap, Relation index)
+{
+	int			parallel_workers;
+
+	/* Make sure it's safe to use parallel workers */
+	parallel_workers = plan_create_index_workers(RelationGetRelid(heap),
+												 RelationGetRelid(index));
+	if (parallel_workers == 0)
+		return 0;
+
+	/* Use parallel_workers storage parameter on table if set */
+	parallel_workers = RelationGetParallelWorkers(heap, -1);
+	if (parallel_workers != -1)
+		return Min(parallel_workers, max_parallel_maintenance_workers);
+
+	return max_parallel_maintenance_workers;
+}
+
+/* -----------------------------------------------------------------------
+ * ambuild / ambuildempty
+ * ----------------------------------------------------------------------- */
 
 static void
 acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
@@ -2993,7 +3975,7 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	int				gamma = acorn_opt_gamma(index);
 	bool			inline_vectors = acorn_opt_inline_vectors(index);
 	AcornBuildState bs;
-	double			reltuples = 0;
+	int				parallel_workers = 0;
 
 	if (dims < 0)
 		dims = 0;
@@ -3024,48 +4006,58 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	acorn_create_meta_page(index, forkNum, m_eff, efc, dims,
 						   inline_vectors ? ACORN_T2_META_INLINE_VECTORS : 0);
 
+	acorn_init_build_state(&bs, heap, index, indexInfo, forkNum, 0);
+
+	/* Attempt a parallel build when the planner grants workers */
+	if (heap != NULL && forkNum == MAIN_FORKNUM)
+		parallel_workers = acorn_plan_parallel_workers(heap, index);
+	if (parallel_workers > 0)
+		acorn_begin_parallel(&bs, indexInfo->ii_Concurrent, parallel_workers);
+
+	if (heap != NULL)
 	{
-		MemoryContext build_ctx = AllocSetContextCreate(CurrentMemoryContext,
-													    "acorn build",
-													    ALLOCSET_DEFAULT_SIZES);
-		bs.forkNum    = forkNum;
-		bs.ntuples    = 0;
-		bs.has_filter = (RelationGetDescr(index)->natts > 1);
-		if (acorn_build_seed >= 0)
-		{
-			/* Deterministic level RNG: same data + same seed -> same graph */
-			bs.rand_state[0] = (unsigned short) (acorn_build_seed & 0xFFFF);
-			bs.rand_state[1] = (unsigned short) ((acorn_build_seed >> 16) & 0xFFFF);
-			bs.rand_state[2] = 0x1234;
-		}
+		if (bs.leader)
+			bs.reltuples = acorn_parallel_heapscan(&bs);
 		else
-		{
-			/* Legacy: seed from process ID; different level sequences per build */
-			bs.rand_state[0] = (unsigned short) (MyProcPid & 0xFFFF);
-			bs.rand_state[1] = (unsigned short) (MyProcPid >> 16);
-			bs.rand_state[2] = 0x1234;
-		}
-		bs.mb = acorn_mem_build_init(build_ctx);
-		/* payload edges need a filter column to partition on */
-		bs.mb->payload_edges = acorn_opt_payload_edges(index) && bs.has_filter;
-		bs.mb->inline_vectors = inline_vectors;
-		bs.mb->dims = dims;
-		bs.mb->entry_size = inline_vectors ? ACORN_T2_INLINE_ENTRY_SIZE(dims) : 0;
-
-		if (heap != NULL)
-			reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
-											   acorn_build_callback, (void *) &bs, NULL);
-
-		acorn_mem_build_graph(bs.mb, index, bs.rand_state);
-		acorn_mem_flush(bs.mb, index, forkNum, m_eff);
-
-		MemoryContextDelete(build_ctx);
+			bs.reltuples = table_index_build_scan(heap, index, indexInfo,
+												  true, true,
+												  acorn_build_callback,
+												  (void *) &bs, NULL);
 	}
 
+	if (bs.leader)
+	{
+		/* Adopt the shared graph for the leader-side flush */
+		acorn_attach_shared(&bs, bs.leader->shared, bs.leader->area);
+		LWLockAcquire(&bs.shared->flushLock, LW_EXCLUSIVE);
+		if (!bs.shared->flushed)
+		{
+			acorn_mem_flush(bs.mb, index, forkNum, m_eff);
+			bs.shared->flushed = true;
+		}
+		LWLockRelease(&bs.shared->flushLock);
+		acorn_end_parallel(bs.leader);
+	}
+	else if (!bs.flushed)
+		acorn_mem_flush(bs.mb, index, forkNum, m_eff);
+
+	/*
+	 * The build wrote pages without WAL (including any spilled on-disk
+	 * inserts); log everything at once (pgvector BuildIndex pattern).
+	 */
+	if (RelationNeedsWAL(index) || forkNum == INIT_FORKNUM)
+		log_newpage_range(index, forkNum, 0,
+						  RelationGetNumberOfBlocksInFork(index, forkNum),
+						  true);
+
 	if (heap_tuples)
-		*heap_tuples  = reltuples;
+		*heap_tuples  = bs.reltuples;
 	if (index_tuples)
-		*index_tuples = bs.ntuples;
+		*index_tuples = bs.indtuples;
+
+	if (bs.graph_ctx)
+		MemoryContextDelete(bs.graph_ctx);
+	MemoryContextDelete(bs.tmp_ctx);
 }
 
 IndexBuildResult *
@@ -3121,7 +4113,8 @@ acorn_insert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 
 		if (indexInfo->ii_NumIndexAttrs > 1 && !isnull[1])
 			filter_val = (int64) values[1];
-		acorn_insert_element(index, MAIN_FORKNUM, value, filter_val, heap_tid, rand_state);
+		acorn_insert_element(index, MAIN_FORKNUM, value, filter_val, heap_tid,
+							 rand_state, RelationNeedsWAL(index));
 	}
 
 	MemoryContextSwitchTo(oldCtx);

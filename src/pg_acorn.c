@@ -69,6 +69,12 @@ bool acorn_build_direct_dist = true;
  * level-RNG seeding (every rebuild produces a different graph).  >= 0 seeds
  * the level RNG deterministically: identical data + identical seed produce an
  * identical index, enabling reproducible benchmarks and prebuilt index pools.
+ *
+ * SERIAL BUILDS ONLY: a parallel build (max_parallel_maintenance_workers > 0
+ * and the planner grants workers) interleaves tuples nondeterministically
+ * across participants, so the graph varies run to run even at a fixed seed
+ * and worker count.  Set max_parallel_maintenance_workers = 0 when a
+ * reproducible graph is required.
  */
 int acorn_build_seed = -1;
 
@@ -272,7 +278,9 @@ _PG_init(void)
 		"pg_acorn.build_seed",
 		"Seed for the acorn_hnsw level RNG during index build. "
 		"-1 = legacy PID-derived seeding (each rebuild differs); "
-		">= 0 = deterministic builds for reproducible benchmarks.",
+		">= 0 = deterministic SERIAL builds for reproducible benchmarks "
+		"(parallel builds are never bit-reproducible; set "
+		"max_parallel_maintenance_workers = 0 for graph identity).",
 		NULL,
 		&acorn_build_seed,
 		-1,			/* default: legacy PID-derived behavior */
