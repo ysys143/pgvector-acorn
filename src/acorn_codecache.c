@@ -167,6 +167,15 @@ typedef struct AcornCodeCacheSlot
 	pg_atomic_uint64 lastused;		/* logical clock at last begin_scan (LRU) */
 	LWLock			wlock;			/* serializes M2 writers + growth + retire */
 	dsa_handle		area_handle;
+	/*
+	 * Creator-pin ownership for the current area incarnation.  Set true under
+	 * dir->lock when the loader creates+pins the area; set false under
+	 * dir->lock by the SINGLE evictor that drops the pin.  Guards BUG-3: a
+	 * concurrent or later evictor observing area_pinned == false never
+	 * dsa_unpin()s again (dsa_unpin is not idempotent — a second call
+	 * elog(ERROR)s "dsa_area not pinned").
+	 */
+	bool			area_pinned;
 	pg_atomic_uint64 blocks;		/* dsa_pointer[nblocks] page arrays (grows) */
 	/* retire list (under wlock): arrays superseded by growth, awaiting drain */
 	uint32			n_retired;
@@ -451,40 +460,47 @@ acorn_cc_evict_slot(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot)
 		/*
 		 * A reader incremented in the race window.  It will see EMPTY/gen++
 		 * and back out, but it may already hold the area pointer — do not
-		 * free.  Forget only our own mapping; leave the creator pin.
+		 * free.  Forget only our own mapping; leave the creator pin
+		 * (area_pinned stays true; a later evictor reclaims once quiescent).
 		 */
 		acorn_cc_forget_attach(dboid, relnumber);
 		return freed;
 	}
 
 	/*
-	 * Quiescent: drop the creator pin so the segment can be reclaimed.
-	 * Prefer this backend's existing mapping (a backend cannot dsa_attach the
-	 * same segment twice); only attach a fresh handle if we have none.  The
-	 * memory frees when the last backend that mapped it detaches (others do
-	 * so at their next begin_scan generation check).
+	 * BUG-3 fix — drop the creator pin EXACTLY ONCE per incarnation.
+	 *
+	 * Claim pin ownership under dir->lock: only the evictor that flips
+	 * area_pinned true->false is allowed to dsa_unpin().  A concurrent or
+	 * later evictor (e.g. reset() scanning all slots, or a racing
+	 * evict_to_fit) sees area_pinned == false and never unpins again —
+	 * dsa_unpin is not idempotent and would elog(ERROR) "dsa_area not
+	 * pinned".  We always unpin through a FRESH transient attach of the
+	 * handle, never through a cached dsa_pin_mapping mapping: detaching a
+	 * cached mapping would pull it out from under the owning backend's later
+	 * reads, and reusing it risks acting on a different incarnation after the
+	 * handle is recycled.  Because we still hold dir->lock and area_pinned was
+	 * true, the handle names THIS live incarnation; the transient attach +
+	 * unpin + detach drops the creator pin and releases our transient
+	 * mapping.  The segment's memory is reclaimed once every other backend
+	 * detaches its own mapping (each does so at its next begin_scan
+	 * generation check via acorn_cc_forget_attach).
 	 */
+	if (!slot->area_pinned)
 	{
-		AcornCCAttachEntry *att = NULL;
-		bool		found = false;
-
-		if (acorn_cc_attached != NULL)
-			att = acorn_cc_attach_find(dboid, relnumber, &found);
-
-		if (found && att->scan.area != NULL)
-		{
-			area = att->scan.area;
-			dsa_unpin(area);
-			dsa_detach(area);
-			hash_search(acorn_cc_attached, &att->key, HASH_REMOVE, NULL);
-		}
-		else
-		{
-			area = dsa_attach(handle);
-			dsa_unpin(area);
-			dsa_detach(area);
-		}
+		/* another evictor already dropped this incarnation's pin */
+		acorn_cc_forget_attach(dboid, relnumber);
+		return freed;
 	}
+	slot->area_pinned = false;
+
+	/* forget our own cached mapping first (it is pinned for our lifetime) */
+	acorn_cc_forget_attach(dboid, relnumber);
+
+	/* transient attach solely to drop the creator pin, then detach it */
+	area = dsa_attach(handle);
+	dsa_unpin(area);
+	dsa_detach(area);
 
 	return freed;
 }
@@ -649,7 +665,17 @@ acorn_cc_attach_store(Oid dboid, RelFileNumber relnumber,
  * Attach this backend to a READY/PARTIAL slot's DSA area and map the block
  * directory.  Attachments are pinned for the backend's lifetime
  * (dsa_pin_mapping) and cached, so each backend pays the attach cost once
- * per index.
+ * per index.  Returns NULL if the slot was evicted out from under us before
+ * we could pin a mapping.
+ *
+ * BUG-3 corollary: dsa_attach() must run while dir->lock is held SHARED.
+ * Eviction takes dir->lock EXCLUSIVE before it drops the creator pin, so
+ * holding SHARED across dsa_attach + dsa_pin_mapping guarantees the area is
+ * still alive when we attach, and our mapping pin then keeps it alive after
+ * we release the lock — even once a later evictor drops the creator pin.
+ * Without the lock, the handle could name an already-freed (or recycled)
+ * segment, yielding "could not attach to dynamic shared area" or, worse, a
+ * mapping of a different index's recycled area.
  */
 static AcornCodeCacheScan *
 acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
@@ -661,6 +687,7 @@ acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 	dsa_pointer blocks_dp;
 	uint32		nblocks;
 	uint32		generation;
+	uint32		st;
 	int			dim;
 	dsa_area   *area;
 	dsa_pointer *blocks;
@@ -671,19 +698,31 @@ acorn_cc_attach(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 		return &e->scan;
 
 	LWLockAcquire(&dir->lock, LW_SHARED);
+	/* re-validate under the lock: the slot may have been evicted/reused */
+	st = pg_atomic_read_u32(&slot->state);
+	if ((st != ACORN_CC_STATE_READY && st != ACORN_CC_STATE_PARTIAL) ||
+		slot->dboid != dboid || slot->relnumber != relnumber)
+	{
+		LWLockRelease(&dir->lock);
+		return NULL;
+	}
 	area_handle = slot->area_handle;
 	dim = slot->dim;
 	generation = slot->generation;
-	LWLockRelease(&dir->lock);
-
-	/* blocks/nblocks grow lock-free; read them via their atomics */
 	blocks_dp = (dsa_pointer) pg_atomic_read_u64(&slot->blocks);
 	nblocks = pg_atomic_read_u32(&slot->nblocks);
 
+	/*
+	 * Attach + pin the mapping while still holding dir->lock SHARED so the
+	 * area cannot be freed by a concurrent evictor mid-attach.  Once pinned,
+	 * the mapping keeps the segment alive for our backend's lifetime.
+	 */
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	area = dsa_attach(area_handle);
 	dsa_pin_mapping(area);
 	MemoryContextSwitchTo(old);
+	LWLockRelease(&dir->lock);
+
 	blocks = (dsa_pointer *) dsa_get_address(area, blocks_dp);
 
 	e = acorn_cc_attach_store(dboid, relnumber, area, slot, blocks_dp,
@@ -776,6 +815,7 @@ acorn_cc_load(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot,
 		/* publish handles before the state can leave LOADING */
 		LWLockAcquire(&dir->lock, LW_EXCLUSIVE);
 		slot->area_handle = dsa_get_handle(area);
+		slot->area_pinned = true;	/* this incarnation holds the creator pin */
 		slot->dim = dim;
 		slot->generation++;
 		LWLockRelease(&dir->lock);
@@ -1036,6 +1076,8 @@ acorn_codecache_begin_scan(Relation index, int dim)
 		return NULL;			/* defensive: stale slot from a prior life */
 
 	cc = acorn_cc_attach(dir, slot, dboid, relnumber);
+	if (cc == NULL)
+		return NULL;			/* slot evicted mid-attach: fall back (G4) */
 	/*
 	 * cc->generation was captured inside acorn_cc_attach (under dir->lock).
 	 * If eviction bumps it before our ref is published, scan_acquire backs
