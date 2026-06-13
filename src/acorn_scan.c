@@ -1980,6 +1980,15 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	return s;
 }
 
+void
+acorn_t2_stream_end(AcornT2StreamScan *s)
+{
+	if (s == NULL || s->cc == NULL)
+		return;
+	acorn_codecache_end_scan(s->cc);
+	s->cc = NULL;				/* idempotent: a second call is a no-op */
+}
+
 /*
  * Emit the next nearest filter-passing heap TID, expanding the frontier lazily.
  *

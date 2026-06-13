@@ -1,0 +1,231 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s_begin s_open s_fetch1 e_evict s_fetch2 s_close c_scan
+step s_begin: BEGIN;
+step s_open: 
+    DECLARE cur CURSOR FOR
+        SELECT id FROM ev_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]';
+
+step s_fetch1: FETCH 5 FROM cur;
+id
+--
+10
+11
+12
+ 2
+ 1
+(5 rows)
+
+step e_evict: SELECT pg_acorn_code_cache_evict('ev_acorn');
+pg_acorn_code_cache_evict
+-------------------------
+f                        
+(1 row)
+
+step s_fetch2: FETCH 5 FROM cur;
+id
+--
+20
+21
+22
+30
+31
+(5 rows)
+
+step s_close: CLOSE cur; COMMIT;
+step c_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM ev_items WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]' LIMIT 10) s;
+
+count
+-----
+   10
+(1 row)
+
+
+starting permutation: e_evict s_begin s_open s_fetch1 s_fetch2 s_close c_scan
+step e_evict: SELECT pg_acorn_code_cache_evict('ev_acorn');
+pg_acorn_code_cache_evict
+-------------------------
+f                        
+(1 row)
+
+step s_begin: BEGIN;
+step s_open: 
+    DECLARE cur CURSOR FOR
+        SELECT id FROM ev_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]';
+
+step s_fetch1: FETCH 5 FROM cur;
+id
+--
+10
+11
+12
+ 2
+ 1
+(5 rows)
+
+step s_fetch2: FETCH 5 FROM cur;
+id
+--
+20
+21
+22
+30
+31
+(5 rows)
+
+step s_close: CLOSE cur; COMMIT;
+step c_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM ev_items WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]' LIMIT 10) s;
+
+count
+-----
+   10
+(1 row)
+
+
+starting permutation: s_begin s_open s_fetch1 s_fetch2 s_close e_evict c_scan
+step s_begin: BEGIN;
+step s_open: 
+    DECLARE cur CURSOR FOR
+        SELECT id FROM ev_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]';
+
+step s_fetch1: FETCH 5 FROM cur;
+id
+--
+10
+11
+12
+ 2
+ 1
+(5 rows)
+
+step s_fetch2: FETCH 5 FROM cur;
+id
+--
+20
+21
+22
+30
+31
+(5 rows)
+
+step s_close: CLOSE cur; COMMIT;
+step e_evict: SELECT pg_acorn_code_cache_evict('ev_acorn');
+pg_acorn_code_cache_evict
+-------------------------
+f                        
+(1 row)
+
+step c_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM ev_items WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]' LIMIT 10) s;
+
+count
+-----
+   10
+(1 row)
+
+
+starting permutation: s_begin s_open s_fetch1 e_reset s_fetch2 s_close c_scan
+step s_begin: BEGIN;
+step s_open: 
+    DECLARE cur CURSOR FOR
+        SELECT id FROM ev_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]';
+
+step s_fetch1: FETCH 5 FROM cur;
+id
+--
+10
+11
+12
+ 2
+ 1
+(5 rows)
+
+step e_reset: SELECT pg_acorn_code_cache_reset() >= 0 AS ok;
+ok
+--
+t 
+(1 row)
+
+step s_fetch2: FETCH 5 FROM cur;
+id
+--
+20
+21
+22
+30
+31
+(5 rows)
+
+step s_close: CLOSE cur; COMMIT;
+step c_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM ev_items WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]' LIMIT 10) s;
+
+count
+-----
+   10
+(1 row)
+
+
+starting permutation: e_reset s_begin s_open s_fetch1 s_fetch2 s_close c_scan
+step e_reset: SELECT pg_acorn_code_cache_reset() >= 0 AS ok;
+ok
+--
+t 
+(1 row)
+
+step s_begin: BEGIN;
+step s_open: 
+    DECLARE cur CURSOR FOR
+        SELECT id FROM ev_items
+        WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]';
+
+step s_fetch1: FETCH 5 FROM cur;
+id
+--
+10
+11
+12
+ 2
+ 1
+(5 rows)
+
+step s_fetch2: FETCH 5 FROM cur;
+id
+--
+20
+21
+22
+30
+31
+(5 rows)
+
+step s_close: CLOSE cur; COMMIT;
+step c_scan: 
+    SELECT count(*) FROM (
+        SELECT id FROM ev_items WHERE bucket < 3
+        ORDER BY embedding <-> '[1.0,0.0,0.0,0.0]' LIMIT 10) s;
+
+count
+-----
+   10
+(1 row)
+

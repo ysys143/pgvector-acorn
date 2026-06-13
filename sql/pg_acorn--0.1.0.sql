@@ -92,6 +92,65 @@ ALTER OPERATOR FAMILY int4_acorn_ops USING acorn_hnsw ADD
     FUNCTION 1 (int4, int2) btint42cmp(int4, int2),
     FUNCTION 1 (int4, int8) btint48cmp(int4, int8);
 
+-- Shared-memory SQ8 code cache observability + admin (M3).
+--
+-- The cache is per-index shared state in a named DSM segment; these read it
+-- under the directory lock.  VOLATILE (the cache mutates under DML/eviction)
+-- and PARALLEL RESTRICTED (touches process-shared DSM/LWLock state that is
+-- not safe to enter from a parallel worker without the directory mapping).
+
+CREATE FUNCTION pg_acorn_code_cache_stats(
+    OUT dboid                   oid,
+    OUT relfilenumber           int8,
+    OUT indexrelid              regclass,
+    OUT state                   text,
+    OUT nelems                  int8,
+    OUT bytes                   int8,
+    OUT generation              int8,
+    OUT lastused                int8,
+    OUT blocks_retired_pending  int4)
+    RETURNS SETOF record
+    AS 'MODULE_PATHNAME', 'pg_acorn_code_cache_stats'
+    LANGUAGE C VOLATILE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION pg_acorn_code_cache_stats() IS
+    'One row per occupied acorn_hnsw code-cache slot (shared memory).';
+
+CREATE FUNCTION pg_acorn_code_cache_summary(
+    OUT total_bytes   int8,
+    OUT budget_bytes  int8,
+    OUT n_slots       int4,
+    OUT n_occupied    int4)
+    RETURNS record
+    AS 'MODULE_PATHNAME', 'pg_acorn_code_cache_summary'
+    LANGUAGE C VOLATILE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION pg_acorn_code_cache_summary() IS
+    'Total acorn_hnsw code-cache bytes resident vs the configured budget.';
+
+CREATE FUNCTION pg_acorn_code_cache_evict(index regclass)
+    RETURNS boolean
+    AS 'MODULE_PATHNAME', 'pg_acorn_code_cache_evict'
+    LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION pg_acorn_code_cache_evict(regclass) IS
+    'Force-evict one index''s acorn_hnsw code-cache slot; true if it was present.';
+
+REVOKE ALL ON FUNCTION pg_acorn_code_cache_evict(regclass) FROM PUBLIC;
+
+CREATE FUNCTION pg_acorn_code_cache_reset()
+    RETURNS integer
+    AS 'MODULE_PATHNAME', 'pg_acorn_code_cache_reset'
+    LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION pg_acorn_code_cache_reset() IS
+    'Force-evict every evictable acorn_hnsw code-cache slot (incl. orphans from '
+    'dropped indexes); returns the count evicted.';
+
+REVOKE ALL ON FUNCTION pg_acorn_code_cache_reset() FROM PUBLIC;
+
 -- GUCs (loaded via _PG_init, declared here for documentation)
--- pg_acorn.enable_hook     boolean  default true   (Tier 1 hook)
--- pg_acorn.default_gamma   integer  default 1      (ACORN-1 by default)
+-- pg_acorn.enable_hook       boolean  default true   (Tier 1 hook)
+-- pg_acorn.default_gamma     integer  default 1      (ACORN-1 by default)
+-- pg_acorn.scan_code_cache   boolean  default false  (M3: still OFF)
+-- pg_acorn.code_cache_size   integer  default 512MB  (shared budget; 0 disables)

@@ -148,6 +148,9 @@ acorn_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 {
 	AcornScanOpaque so = (AcornScanOpaque) scan->opaque;
 
+	/* release the code-cache active-scan ref before the stream is reset */
+	acorn_t2_stream_end(so->stream);
+
 	so->first  = true;
 	so->query  = (Datum) 0;
 	so->stream = NULL;
@@ -224,6 +227,9 @@ static void
 acorn_endscan(IndexScanDesc scan)
 {
 	AcornScanOpaque so = (AcornScanOpaque) scan->opaque;
+
+	/* release the code-cache active-scan ref before freeing the stream */
+	acorn_t2_stream_end(so->stream);
 
 	MemoryContextDelete(so->tmpCtx);
 	pfree(so);
