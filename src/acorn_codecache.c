@@ -435,6 +435,16 @@ acorn_cc_evict_slot(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot)
 	dsa_area   *area;
 
 	/*
+	 * Serialize against M2 writers: insert/invalidate take slot->wlock and
+	 * then deref this backend's area mapping.  Acquiring wlock here (we
+	 * already hold dir->lock EXCLUSIVE; writers never hold dir->lock while
+	 * taking wlock, so no ordering inversion) guarantees no writer is
+	 * mid-write when we clear the slot.  After we bump generation under
+	 * wlock, a writer that next takes wlock observes the mismatch and skips.
+	 */
+	LWLockAcquire(&slot->wlock, LW_EXCLUSIVE);
+
+	/*
 	 * Mark EMPTY first (under dir->lock) so no new begin_scan can attach to
 	 * the area we are about to release; bump generation so a backend holding
 	 * a stale attach (or mid-acquire) detaches / backs out.
@@ -452,6 +462,7 @@ acorn_cc_evict_slot(AcornCodeCacheDirectory *dir, AcornCodeCacheSlot *slot)
 	pg_atomic_write_u32(&slot->nblocks, 0);
 	pg_atomic_write_u64(&slot->blocks, InvalidDsaPointer);
 	pg_atomic_fetch_sub_u64(&dir->total_bytes, freed);
+	LWLockRelease(&slot->wlock);
 
 	/* StoreLoad fence: publish EMPTY/gen++ before reading active_scans */
 	pg_memory_barrier();
@@ -1138,10 +1149,29 @@ acorn_cc_resolve_blocks(AcornCodeCacheScan *cc, BlockNumber blkno)
 	if (blkno < cc->nblocks && DsaPointerIsValid(cc->blocks[blkno]))
 		return cc->blocks;
 
-	/* Snapshot miss: consult the live directory (may have grown). */
+	/*
+	 * Snapshot miss: the live directory may have GROWN within this same
+	 * incarnation (insert), so refresh from it.  But the snapshot must only
+	 * ever be refreshed against cc->area — the incarnation we attached and
+	 * pinned.  Eviction+reload while we scan (active_scans > 0 stops the area
+	 * being FREED, not the slot being re-loaded) bumps the slot generation
+	 * and re-points slot->blocks into a DIFFERENT area.  Dereferencing that
+	 * new dsa_pointer against our old cc->area would read garbage / another
+	 * index's data (the observed cross-read).  Growth never bumps generation,
+	 * so a generation mismatch means reincarnation: stop trusting the cache
+	 * for the rest of this scan and fall back (G4).
+	 */
+	if (cc->slot->generation != cc->generation)
+		return NULL;
+
 	live_dp = (dsa_pointer) pg_atomic_read_u64(&cc->slot->blocks);
 	live_nblocks = pg_atomic_read_u32(&cc->slot->nblocks);
 	pg_read_barrier();
+
+	/* re-check generation after reading blocks: the read must belong to our
+	 * incarnation (growth-only refresh) */
+	if (cc->slot->generation != cc->generation)
+		return NULL;
 
 	if (live_dp != cc->blocks_dp)
 	{
@@ -1259,7 +1289,23 @@ acorn_cc_writer_attach(Relation index)
 
 	att = acorn_cc_attach_find(dboid, relnumber, &found);
 	if (found)
-		return &att->scan;
+	{
+		AcornCodeCacheSlot *s = att->scan.slot;
+		uint32		st = pg_atomic_read_u32(&s->state);
+
+		/*
+		 * Revalidate the cached attach: M3 eviction can have freed this
+		 * incarnation's area and reloaded a new one (bumped generation).
+		 * A match means the mapping is live; a mismatch means stale — forget
+		 * it and re-resolve so we never write through a detached/foreign
+		 * area mapping.
+		 */
+		if (att->scan.generation == s->generation &&
+			s->dboid == dboid && s->relnumber == relnumber &&
+			(st == ACORN_CC_STATE_READY || st == ACORN_CC_STATE_PARTIAL))
+			return &att->scan;
+		acorn_cc_forget_attach(dboid, relnumber);
+	}
 
 	if (acorn_cc_dir == NULL)
 		return NULL;			/* directory never created => no warm slot */
@@ -1447,6 +1493,21 @@ acorn_codecache_insert(Relation index,
 		return;					/* no warm slot / dim mismatch: skip (G4) */
 
 	LWLockAcquire(&cc->slot->wlock, LW_EXCLUSIVE);
+
+	/*
+	 * Re-validate the incarnation under wlock: eviction (which does not take
+	 * wlock) may have flipped this slot EMPTY / bumped generation between
+	 * writer_attach and here.  Writing then would deref our stale area against
+	 * the new incarnation's (Invalid) block directory.  On a mismatch, skip
+	 * the upsert — the element is simply a future cache miss (G4).
+	 */
+	if (cc->generation != cc->slot->generation ||
+		cc->slot->dboid != index->rd_locator.dbOid ||
+		cc->slot->relnumber != index->rd_locator.relNumber)
+	{
+		LWLockRelease(&cc->slot->wlock);
+		return;
+	}
 
 	ph = acorn_cc_ensure_page(dir, cc, blkno, offno);
 	if (ph == NULL)

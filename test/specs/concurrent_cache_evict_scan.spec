@@ -60,9 +60,13 @@ step "s_fetch1" { FETCH 5 FROM cur; }
 step "s_fetch2" { FETCH 5 FROM cur; }
 step "s_close"  { CLOSE cur; COMMIT; }
 
-# Manipulator: force-evict the slot the scanner is reading.
+# Manipulator: force-evict the slot the scanner is reading, or reset the
+# whole directory.  Reset exercises the same per-incarnation creator-pin
+# release as evict, across every slot in one dir->lock section — the BUG-3
+# double-unpin path if the pin ownership were not tracked.
 session "evictor"
 step "e_evict"  { SELECT pg_acorn_code_cache_evict('ev_acorn'); }
+step "e_reset"  { SELECT pg_acorn_code_cache_reset() >= 0 AS ok; }
 
 # Rescan after eviction must reload and stay correct.
 session "checker"
@@ -80,3 +84,8 @@ permutation "s_begin" "s_open" "s_fetch1" "e_evict" "s_fetch2" "s_close" "c_scan
 permutation "e_evict" "s_begin" "s_open" "s_fetch1" "s_fetch2" "s_close" "c_scan"
 # Evict after the cursor closes: slot already quiescent.
 permutation "s_begin" "s_open" "s_fetch1" "s_fetch2" "s_close" "e_evict" "c_scan"
+# Reset() mid-scan: the slot has an active scan, so reset defers its free;
+# the open cursor completes correctly and the next scan reloads.
+permutation "s_begin" "s_open" "s_fetch1" "e_reset" "s_fetch2" "s_close" "c_scan"
+# Reset() before the scan: clean reload on the next scan.
+permutation "e_reset" "s_begin" "s_open" "s_fetch1" "s_fetch2" "s_close" "c_scan"
