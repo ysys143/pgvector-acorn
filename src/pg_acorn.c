@@ -121,7 +121,7 @@ bool acorn_scan_inline_vectors = true;
  * Misses and disabled/LOADING slots fall back to the element-page read, so
  * results never depend on cache state.
  */
-bool acorn_scan_code_cache = false;
+bool acorn_scan_code_cache = true;
 
 /*
  * GUC: total shared-memory budget for the SQ8 code cache, in MB.  0 disables
@@ -343,7 +343,7 @@ _PG_init(void)
 		"element-page read; inline-vector indexes never consult the cache.",
 		NULL,
 		&acorn_scan_code_cache,
-		false,
+		true,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

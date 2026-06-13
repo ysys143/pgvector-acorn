@@ -152,5 +152,7 @@ REVOKE ALL ON FUNCTION pg_acorn_code_cache_reset() FROM PUBLIC;
 -- GUCs (loaded via _PG_init, declared here for documentation)
 -- pg_acorn.enable_hook       boolean  default true   (Tier 1 hook)
 -- pg_acorn.default_gamma     integer  default 1      (ACORN-1 by default)
--- pg_acorn.scan_code_cache   boolean  default false  (M3: still OFF)
+-- pg_acorn.scan_code_cache   boolean  default true   (graduated: non-inline
+--                                                      indexes are cache-served;
+--                                                      a miss/0-budget falls back)
 -- pg_acorn.code_cache_size   integer  default 512MB  (shared budget; 0 disables)
