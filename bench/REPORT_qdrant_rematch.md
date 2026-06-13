@@ -3,6 +3,31 @@
 Date: 2026-06-14. Harness: `bench/qdrant_rematch.py`. Result:
 `bench/results_qdrant_rematch.json`. Qdrant v1.16.0 container.
 
+## CORRECTION 2026-06-14 — the recall verdict below was WRONG (stale acorn data)
+
+The verdict further down ("Qdrant wins; acorn caps ~0.91-0.94 at sel 10/20%")
+compared CURRENT Qdrant against acorn numbers from `results_thesis_250k.json`,
+which predate the Z3 buffered-emission fix. Those caps were the emission-order
+bug Z3 already fixed — NOT a graph limitation. A controlled gamma sweep on the
+SAME correlated fixture with the current binary (`bench/gamma_sweep.py`,
+`results_gamma_sweep.json`), cross-checked against the post-Z3
+`results_emission_250k_quiet.json` (agree exactly), shows acorn does NOT cap:
+
+| sel | acorn g2 ef800 | acorn g2 ef1600 | acorn g4 ef800 | Qdrant ef800 |
+|----:|---:|---:|---:|---:|
+| 10% | 0.993 | 1.000 | 1.000 | 1.000 |
+| 20% | 0.963 | 0.995 | 1.000 | 0.973 |
+
+Corrected recall verdict: **current acorn matches Qdrant on recall** (g2 within
+~0.01; g4 matches/beats). The recall gap was an artifact of comparing current
+Qdrant to pre-Z3 acorn. Higher gamma reaches the same recall at LOWER ef
+(sel=20% -> ~0.95 needs ef~700 at g2, ef~400 at g4; sel=10% -> 0.94 needs
+ef~400 at g2, ef~200 at g4), which should also lower latency-at-recall — and
+gamma 3/4 were never benchmarked before. The LATENCY comparison below also used
+stale/noisy acorn latency and remains OPEN: a clean current-binary acorn
+latency run on the correlated fixture vs Qdrant is still needed before any
+latency verdict. Treat everything below as the (flawed) original record.
+
 ## What this fixes
 
 Prior Qdrant numbers (`QDRANT_CODEPATH.md`) measured exact brute-force — no
