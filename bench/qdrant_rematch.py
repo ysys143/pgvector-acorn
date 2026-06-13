@@ -67,7 +67,10 @@ def wait_indexed(c, want, timeout=900):
         if idx != last:
             print(f"  [index] status={status} indexed={idx}/{want}", flush=True)
             last = idx
-        if status == "green" and idx >= want * 0.99:
+        # indexed_vectors_count is the real signal; a low indexing_threshold
+        # keeps status "yellow" (optimizer always armed) even when the graph
+        # already covers every vector.
+        if idx >= want * 0.99:
             return idx
         time.sleep(3)
     raise TimeoutError(f"indexing stalled at {last}/{want}")
