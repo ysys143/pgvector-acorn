@@ -1,0 +1,89 @@
+{
+ "meta": {
+  "fixture": "correlated seed0 250K",
+  "k": 10,
+  "ef": 100,
+  "acorn_index": "tv_acorn_noinline",
+  "nq": 10
+ },
+ "rows": [
+  {
+   "sel": 1,
+   "planner_pick": "acorn",
+   "planner_cost": 236.5,
+   "planner_ms": 17.14,
+   "acorn_cost": 236.5,
+   "acorn_ms": 11.79,
+   "prefilter_cost": 6546.9,
+   "prefilter_ms": 6.1,
+   "time_winner": "prefilter",
+   "cost_winner": "acorn",
+   "mismatch": true
+  },
+  {
+   "sel": 2,
+   "planner_pick": "acorn",
+   "planner_cost": 118.1,
+   "planner_ms": 4.82,
+   "acorn_cost": 118.1,
+   "acorn_ms": 15.71,
+   "prefilter_cost": 11162.5,
+   "prefilter_ms": 53.11,
+   "time_winner": "acorn",
+   "cost_winner": "acorn",
+   "mismatch": false
+  },
+  {
+   "sel": 5,
+   "planner_pick": "acorn",
+   "planner_cost": 84.0,
+   "planner_ms": 27.4,
+   "acorn_cost": 84.0,
+   "acorn_ms": 3.05,
+   "prefilter_cost": 17870.9,
+   "prefilter_ms": 118.15,
+   "time_winner": "acorn",
+   "cost_winner": "acorn",
+   "mismatch": false
+  },
+  {
+   "sel": 10,
+   "planner_pick": "acorn",
+   "planner_cost": 74.4,
+   "planner_ms": 13.91,
+   "acorn_cost": 74.4,
+   "acorn_ms": 2.81,
+   "prefilter_cost": 20064.9,
+   "prefilter_ms": 431.9,
+   "time_winner": "acorn",
+   "cost_winner": "acorn",
+   "mismatch": false
+  },
+  {
+   "sel": 20,
+   "planner_pick": "acorn",
+   "planner_cost": 64.0,
+   "planner_ms": 123.61,
+   "acorn_cost": 64.0,
+   "acorn_ms": 4.35,
+   "prefilter_cost": 20406.4,
+   "prefilter_ms": 324.87,
+   "time_winner": "acorn",
+   "cost_winner": "acorn",
+   "mismatch": false
+  },
+  {
+   "sel": 50,
+   "planner_pick": "acorn",
+   "planner_cost": 55.4,
+   "planner_ms": 24.95,
+   "acorn_cost": 55.4,
+   "acorn_ms": 3.63,
+   "prefilter_cost": 24138.7,
+   "prefilter_ms": 928.63,
+   "time_winner": "acorn",
+   "cost_winner": "acorn",
+   "mismatch": false
+  }
+ ]
+}

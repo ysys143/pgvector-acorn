@@ -38,7 +38,21 @@ Original analysis below.
 - Evidence: gamma sweep — sel=20% reaching ~0.95 needs ef~700 at gamma=2 vs
   ef~400 at gamma=4, and g4's extra density is half-wasted on the global side.
 
-## Priority 2 — cardinality-aware path (exact vs graph)
+## Priority 2 — cardinality-aware path (exact vs graph) — INVESTIGATED, no change
+
+DIAGNOSED (2026-06-14, `bench/REPORT_plan_choice.md` + `bench/plan_choice_probe.py`):
+the plan-choice safety net shows the current selectivity-aware cost model already
+routes CORRECTLY. Across sel 1-50% the planner picks acorn (estimated cost 28-436x
+below the bitmap prefilter, which must sort thousands of passing rows) and acorn
+is empirically far faster. The tiny-cardinality extreme is already handled by
+`n_expand = Min(40/sel, N)` saturating to N as sel -> 0, switching the planner to
+the exact prefilter below ~40/N selectivity (= Qdrant's small-cardinality branch,
+the Postgres way). P2's hypothesized mis-routing did not reproduce; the only
+residual is a sub-1% band (both plans < ~5 ms, below the fixture granularity)
+whose fix (ef/recall-aware cost) is exactly the change that previously
+destabilized mid-band plan choice. Decision: no change — it adds the documented
+regression risk for no measurable benefit. The probe is kept as a regression
+guard. Original analysis below.
 
 - Qdrant: at search time estimates filter cardinality (with up-to-1000-point
   sampling, Agresti-Coull) and routes small filtered sets to an exact plain
@@ -134,8 +148,10 @@ that cost debugging time during Phase C/D. Original analysis below.
    per-scan visibility into expansions / path / cache hits).
 3. Priority 3 (auto-ef) — DONE. Index-resident histogram + coarse heuristic;
    target_recall GUC. Decoupled from the cost model.
-4. Priority 2 (recall-aware cost) — next. Documented regression risk (live-ef
-   cost destabilized mid-band plans; see acorn_cost.c). P3's histogram +
-   selectivity estimator and P5's telemetry now de-risk it (the same
-   index-resident selectivity can feed the cost model).
-5. Priority 4 (gate payload links by cardinality) — opportunistic.
+4. Priority 2 (recall-aware cost) — INVESTIGATED, no change. The plan-choice
+   safety net showed the current cost model already routes correctly (acorn 1-50%,
+   tiny-cardinality -> prefilter via n_expand saturation); changing it adds the
+   documented mid-band regression risk for no measurable gain
+   (bench/REPORT_plan_choice.md).
+5. Priority 4 (gate payload links by cardinality) — opportunistic; the only
+   remaining borrow-list item.

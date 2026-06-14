@@ -41,7 +41,18 @@
  * at high ef even in the mid-selectivity band where acorn is empirically 6-8x
  * faster (n=30K correlated: g4 0.955@203qps vs bitmap 1.0@23qps at 40%). The
  * cost model has no recall signal, so a naive ef-aware cost mis-trades speed
- * for an unneeded exact path. Revisit as a deliberate recall-aware calibration. */
+ * for an unneeded exact path.
+ *
+ * P2 investigation (2026-06-14, bench/REPORT_plan_choice.md): the plan-choice
+ * diagnostic confirms this constant routes CORRECTLY across sel 1-50% — the
+ * planner picks acorn (cost 28-436x below the bitmap prefilter, which must sort
+ * thousands of passing rows) and acorn is empirically far faster. The
+ * tiny-cardinality extreme is already handled here: n_expand = Min(40/sel, N)
+ * saturates to N as sel -> 0, so acorn's cost approaches a full scan and the
+ * planner switches to the exact prefilter below ~40/N selectivity (Qdrant's
+ * small-cardinality branch, the Postgres way). No change made: an ef/recall-aware
+ * cost gains nothing measurable here and reintroduces the mid-band regression
+ * above. The probe is the regression guard if this is ever revisited. */
 #define ACORN_T2_EF_SEARCH_EST		40.0
 
 void
