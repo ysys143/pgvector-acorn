@@ -124,6 +124,13 @@ acorn_opt_gamma(Relation index)
 	return opts ? opts->gamma : acorn_default_gamma;
 }
 
+static int
+acorn_opt_payload_m(Relation index)
+{
+	AcornOptions *opts = (AcornOptions *) index->rd_options;
+	return opts ? opts->payloadM : ACORN_DEFAULT_PAYLOAD_M;
+}
+
 static bool
 acorn_opt_payload_edges(Relation index)
 {
@@ -175,6 +182,32 @@ acorn_m_eff(Relation index)
 	if (m_eff > HNSW_MAX_M)
 		m_eff = HNSW_MAX_M;
 	return m_eff;
+}
+
+/*
+ * Resolve the absolute layer-0 payload-half width for this index.
+ *
+ * global_m = acorn_m_eff(index).  The reloption sentinel 0 means "symmetric":
+ * payload half = global half = global_m (the legacy 2*m_eff layer-0 layout).
+ * Any explicit value is clamped so global_m + payload_m <= HNSW_MAX_NEIGHBORS,
+ * keeping the full layer-0 slot array on a single page.
+ *
+ * REDUCTION: when the option is 0, this returns global_m, so every generalized
+ * format formula collapses to its legacy form.
+ */
+static int
+acorn_payload_m_eff(Relation index)
+{
+	int global_m  = acorn_m_eff(index);
+	int payload_m = acorn_opt_payload_m(index);
+
+	if (payload_m <= 0)
+		return global_m;			/* sentinel: symmetric = global_m */
+	if (global_m + payload_m > HNSW_MAX_NEIGHBORS)
+		payload_m = HNSW_MAX_NEIGHBORS - global_m;
+	if (payload_m < 0)
+		payload_m = 0;
+	return payload_m;
 }
 
 /* -----------------------------------------------------------------------
@@ -264,7 +297,8 @@ acorn_init_page(Buffer buf, Page page)
 
 static void
 acorn_create_meta_page(Relation index, ForkNumber forkNum, int m_eff,
-					   int efConstruction, int dimensions, uint16 acorn_flags)
+					   int payload_m, int efConstruction, int dimensions,
+					   uint16 acorn_flags)
 {
 	Buffer		 buf;
 	Page		 page;
@@ -285,7 +319,12 @@ acorn_create_meta_page(Relation index, ForkNumber forkNum, int m_eff,
 	metap->hnsw.entryLevel     = -1;
 	metap->hnsw.insertPage     = InvalidBlockNumber;
 	metap->acorn_flags         = acorn_flags;
-	metap->reserved            = 0;
+	/*
+	 * Sentinel encoding: store 0 when payload_m == global_m (= m_eff) so the
+	 * symmetric / legacy layout is byte-identical to pre-payload_m indexes.
+	 * Any asymmetric value is stored as the resolved absolute payload count.
+	 */
+	metap->payload_m           = (uint16) ((payload_m == m_eff) ? 0 : payload_m);
 
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(AcornT2MetaPageData)) - (char *) page;
@@ -302,18 +341,21 @@ acorn_create_meta_page(Relation index, ForkNumber forkNum, int m_eff,
  */
 static int
 acorn_read_meta(Relation index, BlockNumber *entry_blkno, OffsetNumber *entry_offno,
-				int *entry_level_out, int *dims_out, uint16 *acorn_flags_out)
+				int *entry_level_out, int *dims_out, uint16 *acorn_flags_out,
+				int *payload_m_out)
 {
 	Buffer		 buf;
 	Page		 page;
 	AcornT2MetaPage metap;
 	int			 m;
+	uint16		 stored_payload_m;
 
 	buf   = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page  = BufferGetPage(buf);
 	metap = AcornT2PageGetMeta(page);
 	m     = (int) metap->hnsw.m;
+	stored_payload_m = metap->payload_m;
 	if (entry_blkno)
 		*entry_blkno = metap->hnsw.entryBlkno;
 	if (entry_offno)
@@ -324,6 +366,9 @@ acorn_read_meta(Relation index, BlockNumber *entry_blkno, OffsetNumber *entry_of
 		*dims_out = (int) metap->hnsw.dimensions;
 	if (acorn_flags_out)
 		*acorn_flags_out = metap->acorn_flags;
+	/* Decode the sentinel: 0 = symmetric = global_m (= m). */
+	if (payload_m_out)
+		*payload_m_out = (stored_payload_m == 0) ? m : (int) stored_payload_m;
 	UnlockReleaseBuffer(buf);
 	return m;
 }
@@ -331,7 +376,7 @@ acorn_read_meta(Relation index, BlockNumber *entry_blkno, OffsetNumber *entry_of
 int
 acorn_index_m(Relation index)
 {
-	return acorn_read_meta(index, NULL, NULL, NULL, NULL, NULL);
+	return acorn_read_meta(index, NULL, NULL, NULL, NULL, NULL, NULL);
 }
 
 /*
@@ -534,7 +579,7 @@ acorn_node_distance(Relation index, ForkNumber forkNum,
 static int
 acorn_read_nbr_tids_at_layer(Relation index, ForkNumber forkNum,
 							  BlockNumber nbr_blkno, OffsetNumber nbr_offno,
-							  int elem_level, int layer, int m_eff,
+							  int elem_level, int layer, int m_eff, int payload_m,
 							  ItemPointerData *tids_out, int max_tids)
 {
 	Buffer			  buf;
@@ -542,7 +587,8 @@ acorn_read_nbr_tids_at_layer(Relation index, ForkNumber forkNum,
 	HnswNeighborTuple ntup;
 	ItemPointerData  *tids;
 	int				  start = HnswNeighborStart(m_eff, elem_level, layer);
-	int				  count = Min(HnswNeighborCount(m_eff, layer), max_tids);
+	int				  count = Min(acorn_t2_layer_m(layer, m_eff, payload_m),
+								 max_tids);
 	int				  n     = 0;
 
 	buf  = ReadBufferExtended(index, forkNum, nbr_blkno, RBM_NORMAL, NULL);
@@ -743,6 +789,7 @@ typedef struct AcornMemBuild
 	uint32		   *visit_gen;		/* per-process generation-based visited set */
 	uint32			cur_gen;
 	bool			payload_edges;	/* split layer-0 slots global/partition halves */
+	int				payload_m;		/* layer-0 payload-half width (= m_eff symmetric) */
 	bool			inline_vectors;	/* co-locate SQ8 vectors in neighbor lists */
 	int				dims;			/* vector dimensions (inline mode) */
 	Size			entry_size;		/* inline entry stride (inline mode) */
@@ -854,7 +901,8 @@ static inline Size
 acorn_mem_node_cost(const AcornMemBuild *mb, int level, Size vsize, int m_eff)
 {
 	Size cost = MAXALIGN(vsize)
-		+ MAXALIGN((Size) (level + 2) * m_eff * sizeof(int));
+		+ MAXALIGN((Size) acorn_t2_total_slots(level, m_eff, mb->payload_m)
+				   * sizeof(int));
 
 	/* serial: account the capacity doubling this push would trigger */
 	if (!mb->shared && mb->n_nodes >= mb->capacity)
@@ -875,7 +923,7 @@ acorn_mem_push_node(AcornMemBuild *mb, Datum vec, Size vsize, int level,
 {
 	AcornMemNode  *node;
 	int			   id;
-	int			   n_slots = (level + 2) * m_eff;
+	int			   n_slots = acorn_t2_total_slots(level, m_eff, mb->payload_m);
 	int			  *nbr;
 	void		  *vdst;
 
@@ -970,7 +1018,7 @@ acorn_mem_greedy_descend(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 			double        cur_dist = acorn_dist(dist, acorn_node_vec(mb, node),
 												query);
 			int           start    = HnswNeighborStart(m_eff, node->level, lc);
-			int           layer_m  = HnswGetLayerM(m_eff, lc);
+			int           layer_m  = acorn_t2_layer_m(lc, m_eff, mb->payload_m);
 
 			acorn_mem_copy_slots(mb, node, start, layer_m, slots);
 
@@ -1049,7 +1097,7 @@ acorn_mem_search_layer(AcornMemBuild *mb, const AcornDistCtx *dist, int m_eff,
 			continue;	/* safety: node doesn't appear at this layer */
 
 		start   = HnswNeighborStart(m_eff, c_data->level, layer);
-		layer_m = HnswGetLayerM(m_eff, layer);
+		layer_m = acorn_t2_layer_m(layer, m_eff, mb->payload_m);
 
 		acorn_mem_copy_slots(mb, c_data, start, layer_m, slots);
 
@@ -1163,7 +1211,7 @@ acorn_mem_search_partition(AcornMemBuild *mb, const AcornDistCtx *dist, int m_ef
 			break;
 
 		start   = HnswNeighborStart(m_eff, c_data->level, 0);
-		layer_m = HnswGetLayerM(m_eff, 0);
+		layer_m = acorn_t2_layer_m(0, m_eff, mb->payload_m);
 
 		acorn_mem_copy_slots(mb, c_data, start, layer_m, slots);
 
@@ -1576,11 +1624,12 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 
 	out_ids   = palloc(sizeof(int)    * efc);
 	out_dists = palloc(sizeof(double) * efc);
-	rev       = palloc(sizeof(AcornRevEdge) * (Size) (level + 2) * m_eff);
+	rev       = palloc(sizeof(AcornRevEdge) *
+					   (Size) acorn_t2_total_slots(level, m_eff, mb->payload_m));
 
 	for (int lc = Min(entry_level, level); lc >= 0; lc--)
 	{
-		int layer_m = HnswGetLayerM(m_eff, lc);
+		int layer_m = acorn_t2_layer_m(lc, m_eff, mb->payload_m);
 		int start   = HnswNeighborStart(m_eff, level, lc);
 		int n_cands = acorn_mem_search_layer(mb, dist, m_eff,
 											  ep_id, q, lc, efc,
@@ -1592,8 +1641,8 @@ acorn_mem_insert_node(AcornMemBuild *mb, const AcornDistCtx *dist,
 			 * Split layer-0 slots: [start, start+g_half) = global nearest,
 			 * [start+g_half, start+layer_m) = nearest same-partition members.
 			 */
-			int  g_half   = layer_m / 2;	/* = m_eff */
-			int  p_half   = layer_m - g_half;
+			int  g_half   = m_eff;				/* global half = m_eff */
+			int  p_half   = mb->payload_m;		/* payload half = payload_m */
 			int  part     = acorn_payload_partition(node->filter_val);
 			int  part_ep;
 			int  n_global;
@@ -1859,15 +1908,16 @@ acorn_mem_preassign_tids(AcornMemBuild *mb, int m_eff)
 
 		if (mb->inline_vectors)
 		{
-			int		layer0_n = HnswGetLayerM(m_eff, 0);
+			int		layer0_n = acorn_t2_l0_width(m_eff, mb->payload_m);
 			int		n1 = Min(layer0_n,
 							 acorn_t2_inline_primary_cap(node->level, m_eff,
+														 mb->payload_m,
 														 mb->entry_size));
 			int		cont_cap = acorn_t2_inline_cont_cap(mb->entry_size);
 			int		rest = layer0_n - n1;
 
-			ntup_sz = ACORN_T2_INLINE_NTUP_SIZE(node->level, m_eff, n1,
-												mb->entry_size);
+			ntup_sz = ACORN_T2_INLINE_NTUP_SIZE(node->level, m_eff, mb->payload_m,
+												n1, mb->entry_size);
 			if (!sim_page_fits(&sp, ntup_sz))
 				sim_page_advance(&sp);
 			node->nbr_blkno = sp.blkno;
@@ -1897,7 +1947,8 @@ acorn_mem_preassign_tids(AcornMemBuild *mb, int m_eff)
 		}
 		else
 		{
-			ntup_sz = HNSW_NEIGHBOR_TUPLE_SIZE(node->level, m_eff);
+			ntup_sz = ACORN_T2_NEIGHBOR_TUPLE_SIZE(node->level, m_eff,
+												   mb->payload_m);
 			if (!sim_page_fits(&sp, ntup_sz))
 				sim_page_advance(&sp);
 			node->nbr_blkno = sp.blkno;
@@ -1957,9 +2008,11 @@ acorn_mem_flush_inline_node(AcornMemBuild *mb, Relation index,
 	AcornMemNode *node     = &mb->nodes[i];
 	int			 *my_nbr   = acorn_node_nbr(mb, node);
 	Size		  esz      = mb->entry_size;
-	int			  layer0_n = HnswGetLayerM(m_eff, 0);
+	int			  payload_m = mb->payload_m;
+	int			  layer0_n = acorn_t2_l0_width(m_eff, payload_m);
 	int			  n1       = Min(layer0_n,
-								 acorn_t2_inline_primary_cap(node->level, m_eff, esz));
+								 acorn_t2_inline_primary_cap(node->level, m_eff,
+															 payload_m, esz));
 	int			  cont_cap = acorn_t2_inline_cont_cap(esz);
 	int			  start0   = HnswNeighborStart(m_eff, node->level, 0);
 	int			  done;
@@ -1969,14 +2022,15 @@ acorn_mem_flush_inline_node(AcornMemBuild *mb, Relation index,
 	/* Primary: header + TID slots + first inline chunk */
 	{
 		Size				sz   = ACORN_T2_INLINE_NTUP_SIZE(node->level, m_eff,
-															 n1, esz);
+															 payload_m, n1, esz);
 		HnswNeighborTuple	ntup = palloc0(sz);
 		AcornT2InlineHdr	hdr;
 		char			   *entries;
 
 		ntup->type    = HNSW_NEIGHBOR_TUPLE_TYPE;
 		ntup->version = HNSW_VERSION;
-		ntup->count   = (uint16) ((node->level + 2) * m_eff);
+		ntup->count   = (uint16) acorn_t2_total_slots(node->level, m_eff,
+													  payload_m);
 
 		hdr = AcornT2NeighborInlineHdr(ntup);
 		hdr->n_here     = (uint16) n1;
@@ -2081,12 +2135,15 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 
 		{
 			AcornMemNode     *node    = &mb->nodes[i];
-			Size              ntup_sz = HNSW_NEIGHBOR_TUPLE_SIZE(node->level, m_eff);
+			Size              ntup_sz = ACORN_T2_NEIGHBOR_TUPLE_SIZE(node->level,
+																	 m_eff,
+																	 mb->payload_m);
 			HnswNeighborTuple ntup    = palloc0(ntup_sz);
 
 			ntup->type    = HNSW_NEIGHBOR_TUPLE_TYPE;
 			ntup->version = HNSW_VERSION;
-			ntup->count   = (uint16) ((node->level + 2) * m_eff);
+			ntup->count   = (uint16) acorn_t2_total_slots(node->level, m_eff,
+														  mb->payload_m);
 
 			acorn_append_tuple(index, forkNum, (Item) ntup, ntup_sz,
 							   &blkno_out, &off_out, false);
@@ -2128,7 +2185,7 @@ acorn_mem_flush(AcornMemBuild *mb, Relation index, ForkNumber forkNum, int m_eff
 		for (int lc = node->level; lc >= 0; lc--)
 		{
 			int start   = HnswNeighborStart(m_eff, node->level, lc);
-			int layer_m = HnswGetLayerM(m_eff, lc);
+			int layer_m = acorn_t2_layer_m(lc, m_eff, mb->payload_m);
 
 			for (int j = 0; j < layer_m; j++)
 			{
@@ -2181,7 +2238,7 @@ static void
 acorn_greedy_descend_build(Relation index, ForkNumber forkNum,
 						   BlockNumber *cur_blkno, OffsetNumber *cur_offno,
 						   Datum query, const AcornDistCtx *dist, int m_eff,
-						   int from_level, int to_level)
+						   int payload_m, int from_level, int to_level)
 {
 	for (int lc = from_level; lc > to_level; lc--)
 	{
@@ -2206,7 +2263,7 @@ acorn_greedy_descend_build(Relation index, ForkNumber forkNum,
 
 			n_nbrs = acorn_read_nbr_tids_at_layer(index, forkNum,
 												   c_nbr_blk, c_nbr_off,
-												   c_level, lc, m_eff,
+												   c_level, lc, m_eff, payload_m,
 												   nbrs, HNSW_MAX_NEIGHBORS);
 
 			for (int i = 0; i < n_nbrs; i++)
@@ -2258,7 +2315,7 @@ static int
 acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 								  BlockNumber entry_blkno, OffsetNumber entry_offno,
 								  Datum query, const AcornDistCtx *dist, int m_eff,
-								  int layer, int ef,
+								  int payload_m, int layer, int ef,
 								  AcornCand *out_cands,
 								  int part, int max_expansions)
 {
@@ -2341,7 +2398,7 @@ acorn_search_layer_construction(Relation index, ForkNumber forkNum,
 
 		n_nbrs = acorn_read_nbr_tids_at_layer(index, forkNum,
 											   c_nbr_blk, c_nbr_off,
-											   c_level, layer, m_eff,
+											   c_level, layer, m_eff, payload_m,
 											   nbrs, HNSW_MAX_NEIGHBORS);
 
 		for (int i = 0; i < n_nbrs; i++)
@@ -2617,7 +2674,7 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 								 ItemPointer n_tid,
 								 BlockNumber e_blk, OffsetNumber e_off,
 								 Datum e_value, const AcornDistCtx *dist,
-								 int m_eff, int layer,
+								 int m_eff, int payload_m, int layer,
 								 int range_off, int range_len, int part,
 								 bool diversify,
 								 const AcornT2InlineEntry *e_entry, Size e_esz,
@@ -2638,7 +2695,7 @@ acorn_add_reverse_edge_at_layer(Relation index, ForkNumber forkNum,
 	double			  nonmember_d = -DBL_MAX;
 
 	Assert(range_len <= HNSW_MAX_NEIGHBORS);
-	Assert(range_off + range_len <= HnswGetLayerM(m_eff, layer));
+	Assert(range_off + range_len <= acorn_t2_layer_m(layer, m_eff, payload_m));
 
 	/* --- Phase 1: read N's element tuple (level + neighbor location + vector) --- */
 	acorn_read_element(index, forkNum, n_tid, &n_level,
@@ -2926,6 +2983,7 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	int				  n_payload_real = 0;	/* partition-sourced layer-0 payload slots */
 	int				  meta_dims;
 	uint16			  meta_flags;
+	int				  payload_m;		/* layer-0 payload-half width (from meta) */
 	bool			  inline_on;
 	Size			  esz = 0;
 	AcornT2InlineEntry *e_self = NULL;		/* E's own inline entry (reverse edges) */
@@ -2937,9 +2995,14 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	/* Step 1: assign random level */
 	l_new = acorn_assign_level(m_eff, rand_state);
 
-	/* Step 2: read current entry point (+ Tier 2 meta: inline layout flag) */
+	/*
+	 * Step 2: read current entry point (+ Tier 2 meta: inline layout flag and
+	 * the resolved payload-half width — taken from the META PAGE, not
+	 * rd_options, so an ALTER INDEX ... SET (acorn_payload_m=...) cannot desync
+	 * the layer-0 boundary from the slots already written by earlier inserts).
+	 */
 	acorn_read_meta(index, &entry_blkno, &entry_offno, &entry_level,
-					&meta_dims, &meta_flags);
+					&meta_dims, &meta_flags, &payload_m);
 	has_entry = BlockNumberIsValid(entry_blkno);
 	inline_on = (meta_flags & ACORN_T2_META_INLINE_VECTORS) != 0;
 	if (inline_on)
@@ -2956,18 +3019,23 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 
 	/*
 	 * Step 3: allocate neighbor tuple.
-	 * Total slots = (l_new + 2) * m_eff: layers l_new..1 use m_eff each,
-	 * layer 0 uses 2*m_eff.  HnswGetLayerM / HnswNeighborStart encode this.
+	 * Total slots = acorn_t2_total_slots(l_new, m_eff, payload_m): layers
+	 * l_new..1 use m_eff each, layer 0 uses m_eff + payload_m.  Reduces to
+	 * (l_new + 2) * m_eff when payload_m == m_eff (symmetric).
 	 */
-	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(l_new, m_eff);
-	Assert(ntupSize <= HNSW_MAX_SIZE);
-	ntup           = palloc0(ntupSize);
-	ntup->type     = HNSW_NEIGHBOR_TUPLE_TYPE;
-	ntup->version  = HNSW_VERSION;
-	ntup->count    = (l_new + 2) * m_eff;
-	ntids = HnswNeighborTupleGetTids(ntup);
-	for (int i = 0; i < (l_new + 2) * m_eff; i++)
-		ItemPointerSetInvalid(&ntids[i]);
+	{
+		int total_slots = acorn_t2_total_slots(l_new, m_eff, payload_m);
+
+		ntupSize = ACORN_T2_NEIGHBOR_TUPLE_SIZE(l_new, m_eff, payload_m);
+		Assert(ntupSize <= HNSW_MAX_SIZE);
+		ntup           = palloc0(ntupSize);
+		ntup->type     = HNSW_NEIGHBOR_TUPLE_TYPE;
+		ntup->version  = HNSW_VERSION;
+		ntup->count    = (uint16) total_slots;
+		ntids = HnswNeighborTupleGetTids(ntup);
+		for (int i = 0; i < total_slots; i++)
+			ItemPointerSetInvalid(&ntids[i]);
+	}
 
 	/* Step 4: find neighbors at each layer */
 	if (has_entry)
@@ -2978,13 +3046,13 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 		/* Greedy descent from entry_level down to l_new+1 (ef=1 per layer) */
 		if (entry_level > l_new)
 			acorn_greedy_descend_build(index, forkNum, &ep_blkno, &ep_offno,
-									   value, dist, m_eff,
+									   value, dist, m_eff, payload_m,
 									   entry_level, l_new);
 
 		/* Beam search from min(entry_level, l_new) down to 0 */
 		for (int lc = Min(entry_level, l_new); lc >= 0; lc--)
 		{
-			int		   layer_m = HnswGetLayerM(m_eff, lc);
+			int		   layer_m = acorn_t2_layer_m(lc, m_eff, payload_m);
 			int		   start   = HnswNeighborStart(m_eff, l_new, lc);
 			int		   n_cands;
 			AcornCand *cands   = palloc(sizeof(AcornCand) * efc);
@@ -2992,7 +3060,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 			n_cands = acorn_search_layer_construction(index, forkNum,
 													   ep_blkno, ep_offno,
 													   value, dist, m_eff,
-													   lc, efc, cands, -1, 0);
+													   payload_m, lc, efc,
+													   cands, -1, 0);
 
 			if (lc == 0 && payload_on)
 			{
@@ -3002,8 +3071,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 				 * restricted search (W limited to the partition, exploration
 				 * unrestricted, work capped).
 				 */
-				int			g_half   = layer_m / 2;		/* = m_eff */
-				int			p_half   = layer_m - g_half;
+				int			g_half   = m_eff;			/* global half = m_eff */
+				int			p_half   = payload_m;		/* payload half = payload_m */
 				int			n_global;
 				int			p_filled = 0;
 				AcornCand  *pcands   = palloc(sizeof(AcornCand) * efc);
@@ -3027,8 +3096,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 				n_part = acorn_search_layer_construction(index, forkNum,
 														  ep_blkno, ep_offno,
 														  value, dist, m_eff,
-														  0, efc, pcands,
-														  part, efc * 8);
+														  payload_m, 0, efc,
+														  pcands, part, efc * 8);
 
 				/* drop candidates already wired as global neighbors */
 				for (int i = 0; i < n_part; i++)
@@ -3141,10 +3210,11 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 		 * (so each knows its successor's TID) followed by the primary
 		 * neighbor tuple carrying the TID slots + first chunk.
 		 */
-		int		layer0_n = HnswGetLayerM(m_eff, 0);
+		int		layer0_n = acorn_t2_l0_width(m_eff, payload_m);
 		int		start0   = HnswNeighborStart(m_eff, l_new, 0);
 		int		n1       = Min(layer0_n,
-							   acorn_t2_inline_primary_cap(l_new, m_eff, esz));
+							   acorn_t2_inline_primary_cap(l_new, m_eff,
+														   payload_m, esz));
 		int		cont_cap = acorn_t2_inline_cont_cap(esz);
 		int		n_conts  = (cont_cap > 0)
 			? (layer0_n - n1 + cont_cap - 1) / cont_cap : 0;
@@ -3212,11 +3282,12 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 		/* Primary neighbor tuple: TID slots + chunk 0 */
 		{
 			Size				isz = ACORN_T2_INLINE_NTUP_SIZE(l_new, m_eff,
-																n1, esz);
+																payload_m, n1, esz);
 			HnswNeighborTuple	intup = palloc0(isz);
 			AcornT2InlineHdr	hdr;
 
-			memcpy(intup, ntup, HNSW_NEIGHBOR_TUPLE_SIZE(l_new, m_eff));
+			memcpy(intup, ntup,
+				   ACORN_T2_NEIGHBOR_TUPLE_SIZE(l_new, m_eff, payload_m));
 			hdr = AcornT2NeighborInlineHdr(intup);
 			hdr->n_here     = (uint16) n1;
 			hdr->start      = 0;
@@ -3275,13 +3346,13 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 	{
 		for (int lc = Min(entry_level, l_new); lc >= 0; lc--)
 		{
-			int layer_m = HnswGetLayerM(m_eff, lc);
+			int layer_m = acorn_t2_layer_m(lc, m_eff, payload_m);
 			int start   = HnswNeighborStart(m_eff, l_new, lc);
 
 			if (lc == 0 && payload_on)
 			{
-				int g_half = layer_m / 2;
-				int p_half = layer_m - g_half;
+				int g_half = m_eff;			/* global half = m_eff */
+				int p_half = payload_m;		/* payload half = payload_m */
 
 				/* global half -> neighbors' global halves */
 				for (int i = 0; i < g_half; i++)
@@ -3291,8 +3362,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					acorn_add_reverse_edge_at_layer(index, forkNum,
 													 &ntids[start + i],
 													 e_blk, e_off,
-													 value, dist, m_eff, lc,
-													 0, g_half, -1, diversify,
+													 value, dist, m_eff, payload_m,
+													 lc, 0, g_half, -1, diversify,
 													 e_self, esz, use_wal);
 				}
 
@@ -3308,8 +3379,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					acorn_add_reverse_edge_at_layer(index, forkNum,
 													 &ntids[start + g_half + i],
 													 e_blk, e_off,
-													 value, dist, m_eff, lc,
-													 g_half, p_half, part,
+													 value, dist, m_eff, payload_m,
+													 lc, g_half, p_half, part,
 													 diversify, e_self, esz,
 													 use_wal);
 				}
@@ -3323,8 +3394,8 @@ acorn_insert_element(Relation index, ForkNumber forkNum, Datum value,
 					acorn_add_reverse_edge_at_layer(index, forkNum,
 													 &ntids[start + i],
 													 e_blk, e_off,
-													 value, dist, m_eff, lc,
-													 0, layer_m, -1, diversify,
+													 value, dist, m_eff, payload_m,
+													 lc, 0, layer_m, -1, diversify,
 													 (lc == 0) ? e_self : NULL, esz,
 													 use_wal);
 				}
@@ -3468,6 +3539,8 @@ acorn_init_build_state(AcornBuildState *bs, Relation heap, Relation index,
 	bs->mb = acorn_mem_build_init(bs->graph_ctx);
 	/* payload edges need a filter column to partition on */
 	bs->mb->payload_edges  = acorn_opt_payload_edges(index) && bs->has_filter;
+	/* layer-0 payload-half width (= m_eff when symmetric) */
+	bs->mb->payload_m      = acorn_payload_m_eff(index);
 	bs->mb->inline_vectors = acorn_opt_inline_vectors(index);
 	bs->mb->dims           = dims;
 	bs->mb->entry_size     = bs->mb->inline_vectors
@@ -3989,6 +4062,8 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 					 ForkNumber forkNum, double *heap_tuples, double *index_tuples)
 {
 	int				m_eff = acorn_m_eff(index);
+	int				payload_m = acorn_payload_m_eff(index);
+	int				payload_m_req = acorn_opt_payload_m(index);
 	int				efc   = acorn_opt_ef_construction(index);
 	int				dims  = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
 	int				m_req = acorn_opt_m(index);
@@ -4023,7 +4098,22 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 				 errhint("Lower acorn_gamma or m so that m*gamma <= %d to apply gamma fully.",
 						 HNSW_MAX_M)));
 
-	acorn_create_meta_page(index, forkNum, m_eff, efc, dims,
+	/*
+	 * Same page-budget guard for the additive payload half: the full layer-0
+	 * slot array (global_m + payload_m) must fit one page, so the resolver
+	 * clamps global_m + payload_m to HNSW_MAX_NEIGHBORS.  Warn if the requested
+	 * acorn_payload_m was clamped, so the user knows it was not fully applied.
+	 */
+	if (payload_m_req > 0 && m_eff + payload_m_req > HNSW_MAX_NEIGHBORS)
+		ereport(WARNING,
+				(errmsg("acorn_payload_m=%d with m_eff=%d requests %d layer-0 neighbors, "
+						"clamped to payload_m=%d (HNSW page limit %d)",
+						payload_m_req, m_eff, m_eff + payload_m_req, payload_m,
+						HNSW_MAX_NEIGHBORS),
+				 errhint("Lower acorn_payload_m or m*gamma so that m*gamma + acorn_payload_m <= %d.",
+						 HNSW_MAX_NEIGHBORS)));
+
+	acorn_create_meta_page(index, forkNum, m_eff, payload_m, efc, dims,
 						   inline_vectors ? ACORN_T2_META_INLINE_VECTORS : 0);
 
 	acorn_init_build_state(&bs, heap, index, indexInfo, forkNum, 0);

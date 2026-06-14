@@ -30,6 +30,15 @@
 #define ACORN_DEFAULT_GAMMA           1
 #define ACORN_MIN_GAMMA               1
 #define ACORN_MAX_GAMMA               8
+/*
+ * acorn_payload_m: independent absolute size of the layer-0 payload half
+ * (Qdrant-style).  0 = sentinel "symmetric": payload half = global half =
+ * m_eff, i.e. the legacy 2*m_eff layer-0 layout.  Max is HNSW_MAX_NEIGHBORS
+ * (=200) so global_m + payload_m can still be clamped to fit a page.
+ */
+#define ACORN_DEFAULT_PAYLOAD_M       0
+#define ACORN_MIN_PAYLOAD_M           0
+#define ACORN_MAX_PAYLOAD_M           200
 
 /* ef_search heuristic for index-AM scans */
 #define ACORN_DEFAULT_EF_SEARCH      40
@@ -44,6 +53,7 @@ typedef struct AcornOptions
 	int			m;				/* base connections per node */
 	int			efConstruction;	/* candidate list size at build time */
 	int			gamma;			/* ACORN-gamma multiplier (m_eff = m*gamma) */
+	int			payloadM;		/* layer-0 payload-half width (0 = symmetric = global_m) */
 	bool		payloadEdges;	/* split layer-0 slots: half global / half same-partition */
 	bool		diversify;		/* HNSW diversity heuristic in neighbor selection */
 	bool		inlineVectors;	/* co-locate SQ8 vectors + metadata in neighbor lists */

@@ -57,6 +57,12 @@ acorn_am_init(void)
 					  "ACORN gamma: store m*gamma neighbors per node",
 					  ACORN_DEFAULT_GAMMA, ACORN_MIN_GAMMA, ACORN_MAX_GAMMA,
 					  AccessExclusiveLock);
+	add_int_reloption(acorn_relopt_kind, "acorn_payload_m",
+					  "Layer-0 payload-half neighbor count (Qdrant-style); "
+					  "0 = symmetric (payload half = global half = m*gamma)",
+					  ACORN_DEFAULT_PAYLOAD_M, ACORN_MIN_PAYLOAD_M,
+					  ACORN_MAX_PAYLOAD_M,
+					  AccessExclusiveLock);
 	add_bool_reloption(acorn_relopt_kind, "acorn_payload_edges",
 					   "Split layer-0 neighbor slots: half global nearest, "
 					   "half nearest within the same payload partition",
@@ -90,6 +96,7 @@ acorn_options(Datum reloptions, bool validate)
 		{"m", RELOPT_TYPE_INT, offsetof(AcornOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(AcornOptions, efConstruction)},
 		{"acorn_gamma", RELOPT_TYPE_INT, offsetof(AcornOptions, gamma)},
+		{"acorn_payload_m", RELOPT_TYPE_INT, offsetof(AcornOptions, payloadM)},
 		{"acorn_payload_edges", RELOPT_TYPE_BOOL, offsetof(AcornOptions, payloadEdges)},
 		{"acorn_diversify", RELOPT_TYPE_BOOL, offsetof(AcornOptions, diversify)},
 		{"acorn_inline_vectors", RELOPT_TYPE_BOOL, offsetof(AcornOptions, inlineVectors)},
