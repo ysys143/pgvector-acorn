@@ -272,6 +272,74 @@ acorn_t2_inline_cont_cap(Size entry_size)
 	(sizeof(AcornT2InlineContData) + (Size) (n_here) * (esz))
 
 /* -----------------------------------------------------------------------
+ * Auto-ef selectivity histogram (borrow-list Priority 3)
+ *
+ * An equi-depth histogram of the index's filter_val column, summarized at
+ * build time into the meta page, lets the scan estimate a query's filter
+ * selectivity and derive an ef that targets a recall goal
+ * (pg_acorn.target_recall) WITHOUT manual per-selectivity ef tuning.
+ *
+ * hist_bounds[0..nbounds-1] are ascending equi-depth boundaries: bounds[0] is
+ * the min, bounds[nbounds-1] the max, and ~1/(nbounds-1) of the rows fall in
+ * each [bounds[i], bounds[i+1]] band (PG-style histogram).  nbounds == 0 means
+ * "no histogram" (pre-P3 index, or no / empty filter column) — auto-ef then
+ * falls back to the manual pg_acorn.ef_search.  Same zero-sentinel back-compat
+ * as payload_m: pre-P3 indexes read a PageInit'd (zeroed) meta region.
+ * ----------------------------------------------------------------------- */
+#define ACORN_T2_HIST_BOUNDS	64
+/* Reservoir-sample cap for the build-time histogram (rows beyond are sampled). */
+#define ACORN_T2_HIST_SAMPLE	30000
+
+/* Histogram value struct (copied out of the meta page by the scan). */
+typedef struct AcornT2Histogram
+{
+	int			nbounds;						/* 0 = absent */
+	int64		ntuples;						/* rows summarized */
+	int64		ndistinct;						/* distinct filter_vals (>= 1) */
+	int64		bounds[ACORN_T2_HIST_BOUNDS];	/* ascending equi-depth */
+} AcornT2Histogram;
+
+/*
+ * Fraction of summarized rows with filter_val strictly < c, by linear
+ * interpolation within the equi-depth band containing c.  0 below the min, 1
+ * above the max.  Caller guarantees h->nbounds >= 1.
+ */
+static inline double
+acorn_t2_hist_frac_lt(const AcornT2Histogram *h, int64 c)
+{
+	int		lo, hi, i;
+	int64	b0, b1;
+	double	within;
+
+	if (h->nbounds <= 1)
+		return (c > h->bounds[0]) ? 1.0 : 0.0;
+	if (c <= h->bounds[0])
+		return 0.0;
+	if (c > h->bounds[h->nbounds - 1])
+		return 1.0;
+
+	/* binary search: largest i with bounds[i] < c (so bounds[i] < c <= bounds[i+1]) */
+	lo = 0;
+	hi = h->nbounds - 1;
+	while (lo < hi)
+	{
+		int mid = (lo + hi + 1) / 2;
+
+		if (h->bounds[mid] < c)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	i  = lo;
+	b0 = h->bounds[i];
+	b1 = h->bounds[i + 1];
+	within = (b1 > b0) ? (double) (c - b0) / (double) (b1 - b0) : 0.0;
+	if (within > 1.0)
+		within = 1.0;
+	return ((double) i + within) / (double) (h->nbounds - 1);
+}
+
+/* -----------------------------------------------------------------------
  * Tier 2 meta page extension
  *
  * The acorn_inline_vectors layout decision is recorded in the META PAGE at
@@ -297,6 +365,17 @@ typedef struct AcornT2MetaPageData
 	 * that case is acorn_payload_edges = false.
 	 */
 	uint16		payload_m;
+	/*
+	 * Auto-ef selectivity histogram (Priority 3).  hist_nbounds == 0 => absent
+	 * (pre-P3 index or no filter column); auto-ef then uses the manual
+	 * ef_search.  See AcornT2Histogram / acorn_t2_hist_frac_lt above.  These
+	 * fields are zero on a PageInit'd page, so pre-P3 indexes read "absent".
+	 */
+	uint16		hist_nbounds;	/* # valid entries in hist_bounds (0 = absent) */
+	uint16		hist_reserved;	/* pad / future use */
+	int64		hist_ntuples;	/* rows the histogram summarizes */
+	int64		hist_ndistinct;	/* distinct filter_vals in the sample (>= 1) */
+	int64		hist_bounds[ACORN_T2_HIST_BOUNDS];	/* ascending equi-depth */
 } AcornT2MetaPageData;
 typedef AcornT2MetaPageData *AcornT2MetaPage;
 

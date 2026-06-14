@@ -1,0 +1,82 @@
+{
+ "meta": {
+  "fixture": "correlated seed0 250K",
+  "k": 10,
+  "index": "tv_acorn_autoef",
+  "note": "manual ef_search=40 throughout; auto-ef overrides it"
+ },
+ "baseline_manual_ef40": {
+  "1": {
+   "recall": 0.8025,
+   "ef_exp": 40
+  },
+  "5": {
+   "recall": 0.345,
+   "ef_exp": 40
+  },
+  "10": {
+   "recall": 0.2525,
+   "ef_exp": 40
+  },
+  "20": {
+   "recall": 0.1825,
+   "ef_exp": 40
+  }
+ },
+ "auto": {
+  "0.9": {
+   "1": {
+    "recall": 0.98,
+    "ef_exp": 100
+   },
+   "5": {
+    "recall": 0.8375,
+    "ef_exp": 157
+   },
+   "10": {
+    "recall": 0.8675,
+    "ef_exp": 314
+   },
+   "20": {
+    "recall": 0.9025,
+    "ef_exp": 606
+   }
+  },
+  "0.95": {
+   "1": {
+    "recall": 0.98,
+    "ef_exp": 100
+   },
+   "5": {
+    "recall": 0.93,
+    "ef_exp": 222
+   },
+   "10": {
+    "recall": 0.9475,
+    "ef_exp": 444
+   },
+   "20": {
+    "recall": 0.965,
+    "ef_exp": 857
+   }
+  },
+  "0.99": {
+   "1": {
+    "recall": 1.0,
+    "ef_exp": 224
+   },
+   "5": {
+    "recall": 0.995,
+    "ef_exp": 497
+   },
+   "10": {
+    "recall": 1.0,
+    "ef_exp": 994
+   },
+   "20": {
+    "recall": 1.0,
+    "ef_exp": 1917
+   }
+  }
+ }
+}

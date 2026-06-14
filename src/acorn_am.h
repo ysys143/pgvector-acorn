@@ -44,6 +44,26 @@
 #define ACORN_DEFAULT_EF_SEARCH      40
 
 /*
+ * Auto-ef (pg_acorn.target_recall): when target_recall > 0, derive ef from the
+ * estimated filter selectivity instead of using the manual ef_search.  Coarse,
+ * MONOTONE heuristic — a convenience that removes per-selectivity ef tuning,
+ * NOT a recall guarantee.  Anchored to the reference fixture at top-~10 KNN:
+ *
+ *   ef = clamp( max(EF_MIN, EF_PER_SEL * sel) * recall_factor, EF_MIN, EF_MAX )
+ *   recall_factor = clamp( sqrt((1-ANCHOR) / (1-target_recall)), RF_MIN, RF_MAX )
+ *
+ * At target_recall == ANCHOR (0.95) recall_factor == 1, matching the gamma
+ * sweep money cells (sel 1%/10%/20% -> ef ~100/400/800).
+ */
+#define ACORN_DEFAULT_TARGET_RECALL  0.0	/* 0 = off (manual ef_search) */
+#define ACORN_AUTOEF_EF_MIN          100
+#define ACORN_AUTOEF_EF_PER_SEL      4000
+#define ACORN_AUTOEF_EF_MAX          4000
+#define ACORN_AUTOEF_RECALL_ANCHOR   0.95
+#define ACORN_AUTOEF_RF_MIN          0.5
+#define ACORN_AUTOEF_RF_MAX          4.0
+
+/*
  * Parsed reloptions for an acorn_hnsw index.  Layout must start with int32
  * vl_len_ for build_reloptions().
  */

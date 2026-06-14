@@ -35,10 +35,14 @@
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
+#include "catalog/pg_type.h"
+#include "common/pg_prng.h"
+#include "executor/tuptable.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
+#include "utils/snapmgr.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/lmgr.h"
@@ -295,10 +299,116 @@ acorn_init_page(Buffer buf, Page page)
 	HnswPageGetOpaque(page)->page_id   = HNSW_PAGE_ID;
 }
 
+/* ascending int64 comparator for pg_qsort */
+static int
+acorn_int64_cmp(const void *a, const void *b)
+{
+	int64	x = *(const int64 *) a;
+	int64	y = *(const int64 *) b;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/*
+ * Build the auto-ef filter histogram (borrow-list Priority 3) via a serial
+ * reservoir sample over the heap's filter column.  Leader-side and
+ * parallel-agnostic (a dedicated scan, independent of the graph build's
+ * parallelism), which keeps it simple and correct at the cost of one extra
+ * column scan.  out->nbounds = 0 disables auto-ef for this index whenever there
+ * is no int4 filter column or no rows.  Values use the signed-int32 space that
+ * acorn_t2_eval_filter compares in.  Deterministic when build_seed >= 0; for
+ * tables below the sample cap (no sampling) it is exact regardless.
+ *
+ * v1 supports int4 filter columns (acorn's filter type — the int4 fast path,
+ * tests, and benches); other types get no histogram and fall back to manual ef.
+ */
+static void
+acorn_build_filter_histogram(Relation heap, Relation index, IndexInfo *indexInfo,
+							 AcornT2Histogram *out)
+{
+	AttrNumber		heap_attno;
+	TableScanDesc	scan;
+	TupleTableSlot *slot;
+	Snapshot		snapshot;
+	pg_prng_state	rng;
+	int64		   *buf;
+	int				cap = ACORN_T2_HIST_SAMPLE;
+	int				k = 0;			/* values kept in the reservoir */
+	int64			seen = 0;		/* non-null filter values scanned */
+
+	out->nbounds = 0;
+	out->ntuples = 0;
+	out->ndistinct = 0;
+
+	/* Need a second key column (the filter) and v1 requires it to be int4. */
+	if (IndexRelationGetNumberOfKeyAttributes(index) < 2)
+		return;
+	if (TupleDescAttr(RelationGetDescr(index), 1)->atttypid != INT4OID)
+		return;
+	heap_attno = indexInfo->ii_IndexAttrNumbers[1];
+	if (heap_attno <= 0)			/* expression key: no plain column to sample */
+		return;
+
+	pg_prng_seed(&rng,
+				 (uint64) (acorn_build_seed >= 0 ? acorn_build_seed : 0x9E3779B9u));
+	buf = (int64 *) palloc(sizeof(int64) * cap);
+
+	snapshot = RegisterSnapshot(GetTransactionSnapshot());
+	scan = table_beginscan(heap, snapshot, 0, NULL);
+	slot = table_slot_create(heap, NULL);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		bool	isnull;
+		Datum	d = slot_getattr(slot, heap_attno, &isnull);
+		int64	v;
+
+		if (isnull)
+			continue;
+		v = (int64) DatumGetInt32(d);	/* signed int32 space (matches eval_filter) */
+		seen++;
+		if (k < cap)
+			buf[k++] = v;
+		else
+		{
+			uint64	j = pg_prng_uint64_range(&rng, 0, (uint64) seen - 1);
+
+			if (j < (uint64) cap)
+				buf[j] = v;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	table_endscan(scan);
+	UnregisterSnapshot(snapshot);
+
+	if (k > 0)
+	{
+		int		nb, i, ndistinct = 1;
+
+		pg_qsort(buf, (size_t) k, sizeof(int64), acorn_int64_cmp);
+		for (i = 1; i < k; i++)
+			if (buf[i] != buf[i - 1])
+				ndistinct++;
+
+		nb = Min(ACORN_T2_HIST_BOUNDS, k);
+		for (i = 0; i < nb; i++)
+		{
+			/* equi-depth quantile by sample index (ascending => bounds ascending) */
+			int		idx = (nb == 1) ? 0 : (int) (((int64) i * (k - 1)) / (nb - 1));
+
+			out->bounds[i] = buf[idx];
+		}
+		out->nbounds   = nb;
+		out->ntuples   = seen;
+		out->ndistinct = ndistinct;
+	}
+	pfree(buf);
+}
+
 static void
 acorn_create_meta_page(Relation index, ForkNumber forkNum, int m_eff,
 					   int payload_m, int efConstruction, int dimensions,
-					   uint16 acorn_flags)
+					   uint16 acorn_flags, const AcornT2Histogram *hist)
 {
 	Buffer		 buf;
 	Page		 page;
@@ -325,6 +435,23 @@ acorn_create_meta_page(Relation index, ForkNumber forkNum, int m_eff,
 	 * Any asymmetric value is stored as the resolved absolute payload count.
 	 */
 	metap->payload_m           = (uint16) ((payload_m == m_eff) ? 0 : payload_m);
+
+	/* Auto-ef filter histogram (Priority 3); 0 bounds => absent. */
+	metap->hist_reserved = 0;
+	if (hist != NULL && hist->nbounds > 0)
+	{
+		metap->hist_nbounds   = (uint16) hist->nbounds;
+		metap->hist_ntuples   = hist->ntuples;
+		metap->hist_ndistinct = hist->ndistinct;
+		memcpy(metap->hist_bounds, hist->bounds,
+			   (size_t) hist->nbounds * sizeof(int64));
+	}
+	else
+	{
+		metap->hist_nbounds   = 0;
+		metap->hist_ntuples   = 0;
+		metap->hist_ndistinct = 0;
+	}
 
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(AcornT2MetaPageData)) - (char *) page;
@@ -4071,6 +4198,7 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 	bool			inline_vectors = acorn_opt_inline_vectors(index);
 	AcornBuildState bs;
 	int				parallel_workers = 0;
+	AcornT2Histogram hist;
 
 	if (dims < 0)
 		dims = 0;
@@ -4113,8 +4241,18 @@ acorn_build_internal(Relation heap, Relation index, IndexInfo *indexInfo,
 				 errhint("Lower acorn_payload_m or m*gamma so that m*gamma + acorn_payload_m <= %d.",
 						 HNSW_MAX_NEIGHBORS)));
 
+	/*
+	 * Auto-ef filter histogram (Priority 3): sample the filter column before
+	 * writing the meta page.  Only meaningful with a heap to scan (the
+	 * ambuildempty / INIT_FORKNUM path leaves it absent).
+	 */
+	hist.nbounds = 0;
+	if (heap != NULL && forkNum == MAIN_FORKNUM)
+		acorn_build_filter_histogram(heap, index, indexInfo, &hist);
+
 	acorn_create_meta_page(index, forkNum, m_eff, payload_m, efc, dims,
-						   inline_vectors ? ACORN_T2_META_INLINE_VECTORS : 0);
+						   inline_vectors ? ACORN_T2_META_INLINE_VECTORS : 0,
+						   &hist);
 
 	acorn_init_build_state(&bs, heap, index, indexInfo, forkNum, 0);
 

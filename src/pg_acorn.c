@@ -28,6 +28,13 @@ bool acorn_enable_2hop = false;
 int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
 
 /*
+ * GUC: auto-ef recall target.  0 = off (use manual ef_search).  When > 0 and
+ * the index carries a filter histogram, the scan derives ef from the estimated
+ * filter selectivity (coarse heuristic; see acorn_am.h).
+ */
+double acorn_target_recall = ACORN_DEFAULT_TARGET_RECALL;
+
+/*
  * GUC: member-first expansion for Tier 2 in-filter scans.  When on, the
  * expansion budget (ef_search) is spent on filter-PASSING candidates first;
  * failing candidates are only expanded when no passing candidate is queued.
@@ -184,6 +191,23 @@ _PG_init(void)
 		ACORN_DEFAULT_EF_SEARCH,	/* default */
 		1,							/* min */
 		4000,						/* max (expansion budget; allows deep sweeps) */
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL
+	);
+
+	/* GUC: pg_acorn.target_recall (auto-ef) */
+	DefineCustomRealVariable(
+		"pg_acorn.target_recall",
+		"Auto-ef recall target for acorn_hnsw Tier 2 scans. 0 disables "
+		"(use pg_acorn.ef_search). When > 0 and the index has a filter "
+		"histogram, ef is derived from the estimated filter selectivity "
+		"(coarse heuristic; convenience, not a recall guarantee).",
+		NULL,
+		&acorn_target_recall,
+		ACORN_DEFAULT_TARGET_RECALL,	/* default 0.0 = off */
+		0.0,							/* min */
+		0.9999,							/* max */
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

@@ -28,10 +28,12 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "access/stratnum.h"
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
 
 #include "pg_acorn.h"
+#include "acorn_am.h"
 #include "acorn_scan.h"
 #include "hnsw_compat.h"
 #include "acorn_t2_page.h"
@@ -243,7 +245,8 @@ visit_once(HTAB *visited, const ItemPointerData *tid)
 static bool
 acorn_meta_read(Relation index, BlockNumber *entry_blkno,
 				OffsetNumber *entry_offno, int *entry_level, int *m_out,
-				int *dims_out, uint16 *acorn_flags_out, int *payload_m_out)
+				int *dims_out, uint16 *acorn_flags_out, int *payload_m_out,
+				AcornT2Histogram *hist_out)
 {
 	Buffer		buf;
 	Page		page;
@@ -267,6 +270,23 @@ acorn_meta_read(Relation index, BlockNumber *entry_blkno,
 	/* Decode the additive payload-half sentinel: 0 = symmetric = global_m (= m). */
 	if (payload_m_out)
 		*payload_m_out = (meta->payload_m == 0) ? m : (int) meta->payload_m;
+
+	/* Auto-ef histogram (Priority 3): nbounds 0 => absent (pre-P3 / no filter). */
+	if (hist_out)
+	{
+		int		nb = (int) meta->hist_nbounds;
+
+		if (nb > ACORN_T2_HIST_BOUNDS)
+			nb = ACORN_T2_HIST_BOUNDS;	/* defensive clamp */
+		hist_out->nbounds = nb;
+		if (nb > 0)
+		{
+			hist_out->ntuples   = meta->hist_ntuples;
+			hist_out->ndistinct = (meta->hist_ndistinct > 0) ? meta->hist_ndistinct : 1;
+			memcpy(hist_out->bounds, meta->hist_bounds,
+				   (size_t) nb * sizeof(int64));
+		}
+	}
 
 	UnlockReleaseBuffer(buf);
 	return (*entry_blkno != InvalidBlockNumber);
@@ -809,7 +829,7 @@ acorn_scan_execute(AcornScanState *state, Relation index, Relation heap,
 		? acorn_resolve_direct_dist(index) : NULL;
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
-						 NULL, NULL, NULL))
+						 NULL, NULL, NULL, NULL))
 		return 0;			/* empty index */
 
 	/* Greedy descent to layer 1 (skipping to base layer entry point) */
@@ -944,7 +964,7 @@ acorn_stream_begin(Relation index, Datum query, Snapshot snapshot,
 	acorn_load_dist_proc(index, &s->dist_proc);
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
-						 NULL, NULL, NULL))
+						 NULL, NULL, NULL, NULL))
 	{
 		s->exhausted = true;		/* empty index */
 		MemoryContextSwitchTo(old);
@@ -1896,11 +1916,11 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 #ifdef ACORN_CC_DEBUG
 				s->dbg_cc_hits++;
 #endif
-				acorn_scan_cum.cc_hits++;	/* telemetry */
 				double	alb = acorn_t2_inline_lb(s, ad, hit.scale);
 				bool	cpasses = (hit.flags & ACORN_CC_DELETED) == 0 &&
 					acorn_t2_eval_filter(s->keys, s->nkeys, hit.filter_val);
 
+				acorn_scan_cum.cc_hits++;	/* telemetry */
 				cn = palloc(sizeof(AcornPQNode));
 				ItemPointerCopy(&neighbors[i], &cn->elem.indextid);
 				ItemPointerSetInvalid(&cn->elem.heaptid);
@@ -1978,6 +1998,81 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 
 }
 
+/*
+ * Estimate filter selectivity of the scan keys against the auto-ef histogram
+ * (Priority 3).  Each btree predicate on the int4 filter column contributes the
+ * fraction of summarized rows it passes; keys combine assuming independence.
+ * Returns a fraction in [1e-6, 1].  Caller guarantees hist->nbounds >= 1.
+ */
+static double
+acorn_estimate_selectivity(ScanKey keys, int nkeys, const AcornT2Histogram *hist)
+{
+	double	sel = 1.0;
+	int		i;
+
+	for (i = 0; i < nkeys; i++)
+	{
+		int64	c = (int64) DatumGetInt32(keys[i].sk_argument);
+		double	f;
+
+		switch (keys[i].sk_strategy)
+		{
+			case BTLessStrategyNumber:			/* x < c */
+				f = acorn_t2_hist_frac_lt(hist, c);
+				break;
+			case BTLessEqualStrategyNumber:		/* x <= c == x < c+1 (integer) */
+				f = acorn_t2_hist_frac_lt(hist, c + 1);
+				break;
+			case BTGreaterEqualStrategyNumber:	/* x >= c */
+				f = 1.0 - acorn_t2_hist_frac_lt(hist, c);
+				break;
+			case BTGreaterStrategyNumber:		/* x > c == NOT(x < c+1) */
+				f = 1.0 - acorn_t2_hist_frac_lt(hist, c + 1);
+				break;
+			case BTEqualStrategyNumber:			/* x = c */
+				f = 1.0 / (double) hist->ndistinct;
+				break;
+			default:
+				f = 1.0;						/* unknown strategy: no signal */
+				break;
+		}
+		if (f < 0.0)
+			f = 0.0;
+		if (f > 1.0)
+			f = 1.0;
+		sel *= f;
+	}
+	if (sel < 1e-6)
+		sel = 1e-6;
+	return sel;
+}
+
+/*
+ * Coarse monotone auto-ef heuristic (Priority 3): map estimated selectivity +
+ * a recall target to an expansion budget.  A convenience that removes manual
+ * per-selectivity ef tuning, NOT a recall guarantee.  Formula in acorn_am.h.
+ */
+static int
+acorn_auto_ef(double sel, double target_recall)
+{
+	double	rf;
+	double	ef;
+
+	rf = sqrt((1.0 - ACORN_AUTOEF_RECALL_ANCHOR) / (1.0 - target_recall));
+	if (rf < ACORN_AUTOEF_RF_MIN)
+		rf = ACORN_AUTOEF_RF_MIN;
+	if (rf > ACORN_AUTOEF_RF_MAX)
+		rf = ACORN_AUTOEF_RF_MAX;
+
+	ef = Max((double) ACORN_AUTOEF_EF_MIN, ACORN_AUTOEF_EF_PER_SEL * sel) * rf;
+
+	if (ef < (double) ACORN_AUTOEF_EF_MIN)
+		ef = ACORN_AUTOEF_EF_MIN;
+	if (ef > (double) ACORN_AUTOEF_EF_MAX)
+		ef = ACORN_AUTOEF_EF_MAX;
+	return (int) (ef + 0.5);
+}
+
 AcornT2StreamScan *
 acorn_t2_stream_begin(Relation index, Datum query,
 					   ScanKey keys, int nkeys, int ef_search,
@@ -1992,6 +2087,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	int					meta_dims = 0;
 	uint16				meta_flags = 0;
 	HASHCTL				info;
+	AcornT2Histogram	hist;
 
 	(void) snapshot;			/* visibility handled by executor post-fetch */
 
@@ -2011,13 +2107,27 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		? acorn_resolve_direct_dist(index) : NULL;
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
-						 &meta_dims, &meta_flags, &s->payload_m))
+						 &meta_dims, &meta_flags, &s->payload_m, &hist))
 	{
 		s->exhausted = true;		/* empty index */
 		MemoryContextSwitchTo(old);
 		return s;
 	}
 	s->m = m;
+
+	/*
+	 * Auto-ef (Priority 3): when pg_acorn.target_recall > 0 and this index
+	 * carries a filter histogram and the scan has filter predicates, derive the
+	 * expansion budget from the estimated selectivity instead of the manual
+	 * ef_search.  Falls back to the passed ef_search otherwise (target_recall=0,
+	 * pre-P3 index with no histogram, or an unfiltered scan).
+	 */
+	if (acorn_target_recall > 0.0 && hist.nbounds > 0 && nkeys > 0)
+	{
+		double	sel = acorn_estimate_selectivity(keys, nkeys, &hist);
+
+		s->ef_search = acorn_auto_ef(sel, acorn_target_recall);
+	}
 
 	/*
 	 * Vector co-location: the layout flag comes from the META PAGE (set at

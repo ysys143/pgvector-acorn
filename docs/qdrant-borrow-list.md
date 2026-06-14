@@ -56,7 +56,21 @@ Original analysis below.
 - Impact: MEDIUM — fixes the extremes (very small / very large filtered sets)
   where a fixed graph path is wrong.
 
-## Priority 3 — selectivity-aware default ef (auto recall targeting)
+## Priority 3 — selectivity-aware default ef (auto recall targeting) — DONE
+
+SHIPPED as `pg_acorn.target_recall` (default 0 = off / manual ef_search). When
+> 0, a Tier-2 scan estimates the query's filter selectivity from a build-time
+equi-depth histogram of the filter column (stored in the meta page, zero-bounds
+back-compat sentinel like payload_m) and derives the expansion budget from a
+coarse MONOTONE heuristic (acorn_am.h): `ef = clamp(max(EF_MIN, EF_PER_SEL*sel)
+* sqrt((1-0.95)/(1-target)))`. Selectivity source = index-resident histogram
+(decided with the user: self-contained, no ANALYZE dependency, Qdrant
+payload-index parallel; v1 int4 filter columns, others fall back to manual ef).
+Mapping = coarse heuristic (decided with the user: dataset-agnostic, no
+single-fixture overfit; a convenience that removes per-selectivity ef tuning,
+NOT a recall guarantee). Decoupled from the cost model (P2) — auto-ef only sets
+the runtime ef, never the plan choice. Test `tier2_auto_ef.sql`. Original
+analysis below.
 
 - Qdrant: ef defaults to ef_construct and is applied automatically; users
   rarely hand-tune.
@@ -118,9 +132,10 @@ that cost debugging time during Phase C/D. Original analysis below.
    low-risk measurement substrate the other two need to be calibratable and
    verifiable (you cannot calibrate a recall-aware cost model or auto-ef without
    per-scan visibility into expansions / path / cache hits).
-3. Priority 3 (auto-ef) — next. Uses the recall-vs-(ef,sel,gamma,payload_m)
-   surface; telemetry validates it. Lower risk than P2.
-4. Priority 2 (recall-aware cost) — last. Documented regression risk (live-ef
-   cost destabilized mid-band plans; see acorn_cost.c). Do it once P3's
-   calibration + P5's telemetry de-risk it.
+3. Priority 3 (auto-ef) — DONE. Index-resident histogram + coarse heuristic;
+   target_recall GUC. Decoupled from the cost model.
+4. Priority 2 (recall-aware cost) — next. Documented regression risk (live-ef
+   cost destabilized mid-band plans; see acorn_cost.c). P3's histogram +
+   selectivity estimator and P5's telemetry now de-risk it (the same
+   index-resident selectivity can feed the cost model).
 5. Priority 4 (gate payload links by cardinality) — opportunistic.
