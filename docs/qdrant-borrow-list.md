@@ -81,7 +81,17 @@ Original analysis below.
 - Impact: LOW-MEDIUM — negligible for low-cardinality filters (bucket 0-99);
   matters for sparse/high-cardinality payloads.
 
-## Priority 5 — observability parity (per-scan path telemetry)
+## Priority 5 — observability parity (per-scan path telemetry) — DONE (7a1d51d)
+
+SHIPPED as `pg_acorn_scan_stats()` / `pg_acorn_scan_stats_reset()`: backend-local
+cumulative Tier-2 scan counters (scans, expansions, code-cache hits, element-page
+loads, exact re-rank reads, emits). `cc_hits/(cc_hits+loads)` is the code-cache
+hit ratio. Always-on increments at the traversal sites (where the compiled-out
+`ACORN_CC_DEBUG` counters already sat); test `tier2_scan_stats.sql`. Pulled ahead
+of Priorities 2/3 deliberately — it is the low-risk measurement substrate that
+makes a recall-aware cost model (P2) and auto-ef (P3) calibratable and
+verifiable, and it closes the visibility gaps (stale-recall, cache-residency)
+that cost debugging time during Phase C/D. Original analysis below.
 
 - Qdrant: per-segment counters (filtered_plain / filtered_large_cardinality /
   filtered_exact / ...) via telemetry (`hnsw.rs:1445-1459`).
@@ -102,7 +112,15 @@ Original analysis below.
 
 ## Recommended sequence
 
-1. Priority 1 (`acorn_payload_m`) — highest impact, high feasibility, directly
-   closes the high-selectivity latency gap that Phase D surfaced.
-2. Priority 2 (recall-aware cost) — fixes the extremes.
-3. Priorities 3/5 — usability + observability.
+1. Priority 1 (`acorn_payload_m`) — DONE. Highest impact; closed the
+   high-selectivity latency gap Phase D surfaced.
+2. Priority 5 (per-scan telemetry) — DONE. Reordered ahead of 2/3: it is the
+   low-risk measurement substrate the other two need to be calibratable and
+   verifiable (you cannot calibrate a recall-aware cost model or auto-ef without
+   per-scan visibility into expansions / path / cache hits).
+3. Priority 3 (auto-ef) — next. Uses the recall-vs-(ef,sel,gamma,payload_m)
+   surface; telemetry validates it. Lower risk than P2.
+4. Priority 2 (recall-aware cost) — last. Documented regression risk (live-ef
+   cost destabilized mid-band plans; see acorn_cost.c). Do it once P3's
+   calibration + P5's telemetry de-risk it.
+5. Priority 4 (gate payload links by cardinality) — opportunistic.

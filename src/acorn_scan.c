@@ -17,8 +17,10 @@
 #include <float.h>
 #include <math.h>
 
+#include "access/htup_details.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
+#include "funcapi.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -35,6 +37,38 @@
 #include "acorn_t2_page.h"
 #include "acorn_dist.h"
 #include "acorn_codecache.h"
+
+/* -----------------------------------------------------------------------
+ * Per-scan telemetry (Qdrant-style path counters; borrow-list Priority 5)
+ *
+ * Backend-local cumulative counters for Tier-2 in-filter (AM) scans, bumped
+ * live at the traversal sites.  Always on: a handful of uint64 adds per
+ * neighbor, dwarfed by the distance work at the same sites.  No shared memory,
+ * no atomics — each backend sees only its own scans.  Reset, run a query, read
+ * = per-query telemetry; or read cumulative across a session.
+ *
+ *   scans       Tier-2 stream scans begun
+ *   expansions  graph node expansions (the ef_search work budget consumed)
+ *   cc_hits     code-cache discovery hits (neighbor served from shared cache)
+ *   loads       element-page reads (cache miss, or cache not serving / inline)
+ *   reranks     exact re-rank reads (approx-ordering correction)
+ *   emits       tuples returned
+ *
+ * cc_hits/(cc_hits+loads) is the code-cache hit ratio when the cache serves the
+ * scan; on an inline or plain scan cc_hits is 0 and loads counts every neighbor
+ * read.  Tier-1 (hook/CustomScan) traversal is NOT counted here.
+ * ----------------------------------------------------------------------- */
+typedef struct AcornScanStats
+{
+	uint64		scans;
+	uint64		expansions;
+	uint64		cc_hits;
+	uint64		loads;
+	uint64		reranks;
+	uint64		emits;
+} AcornScanStats;
+
+static AcornScanStats acorn_scan_cum;
 
 /* -----------------------------------------------------------------------
  * Code-cache read pipelining
@@ -1596,6 +1630,7 @@ acorn_t2_rerank_one(AcornT2StreamScan *s)
 							   ItemPointerGetBlockNumber(&rn->elem.indextid),
 							   ItemPointerGetOffsetNumber(&rn->elem.indextid),
 							   &heaptid, &deleted, &fval, NULL, NULL);
+	acorn_scan_cum.reranks++;	/* telemetry: exact re-rank read */
 	if (deleted)
 	{
 		pfree(rn);
@@ -1861,6 +1896,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 #ifdef ACORN_CC_DEBUG
 				s->dbg_cc_hits++;
 #endif
+				acorn_scan_cum.cc_hits++;	/* telemetry */
 				double	alb = acorn_t2_inline_lb(s, ad, hit.scale);
 				bool	cpasses = (hit.flags & ACORN_CC_DELETED) == 0 &&
 					acorn_t2_eval_filter(s->keys, s->nkeys, hit.filter_val);
@@ -1894,6 +1930,7 @@ acorn_t2_stream_expand(AcornT2StreamScan *s, const AcornElem *ce)
 #ifdef ACORN_CC_DEBUG
 		s->dbg_loads++;
 #endif
+		acorn_scan_cum.loads++;		/* telemetry: element-page read */
 		nd = acorn_t2_load_node(s, nblkno, noffno,
 								 &nheaptid, &ndeleted, &nfilter_val,
 								 &n_nbrtid, &n_level);
@@ -1966,6 +2003,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 	s->ef_search    = ef_search;
 	s->n_expansions = 0;
 	s->exhausted    = false;
+	acorn_scan_cum.scans++;		/* telemetry: count every Tier-2 scan begun */
 	s->member_first = acorn_member_first;
 	s->buffered     = acorn_buffered_emission;
 	acorn_load_dist_proc(index, &s->dist_proc);
@@ -2229,6 +2267,7 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			else
 				acorn_t2_stream_expand(s, &ce);
 			s->n_expansions++;
+			acorn_scan_cum.expansions++;	/* telemetry */
 			continue;
 		}
 
@@ -2270,6 +2309,7 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 				s->rx_count--;
 				*heaptid_out = rn->elem.heaptid;
 				pfree(rn);
+				acorn_scan_cum.emits++;		/* telemetry */
 #ifdef ACORN_CC_DEBUG
 				s->dbg_emits++;
 				if (!s->dbg_dumped)
@@ -2300,6 +2340,7 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			AcornPQNode *rn = (AcornPQNode *) pairingheap_remove_first(s->R);
 			*heaptid_out = rn->elem.heaptid;
 			pfree(rn);
+			acorn_scan_cum.emits++;		/* telemetry */
 #ifdef ACORN_CC_DEBUG
 			s->dbg_emits++;
 			if (!s->dbg_dumped)
@@ -2318,4 +2359,45 @@ acorn_t2_stream_next(AcornT2StreamScan *s, ItemPointerData *heaptid_out)
 			return true;
 		}
 	}
+}
+
+/* -----------------------------------------------------------------------
+ * Telemetry SQL interface (borrow-list Priority 5)
+ *
+ * pg_acorn_scan_stats() -> one record of the backend-local cumulative Tier-2
+ * scan counters; pg_acorn_scan_stats_reset() zeroes them.  Both PARALLEL
+ * RESTRICTED: the counters are backend-local, so a parallel worker's scans
+ * accumulate in the worker and are invisible to the leader's snapshot.
+ * ----------------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(pg_acorn_scan_stats);
+PG_FUNCTION_INFO_V1(pg_acorn_scan_stats_reset);
+
+Datum
+pg_acorn_scan_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) acorn_scan_cum.scans);
+	values[1] = Int64GetDatum((int64) acorn_scan_cum.expansions);
+	values[2] = Int64GetDatum((int64) acorn_scan_cum.cc_hits);
+	values[3] = Int64GetDatum((int64) acorn_scan_cum.loads);
+	values[4] = Int64GetDatum((int64) acorn_scan_cum.reranks);
+	values[5] = Int64GetDatum((int64) acorn_scan_cum.emits);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum
+pg_acorn_scan_stats_reset(PG_FUNCTION_ARGS)
+{
+	memset(&acorn_scan_cum, 0, sizeof(acorn_scan_cum));
+	PG_RETURN_VOID();
 }

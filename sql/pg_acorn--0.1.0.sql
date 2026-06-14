@@ -149,6 +149,35 @@ COMMENT ON FUNCTION pg_acorn_code_cache_reset() IS
 
 REVOKE ALL ON FUNCTION pg_acorn_code_cache_reset() FROM PUBLIC;
 
+-- Per-scan telemetry (Priority 5): backend-local cumulative Tier-2 scan path
+-- counters.  Backend-local (each connection sees only its own scans), so these
+-- are PARALLEL RESTRICTED.  Typical use: SELECT pg_acorn_scan_stats_reset();
+-- run a query; SELECT * FROM pg_acorn_scan_stats();
+
+CREATE FUNCTION pg_acorn_scan_stats(
+    OUT scans       int8,
+    OUT expansions  int8,
+    OUT cc_hits     int8,
+    OUT loads       int8,
+    OUT reranks     int8,
+    OUT emits       int8)
+    RETURNS record
+    AS 'MODULE_PATHNAME', 'pg_acorn_scan_stats'
+    LANGUAGE C VOLATILE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION pg_acorn_scan_stats() IS
+    'Backend-local cumulative acorn_hnsw Tier-2 scan counters: scans begun, '
+    'graph expansions, code-cache hits, element-page loads, exact re-rank reads, '
+    'tuples emitted. cc_hits/(cc_hits+loads) is the code-cache hit ratio.';
+
+CREATE FUNCTION pg_acorn_scan_stats_reset()
+    RETURNS void
+    AS 'MODULE_PATHNAME', 'pg_acorn_scan_stats_reset'
+    LANGUAGE C VOLATILE PARALLEL RESTRICTED;
+
+COMMENT ON FUNCTION pg_acorn_scan_stats_reset() IS
+    'Zero this backend''s acorn_hnsw scan counters (see pg_acorn_scan_stats()).';
+
 -- GUCs (loaded via _PG_init, declared here for documentation)
 -- pg_acorn.enable_hook       boolean  default true   (Tier 1 hook)
 -- pg_acorn.default_gamma     integer  default 1      (ACORN-1 by default)

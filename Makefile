@@ -38,6 +38,7 @@ REGRESS = \
 	tier2_code_cache \
 	tier2_code_cache_dml \
 	tier2_code_cache_evict \
+	tier2_scan_stats \
 	tier2_emission_order \
 	tier2_build_mwm \
 	tier2_build_parallel \
