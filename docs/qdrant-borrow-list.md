@@ -12,7 +12,15 @@ sub-HNSW"), inline quantized vectors for paged reads (`acorn_inline_vectors` +
 the shared-memory code cache), and split layer-0 density (2*m_eff at L0 vs
 m_eff above). The list below is what remains.
 
-## Priority 1 — independent `payload_m` (split payload density from gamma)
+## Priority 1 — independent `payload_m` (split payload density from gamma) — DONE (merged 306a31d)
+
+SHIPPED as the `acorn_payload_m` reloption (additive: L0 = global_m + payload_m,
+backward-compatible via the reserved=0 symmetric sentinel). Bench
+(`bench/REPORT_payload_m.md`): payload_m=64 at gamma=2 matches gamma=4 recall at
+1.7-2.8x lower latency and a smaller index; beats Qdrant at sel 1-5%, narrows
+the gap to ~2.5x at sel 10-20%. Default unchanged (payload_m=0 symmetric).
+Original analysis below.
+
 
 - Qdrant: separate `m` (global links) and `payload_m` (per-payload-value
   links), tuned independently (`hnsw.rs:456-463`).
