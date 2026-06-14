@@ -209,25 +209,30 @@ visit_once(HTAB *visited, const ItemPointerData *tid)
 static bool
 acorn_meta_read(Relation index, BlockNumber *entry_blkno,
 				OffsetNumber *entry_offno, int *entry_level, int *m_out,
-				int *dims_out, uint16 *acorn_flags_out)
+				int *dims_out, uint16 *acorn_flags_out, int *payload_m_out)
 {
 	Buffer		buf;
 	Page		page;
 	AcornT2MetaPage meta;
+	int			m;
 
 	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	meta = AcornT2PageGetMeta(page);
 
+	m = (int) meta->hnsw.m;
 	*entry_blkno = meta->hnsw.entryBlkno;
 	*entry_offno = meta->hnsw.entryOffno;
 	*entry_level = (int) meta->hnsw.entryLevel;
-	*m_out = (int) meta->hnsw.m;
+	*m_out = m;
 	if (dims_out)
 		*dims_out = (int) meta->hnsw.dimensions;
 	if (acorn_flags_out)
 		*acorn_flags_out = meta->acorn_flags;
+	/* Decode the additive payload-half sentinel: 0 = symmetric = global_m (= m). */
+	if (payload_m_out)
+		*payload_m_out = (meta->payload_m == 0) ? m : (int) meta->payload_m;
 
 	UnlockReleaseBuffer(buf);
 	return (*entry_blkno != InvalidBlockNumber);
@@ -302,7 +307,15 @@ acorn_get_neighbors(Relation index, BlockNumber nbr_blkno, OffsetNumber nbr_offn
 
 	tids  = HnswNeighborTupleGetTids(ntup);
 	start = HnswNeighborStart(m, level, layer);
-	count = Min(HnswNeighborCount(m, layer), max_neighbors);
+	/*
+	 * Layer width from the element's geometry: upper layers hold m (= global_m)
+	 * slots; layer 0 holds global_m + payload_m, which equals the whole tuple
+	 * minus the upper layers (count - level*m).  This derives the additive
+	 * payload-half width WITHOUT a separate payload_m arg, and reduces to the
+	 * symmetric 2*m at layer 0 when payload_m == m.
+	 */
+	count = (layer == 0) ? ((int) ntup->count - level * m) : m;
+	count = Min(count, max_neighbors);
 
 	/*
 	 * Skip (not stop at) invalid slots: with acorn_payload_edges the layer-0
@@ -762,7 +775,7 @@ acorn_scan_execute(AcornScanState *state, Relation index, Relation heap,
 		? acorn_resolve_direct_dist(index) : NULL;
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
-						 NULL, NULL))
+						 NULL, NULL, NULL))
 		return 0;			/* empty index */
 
 	/* Greedy descent to layer 1 (skipping to base layer entry point) */
@@ -897,7 +910,7 @@ acorn_stream_begin(Relation index, Datum query, Snapshot snapshot,
 	acorn_load_dist_proc(index, &s->dist_proc);
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
-						 NULL, NULL))
+						 NULL, NULL, NULL))
 	{
 		s->exhausted = true;		/* empty index */
 		MemoryContextSwitchTo(old);
@@ -1036,7 +1049,8 @@ struct AcornT2StreamScan
 	FmgrInfo		dist_proc;
 	AcornDistFn		dist_direct;	/* fmgr bypass kernel; NULL = use dist_proc */
 	Datum			query;
-	int				m;
+	int				m;				/* global_m (= m_eff); upper-layer + L0 global half */
+	int				payload_m;		/* L0 payload-half width (= m when symmetric) */
 	int				ef_search;		/* expansion budget: max node expansions */
 	int				n_expansions;	/* expansions used so far */
 	pairingheap	   *C;			/* failing candidates to expand (min-heap) */
@@ -1373,7 +1387,7 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 	ItemPointerData tids_local[HNSW_MAX_NEIGHBORS];
 	bool			covered[HNSW_MAX_NEIGHBORS] = {false};
 	int				n_c = 0;
-	int				layer0_n = HnswGetLayerM(s->m, 0);
+	int				layer0_n = acorn_t2_l0_width(s->m, s->payload_m);
 	BlockNumber		nbr_blkno;
 	OffsetNumber	nbr_offno;
 	ItemPointerData next_tid;
@@ -1420,7 +1434,8 @@ acorn_t2_stream_expand_inline(AcornT2StreamScan *s, const AcornElem *ce)
 		{
 			HnswNeighborTuple	ntup = (HnswNeighborTuple)
 				PageGetItem(page, PageGetItemId(page, coff));
-			int					level  = (int) ntup->count / s->m - 2;
+			int					level  = acorn_t2_level_from_count((int) ntup->count,
+															   s->m, s->payload_m);
 			int					start0 = HnswNeighborStart(s->m, level, 0);
 			ItemPointerData	   *tids   = HnswNeighborTupleGetTids(ntup);
 
@@ -1958,7 +1973,7 @@ acorn_t2_stream_begin(Relation index, Datum query,
 		? acorn_resolve_direct_dist(index) : NULL;
 
 	if (!acorn_meta_read(index, &entry_blkno, &entry_offno, &entry_level, &m,
-						 &meta_dims, &meta_flags))
+						 &meta_dims, &meta_flags, &s->payload_m))
 	{
 		s->exhausted = true;		/* empty index */
 		MemoryContextSwitchTo(old);

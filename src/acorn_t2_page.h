@@ -20,6 +20,69 @@
 
 #include "hnsw_compat.h"	/* neighbor tuple, page opaque, meta, all macros */
 
+/* -----------------------------------------------------------------------
+ * Tier-2 neighbor-array geometry (additive acorn_payload_m).
+ *
+ * pgvector's symmetric layout stores HnswGetLayerM(m, 0) = 2*m slots at
+ * layer 0 and m at every upper layer, for (level+2)*m total — see the macros
+ * in hnsw_compat.h.  Tier-2 generalizes layer 0 to an INDEPENDENT payload
+ * half: global_m global-nearest slots + payload_m payload slots, so
+ *
+ *   layer-0 width   = global_m + payload_m
+ *   total slots     = (level+1)*global_m + payload_m
+ *   level recovery  = (count - payload_m) / global_m - 1
+ *
+ * global_m stays the per-(upper-)layer stride, so HnswNeighborStart(global_m,
+ * level, layer) = (level-layer)*global_m is UNCHANGED — only the layer-0
+ * WIDTH grows.  These helpers REDUCE to the pgvector macros exactly when
+ * payload_m == global_m (the symmetric / legacy case):
+ *
+ *   l0_width:       global_m + global_m            = 2*global_m   = HnswGetLayerM(m,0)
+ *   total_slots:    (level+1)*global_m + global_m  = (level+2)*global_m
+ *   level_from_cnt: (cnt - global_m)/global_m - 1  = cnt/global_m - 2
+ *
+ * Do NOT touch hnsw_compat.h's macros — Tier-1 / pgvector-compat readers use
+ * them.  These live here, Tier-2 only.
+ * ----------------------------------------------------------------------- */
+
+/* Layer-0 slot-array width (global half + payload half). */
+static inline int
+acorn_t2_l0_width(int global_m, int payload_m)
+{
+	return global_m + payload_m;
+}
+
+/* Slots stored for a given layer (layer 0 = l0_width, upper layers = global_m). */
+static inline int
+acorn_t2_layer_m(int layer, int global_m, int payload_m)
+{
+	return (layer == 0) ? acorn_t2_l0_width(global_m, payload_m) : global_m;
+}
+
+/* Total neighbor TID slots for an element whose highest layer is `level`. */
+static inline int
+acorn_t2_total_slots(int level, int global_m, int payload_m)
+{
+	return (level + 1) * global_m + payload_m;
+}
+
+/* Recover an element's highest layer from a neighbor tuple's total slot count. */
+static inline int
+acorn_t2_level_from_count(int count, int global_m, int payload_m)
+{
+	return (count - payload_m) / global_m - 1;
+}
+
+/*
+ * On-disk size of a (non-inline) Tier-2 neighbor tuple: header + the
+ * acorn_t2_total_slots TID array.  Reduces to HNSW_NEIGHBOR_TUPLE_SIZE(level,
+ * m_eff) when payload_m == global_m.
+ */
+#define ACORN_T2_NEIGHBOR_TUPLE_SIZE(level, global_m, payload_m) \
+	MAXALIGN(sizeof(HnswNeighborTupleData) + \
+			 (Size) acorn_t2_total_slots((level), (global_m), (payload_m)) * \
+			 sizeof(ItemPointerData))
+
 /*
  * Tier 2 element tuple.
  *
@@ -170,11 +233,17 @@ StaticAssertDecl(sizeof(AcornT2InlineContData) == 24,
 #define AcornT2InlineEntryAt(base, i, esz) \
 	((AcornT2InlineEntry *) ((char *)(base) + (Size)(i) * (esz)))
 
-/* Max inline entries co-located with a (level, m_eff) neighbor tuple */
+/*
+ * Max inline entries co-located with a neighbor tuple whose TID-slot array
+ * holds acorn_t2_total_slots(level, global_m, payload_m) slots.  Reduces to
+ * the legacy (level+2)*m_eff form when payload_m == global_m.
+ */
 static inline int
-acorn_t2_inline_primary_cap(int level, int m_eff, Size entry_size)
+acorn_t2_inline_primary_cap(int level, int global_m, int payload_m,
+							Size entry_size)
 {
-	Size base = ACORN_T2_INLINE_HDR_OFFSET((Size) (level + 2) * m_eff)
+	Size base = ACORN_T2_INLINE_HDR_OFFSET(
+					(Size) acorn_t2_total_slots(level, global_m, payload_m))
 		+ sizeof(AcornT2InlineHdrData);
 
 	if (base >= HNSW_MAX_SIZE)
@@ -189,9 +258,14 @@ acorn_t2_inline_cont_cap(Size entry_size)
 	return (int) ((HNSW_MAX_SIZE - sizeof(AcornT2InlineContData)) / entry_size);
 }
 
-/* On-disk tuple sizes (both are MAXALIGN multiples by construction) */
-#define ACORN_T2_INLINE_NTUP_SIZE(level, m_eff, n_here, esz) \
-	(ACORN_T2_INLINE_HDR_OFFSET((Size) ((level) + 2) * (m_eff)) + \
+/*
+ * On-disk tuple sizes (both are MAXALIGN multiples by construction).  The
+ * inline neighbor tuple's TID-slot array holds acorn_t2_total_slots; reduces
+ * to (level+2)*m_eff when payload_m == global_m.
+ */
+#define ACORN_T2_INLINE_NTUP_SIZE(level, global_m, payload_m, n_here, esz) \
+	(ACORN_T2_INLINE_HDR_OFFSET( \
+		(Size) acorn_t2_total_slots((level), (global_m), (payload_m))) + \
 	 sizeof(AcornT2InlineHdrData) + (Size) (n_here) * (esz))
 
 #define ACORN_T2_INLINE_CONT_SIZE(n_here, esz) \
@@ -214,7 +288,15 @@ typedef struct AcornT2MetaPageData
 {
 	HnswMetaPageData hnsw;		/* prefix identical to pgvector 0.8.0 */
 	uint16		acorn_flags;	/* ACORN_T2_META_* */
-	uint16		reserved;
+	/*
+	 * payload_m: resolved layer-0 payload-half width (additive acorn_payload_m).
+	 * Sentinel 0 = SYMMETRIC: payload half = global half = meta->hnsw.m, i.e.
+	 * the legacy 2*m layer-0 layout.  Stored 0 whenever payload_m == global_m
+	 * so pre-payload_m indexes (which read zeros from a PageInit'd page) keep
+	 * working with no migration.  0 can therefore never mean "0 payload edges";
+	 * that case is acorn_payload_edges = false.
+	 */
+	uint16		payload_m;
 } AcornT2MetaPageData;
 typedef AcornT2MetaPageData *AcornT2MetaPage;
 
