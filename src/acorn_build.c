@@ -4265,8 +4265,15 @@ acorn_parallel_scan_and_insert(Relation heap, Relation index,
 			(errmsg("acorn_hnsw %s processed %.0f tuples",
 					progress ? "leader" : "worker", reltuples)));
 
-	/* Notify leader (pass 1 done) */
-	ConditionVariableSignal(&shared->workersdonecv);
+	/*
+	 * Notify ALL waiters (pass 1 done).  Broadcast, not Signal: the pass-2
+	 * entry barrier below has every other participant sleeping on this same CV
+	 * waiting for nparticipantsdone to reach nparticipants.  Signal wakes only
+	 * one, so when the final participant finishes pass 1 only a single worker
+	 * re-checks the condition and enters pass 2 -- the rest sleep forever and
+	 * pass 2 runs on 2-3 cores instead of all of them.
+	 */
+	ConditionVariableBroadcast(&shared->workersdonecv);
 
 	/*
 	 * B3 two-pass payload edges: once EVERY participant has finished pass 1
@@ -4310,11 +4317,12 @@ acorn_parallel_scan_and_insert(Relation heap, Relation index,
 			}
 		}
 
-		/* Pass 2 done: the leader waits on this before flushing. */
+		/* Pass 2 done: the leader waits on this before flushing.  Broadcast so
+		 * the leader (and any other waiter) reliably re-checks pass2done. */
 		SpinLockAcquire(&shared->mutex);
 		shared->pass2done++;
 		SpinLockRelease(&shared->mutex);
-		ConditionVariableSignal(&shared->workersdonecv);
+		ConditionVariableBroadcast(&shared->workersdonecv);
 	}
 
 	if (bs.graph_ctx)
