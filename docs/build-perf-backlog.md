@@ -149,9 +149,39 @@ pass-1(기본 그래프, 이웃 32개)이 **~19분**으로 인터리브 insert(~
 - 신규 단언 `stress_no_phantom_tuples`(4워커/1MB-arena stress 빌드 후 `reltuples == count(*)`): DEAD 구멍이
   phantom 튜플로 새면 실패. 기존 spill/stress/entry recall parity가 mid-spill hole 손상 1차 가드.
 
-### 측정 (VM 예정, `feat/build-perf-atomic`)
-10M `tv_items` 재사용, m=16/efc=64/gamma=2/payload_m=64/non-inline/mwm=64GB/workers=30.
-- **N2 후**(two_pass on, max_card≈1M, visit_cap≈4000): pass-2 직렬 꼬리(>40분) → 수 분 기대, pass-2 idle%↓,
-  활성 100%-CPU 백엔드 2→다수. A/B recall ±tol.
-- **N1 후**(two_pass off, 인터리브): 98분 회귀 제거(이상적으로 OLD 87분 미만), idle%가 88%(LWLock)도
-  16%(spin)도 아닌 건전한 중간.
+### VM 실측 결과 (2026-06-16, 10M `tv_items`, m=16/efc=64/gamma=2/payload_m=64/non-inline/mwm=64GB/workers=30)
+
+`tv_items` 분포는 **균일** — 100 bucket × 각 ~100K행(min 61820, max 152929). 1차 진단의 "거대 1M 파티션"은
+이 픽스처에 **존재하지 않음** → N2 max_card 게이트는 여기서 no-op. 측정으로 1·2차 가정이 줄줄이 틀렸음이 드러남.
+
+| 빌드 | wall-time | 판정 |
+|------|-----------|------|
+| OLD (baseline, f0a3308) | 87분 | 기준 |
+| B1+B2 (글로벌 atomic) | 98분 | 회귀 |
+| **N1 (배치예약, 인터리브)** | **115분** | **회귀 악화 → revert(50b3915)** |
+| **N4 (two-pass + broadcast + visit_cap=4000)** | **88분** | **≈ OLD (빌드시간 개선 없음)** |
+
+N4 분해: pass-1(기본그래프, 병렬) 19.5분 + pass-2(payload, 병렬) ~52분 + 직렬 flush/WAL-log(`log_newpage_range`) ~16분.
+
+### 발견 3 (핵심) — pass-2 "직렬 꼬리"의 진짜 원인은 CV 배리어 버그 (N4가 수정)
+1차의 "pass-2 직렬 꼬리"는 거대 파티션도, 무계 backfill도 아니었다. **라이브 gdb**로 확정:
+- 워커의 `visit_cap`은 4000으로 **정상 전파**(GUC 문제 아님), search_partition도 유계로 빠름.
+- 그런데 `pass2_next`가 13분에 488K/10M(4.9%), `pass2done=0`, **워커 28개가 `ParallelCreateIndexScan` 배리어에서 잠듦, 2~3개만 실행**.
+- 원인: pass-1→pass-2 진입 배리어가 `ConditionVariableSignal`(하나만 깨움)을 사용. 31개 참가자가 같은 CV에서
+  자는데 마지막 워커 신호가 **딱 1개만 깨움** → 나머지 ~28개 영원히 잠듦 → pass-2가 2~3코어로 직렬화.
+  (무계 루프엔 `CHECK_FOR_INTERRUPTS`도 없어 빌드가 취소 불가로 멈추기까지 함.)
+- **N4 수정**: 두 `workersdonecv` 신호를 `ConditionVariableBroadcast`로 → 전 워커가 깨어 조건 재확인 → 30워커
+  전부 pass-2 진입. 측정 후 pass-2 idle 94%/2코어 → **4%/31코어**로 정상화. **B3 이후 모든 측정이 이 버그에 오염됨.**
+
+### 결론 — two-pass는 빌드타임 레버가 아니다
+broadcast로 pass-2를 제대로 병렬화해도 총합(88분) ≈ OLD 인터리브(87분). 총 작업량(기본+payload+flush)은
+두 방식이 같고, 이제 병목은 **(a) payload 엣지 구축의 본연 연산량(~52분, 노드당 ~9ms)** + **(b) 82GB 인덱스의
+직렬 WAL-log flush(~16분, 모든 빌드 공통)**. 이번 세션의 실제 가치는 **빌드시간 단축이 아니라 N4 동시성 버그
+수정**(정확성·강건성)과 N2/N3 방어 상한(default-off).
+
+### 후속 과제 (진짜 레버 후보)
+- **flush/WAL-log 병렬화 or `wal_level=minimal` 경로**: ~16분 직렬 단계. 인터리브·two-pass 공통이라 가장 광범위.
+- **payload 엣지 비용 절감**: 노드당 ~9ms(파티션 탐색 + ≤64 역방향 엣지 diversify). diversify/역방향 비용 분석.
+- **B1/B2 atomic allocator/entry 회귀(98분 vs OLD 87)**: N1 revert는 B1 상태로만 복귀. 완전 제거하려면 B1/B2도
+  revert 검토(단 B3 two-pass 인프라가 그 위에 빌드됨 — 의존성 확인 필요).
+- pass-2 work-stealing granularity=1은 broadcast 수정 후엔 문제 아님(노드당 유계 비용, 꼬리 무시 가능).
