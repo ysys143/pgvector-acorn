@@ -116,3 +116,42 @@ pass-1(기본 그래프, 이웃 32개)이 **~19분**으로 인터리브 insert(~
 - 소규모 parity 테스트(`tier2_build_two_pass.sql`)는 정확성은 보장하나 **병렬 효율은 검증 못 함** — 부하
   불균형은 대규모 + 상관 데이터에서만 드러남. 정확성 게이트와 **별도로 perf 회귀 측정**이 필요.
 - 계획의 "코드 먼저, 측정으로 검증"이 정확히 이 결함들을 잡음 — default-off GUC라 휴면 상태로 안전하게 ship.
+
+---
+
+## 2차 반복 (2026-06-16, 측정 1차 결함 → N2/N1 수정)
+
+1차 측정이 짚은 두 결함을 각각 독립 체크포인트로 수정. **모든 신규 knob default-off**(기존 동작 무변),
+각 체크포인트 docker-test green(25 + 4), 단독 `git revert` 가능. 측정은 VM 재실행 예정(이번 라운드는 코드만).
+
+### N2 — pass-2 partition-search 비용 한정 (`90353ee`)
+발견 2의 pass-2 직렬 꼬리(거대 비선택 파티션) 대응. 두 보완 장치:
+- **방문 상한 GUC `pg_acorn.build_payload_visit_cap`**(int, default 0=무한): `acorn_mem_search_partition`이
+  파티션 멤버에 거리계산한 횟수가 cap 초과 시 break. 바닥값 `Max(cap, ef)`로 결과창 미만 굶김 방지.
+  거대 파티션 1개가 pass-2를 직렬화하지 못하게 노드별 비용을 유계화.
+- **최대-카디널리티 게이트 reloption `acorn_payload_max_cardinality`**(per-index, `payload_min_cardinality`
+  대칭, default 0=off): 멤버 수 > 상한인 과대 파티션은 payload edge를 건너뛰고 글로벌-only 폴백. 거대
+  비선택 파티션(10%↑ 통과)은 글로벌 그래프로 충분하므로 **결과-중립**(huge recall ≥ ungated−0.05) —
+  효과는 빌드 시간 한정. `part_count` 배선 3곳을 `(min>0 || max>0)`로 확장(누락 시 silent no-op).
+- 신규 테스트 `tier2_payload_maxgate.sql`(skewed 픽스처, bucket 0 ~80%): filter/k 정확성, huge recall ≥
+  ungated−0.05, 소형 파티션 top-10 불변, visit_cap=200 + 4워커 병렬 빌드 완주 + recall parity ±0.05.
+- 권장 운영값: max_card ≈ N의 5-10%(10M→~500K-1M), visit_cap ≈ 4000.
+
+### N1 — 배치 fetch-add 예약 (B1 글로벌 atomic 교체) (`4d5a461`)
+발견 1의 캐시라인 바운싱 회귀 제거. per-node 글로벌 fetch-add 2개(`n_nodes`/`arena_used`)를
+**워커별 배치 예약**으로: 워커가 256 id + arena 바이트 배치를 각 1회 fetch-add로 예약 후 로컬 lock-free
+할당, 소진 시 재예약. atomic 트래픽 ~256배↓.
+- **HOLE 처리(핵심 정확성):** 배치가 카운터를 실기록 수 너머로 전진 → 마지막 배치 미충전 슬롯이 구멍.
+  `begin_parallel`이 전 노드를 `ACORN_NODE_DEAD`(level=-1)로 스탬프, 성공 push가 덮음, spill(-1)은 유지.
+  모든 `0..n_nodes` 순회 사이트(build_payload_node / work-stealing pass-2 / leader pass / preassign Pass1·2 /
+  flush Pass1·2·3)가 flush와 **동일 순서로** DEAD 스킵 → `Assert(blkno==nbr_blkno)` tripwire 유지.
+- 직렬 경로(shared==NULL) 무변; spill(-1) 의미 보존(부분 배치는 버려져 DEAD 구멍 → flush 스킵).
+- 신규 단언 `stress_no_phantom_tuples`(4워커/1MB-arena stress 빌드 후 `reltuples == count(*)`): DEAD 구멍이
+  phantom 튜플로 새면 실패. 기존 spill/stress/entry recall parity가 mid-spill hole 손상 1차 가드.
+
+### 측정 (VM 예정, `feat/build-perf-atomic`)
+10M `tv_items` 재사용, m=16/efc=64/gamma=2/payload_m=64/non-inline/mwm=64GB/workers=30.
+- **N2 후**(two_pass on, max_card≈1M, visit_cap≈4000): pass-2 직렬 꼬리(>40분) → 수 분 기대, pass-2 idle%↓,
+  활성 100%-CPU 백엔드 2→다수. A/B recall ±tol.
+- **N1 후**(two_pass off, 인터리브): 98분 회귀 제거(이상적으로 OLD 87분 미만), idle%가 88%(LWLock)도
+  16%(spin)도 아닌 건전한 중간.
