@@ -8,7 +8,6 @@
 /* GUC variables declared in pg_acorn.c */
 extern bool acorn_enable_hook;
 extern int  acorn_default_gamma;
-extern bool acorn_enable_2hop;
 extern int  acorn_ef_search;
 extern double acorn_target_recall;
 extern bool acorn_member_first;

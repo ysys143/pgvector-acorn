@@ -21,9 +21,6 @@ bool acorn_enable_hook = true;
 /* GUC: default ACORN-gamma value for new acorn_hnsw indexes */
 int acorn_default_gamma = ACORN_DEFAULT_GAMMA;
 
-/* GUC: enable 2-hop expansion for in-filter scans (experimental) */
-bool acorn_enable_2hop = false;
-
 /* GUC: runtime ef_search cap for acorn_hnsw (Tier 2) streaming scans */
 int acorn_ef_search = ACORN_DEFAULT_EF_SEARCH;
 
@@ -164,18 +161,6 @@ _PG_init(void)
 		1,      /* default */
 		1,      /* min */
 		8,      /* max */
-		PGC_USERSET,
-		0,
-		NULL, NULL, NULL
-	);
-
-	/* GUC: pg_acorn.enable_2hop */
-	DefineCustomBoolVariable(
-		"pg_acorn.enable_2hop",
-		"Enable 2-hop NaviX-Directed expansion in acorn_hnsw in-filter scans (experimental).",
-		NULL,
-		&acorn_enable_2hop,
-		false,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL

@@ -29,7 +29,6 @@ REGRESS = \
 	tier1_hook \
 	tier2_am \
 	tier2_infilter \
-	tier2_2hop \
 	tier2_ef_search \
 	tier2_payload_edges \
 	tier2_payload_m \
