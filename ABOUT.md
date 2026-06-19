@@ -82,15 +82,15 @@ Requires: PostgreSQL 16+, pgvector 0.8.x+
 
 ## Benchmarks
 
-See [bench/](bench/) for reproducible A/B harnesses (4 scenarios, pgvector + Qdrant + pg_acorn).
+See [bench/](bench/) for reproducible harnesses (pgvector + Qdrant + pg_acorn); the consolidated verdict is [bench/COMPETITIVE_VERDICT.md](bench/COMPETITIVE_VERDICT.md).
 
 ## Documentation
 
-- [README.md](README.md) — Quick start, index types, tuning guide
-- [docs/GUIDE.md](docs/GUIDE.md) — Full user guide
-- [docs/REFERENCE.md](docs/REFERENCE.md) — GUCs, reloptions, SQL functions
-- [docs/FINDINGS.md](docs/FINDINGS.md) — Benchmark summary
-- [design/](design/) — Architecture decisions (ADRs)
+- [README.md](README.md) — Quick start, index types, tuning
+- [docs/architecture.md](docs/architecture.md) — Tier 1 / Tier 2 design
+- [bench/COMPETITIVE_VERDICT.md](bench/COMPETITIVE_VERDICT.md) — acorn vs pgvector vs Qdrant (SSOT)
+- [docs/project-log.md](docs/project-log.md) — experiment ledger (what was tried / results / open)
+- [docs/development-roadmap.md](docs/development-roadmap.md) — roadmap (1.0 gated by stabilization)
 
 ## Status
 

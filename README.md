@@ -29,7 +29,7 @@ pgvector's HNSW + post-filter strategy hits two problems:
 
 | Problem | Symptom | pg_acorn Fix |
 |---------|---------|--------------|
-| **High selectivity** | Recall drops 0.7–0.85 at 10–40% filters | Predicate-aware search preserves 0.95+ recall |
+| **Correlated filter, moderate pass-rate (10–40%)** | pgvector iterative-scan recall@10 falls to ~0.22–0.50 (measured) | Predicate-aware search holds ~0.95–1.0 |
 | **Expensive post-filter** | Must scan 1000s of rows to return top-10 | Predicate pushdown bounds traversal to relevant neighbors |
 | **Planner falls back to SeqScan** | Index ignored; no top-k guarantee | ACORN ensures top-k under any filter |
 
@@ -40,7 +40,7 @@ pgvector's HNSW + post-filter strategy hits two problems:
 | `USING hnsw (embedding)` + `pg_acorn` installed | Unchanged | Inferred from WHERE clause | Zero-migration; any integer/text filter |
 | `USING acorn_hnsw (embedding, filter_col)` | M×gamma neighbors | Required column | High-selectivity (1–40%); correlated data |
 | `USING acorn_hnsw (embedding, filter_col) WITH (acorn_payload_edges=true)` | M×gamma + same-value links | Required column | 1–5% selectivity; vector co-location desired |
-| `USING acorn_hnsw (embedding, filter_col) WITH (acorn_inline_vectors=true)` | M×gamma + quantized vectors inline | Required column | Sub-ms latency; 50M+ rows; 10–15× index size |
+| `USING acorn_hnsw (embedding, filter_col) WITH (acorn_inline_vectors=true)` | M×gamma + quantized vectors inline | Required column | Sub-ms latency; 50M+ rows; ~16–20× index size |
 
 ## When to Use pg_acorn
 
@@ -50,7 +50,7 @@ pgvector's HNSW + post-filter strategy hits two problems:
 | Filter selectivity 1–40%, correlated vectors | **acorn_hnsw + predicate** | Recall ceiling eliminated; 2–5× faster than post-filter |
 | Filter selectivity 10–40%, uncorrelated | pgvector HNSW + post-filter | pg_acorn gains small; pgvector is simpler |
 | Filter selectivity >50% | pgvector HNSW | Post-filter is cheapest path |
-| Sub-millisecond latency required | **acorn_hnsw + payload_edges + inline_vectors** | Trade 11× index size for 10× latency; measure first |
+| Sub-millisecond latency required | **acorn_hnsw + payload_edges + inline_vectors** | Trade ~16–20× index size for 10× latency; measure first |
 | 50M+ rows, memory-constrained | pgvector IVFFLAT | Use compression; pg_acorn not optimized for extreme scale |
 
 ## Tier 1 — Zero Migration
@@ -88,7 +88,7 @@ CREATE INDEX ON items USING acorn_hnsw (embedding vector_cosine_ops, category in
 
 - `acorn_payload_edges` (bool, default false): Split layer-0 neighbor slots — half global-nearest, half intra-partition edges. Makes same-category subgraph navigable on 1–5% filters without raising gamma.
 
-- `acorn_inline_vectors` (bool, default false): Store SQ8-quantized vectors + TID inline in neighbor slots. Sub-ms latency on large indexes; trades 11× index size for 10× faster scan.
+- `acorn_inline_vectors` (bool, default false): Store SQ8-quantized vectors + TID inline in neighbor slots. Sub-ms latency on large indexes; trades ~16–20× index size for 10× faster scan.
 
 - `pg_acorn.member_first` (GUC, default off): Prefer filter-passing candidates during search. Companion to `acorn_payload_edges`.
 
@@ -126,31 +126,21 @@ Requirements: PostgreSQL 16+, pgvector 0.8.x+
 
 ## Benchmarks
 
-See [bench/](bench/) for reproducible A/B harnesses against pgvector vanilla and Qdrant 1.16.
+Reproducible harnesses in [bench/](bench/) compare pg_acorn against pgvector and Qdrant 1.16 on a correlated-filter fixture.
 
-Scenarios:
-- **A**: Filter selectivity sweep (1–80%) on correlated vectors
-- **B**: Recall degradation under post-filter (pgvector CTE workaround)
-- **C**: Incremental insert stability  
-- **D**: Adversarial correlation (worst-case pgvector behavior)
+- 3-way (pgvector / Qdrant / acorn): `bench/bench3way_pg.py`, `bench/bench3way_qdrant.py` → [REPORT_3way.md](bench/REPORT_3way.md)
+- Scaling (100K / 1M / 10M): `bench/scalebench.py` → [REPORT_scale.md](bench/REPORT_scale.md)
+- Overhead decomposition: `bench/overhead_ledger.py` → [OVERHEAD_LEDGER.md](bench/OVERHEAD_LEDGER.md)
 
-Run any scenario:
-
-```bash
-cd bench
-python3 harness.py scenario_a  # selectivity sweep
-python3 harness.py scenario_b  # post-filter falloff
-```
-
-See [docs/FINDINGS.md](docs/FINDINGS.md) for summary of measured wins/losses.
+Headline (recall@10, correlated filter): acorn holds ~0.97–1.0 where pgvector's iterative scan falls to ~0.22–0.50; latency vs Qdrant is competitive at low pass-rate and INDICATIVE/unresolved at high. The single source of truth — with an explicit "what is solid vs indicative" breakdown — is [bench/COMPETITIVE_VERDICT.md](bench/COMPETITIVE_VERDICT.md).
 
 ## Documentation
 
-- [User guide](docs/GUIDE.md) — Predicate syntax, tuning, best practices
-- [Reference](docs/REFERENCE.md) — GUCs, reloptions, cost model, SQL functions
-- [Architecture](docs/ARCHITECTURE.md) — Graph layout, build algorithm, search strategy
-- [Findings & limitations](docs/FINDINGS.md) — Benchmark results, when pg_acorn wins/loses
-- [Design decisions](design/) — ADRs: why single predicate, why build-time encoding, etc.
+- [Architecture](docs/architecture.md) — Tier 1 / Tier 2 design, graph layout, scan strategy
+- [Competitive verdict](bench/COMPETITIVE_VERDICT.md) — acorn vs pgvector vs Qdrant (single source of truth)
+- [Project log](docs/project-log.md) — experiment ledger: what was tried, results, what's open
+- [Roadmap](docs/development-roadmap.md) — grand plan, tracks, and the Stabilization gate for 1.0
+- [Build-perf notes](docs/build-perf-backlog.md) · [M-ACORN findings](docs/macorn-penalty-findings.md) · [Filtered-HNSW landscape](docs/filterable-hnsw-landscape.md)
 
 ## Limitations
 
