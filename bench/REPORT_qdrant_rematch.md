@@ -53,16 +53,20 @@ queries, same exact ground truth, same `bucket < sel` semantics.
 | 10% | ef400 r0.98, 23 ms; ef800 r1.0, 65 ms | caps ~0.94 (never reaches 0.95) | Qdrant: higher recall AND faster |
 | 20% | ef800 r0.97, 139 ms | caps ~0.85-0.91 (never reaches 0.95) | Qdrant: reaches recall acorn cannot |
 
-## Verdict — honest
+## Verdict — honest  [SUPERSEDED — see top CORRECTION + bench/COMPETITIVE_VERDICT.md]
+
+> This entire verdict used pre-Z3 stale acorn data and its recall-ceiling
+> conclusion is WRONG. Post-Z3 acorn reaches 0.97-1.0 (recall PARITY with
+> Qdrant). Kept only as the flawed original record. For the current position
+> see `bench/COMPETITIVE_VERDICT.md`.
 
 **Qdrant's filtered HNSW beats acorn on this fixture.** Two distinct gaps:
 
-1. Recall ceiling (the solid finding — recall is deterministic): on the
-   correlated fixture acorn's ACORN-gamma in-filter traversal (gamma=2, the
-   max the HNSW page budget allows at m=16) caps at ~0.91-0.94 at sel 10/20%
-   and cannot reach 0.95+ at any ef. Qdrant reaches 0.97-1.0. This is an
-   algorithmic limitation of acorn's in-filter graph on filters that
-   correlate with vector position.
+1. ~~Recall ceiling~~ **(WRONG — stale pre-Z3 data).** The original text claimed
+   acorn "caps at ~0.91-0.94 at sel 10/20% and cannot reach 0.95+ at any ef".
+   This was the emission-order bug Z3 fixed, NOT a graph limit — current acorn
+   reaches 0.97-1.0 (see the CORRECTION at the top of this file). There is no
+   recall ceiling.
 2. Latency at matched recall: Qdrant is ~2-9x faster at sel 2-5%. (Caveat: the
    acorn latencies here are from a contention-noisy thesis run and predate the
    cache/prefetch work; the recall-ceiling gap is the cleaner, load-independent

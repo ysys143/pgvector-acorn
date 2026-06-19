@@ -1,5 +1,9 @@
 # 3-way filtered-KNN benchmark — pgvector native vs Qdrant vs pg_acorn
 
+> **2026-06-19:** latency/throughput here is INDICATIVE (contended host). For the
+> reconciled acorn-vs-Qdrant verdict cite `bench/COMPETITIVE_VERDICT.md`. (The
+> roadmap's "1.6-4.4x" comes from `REPORT_qdrant_final.md`, not this file.)
+
 Date: 2026-06-15. Harnesses: `bench/bench3way_pg.py` (psycopg from host),
 `bench/bench3way_qdrant.py` (httpx from host), `bench/bench3way_report.py`
 (extraction). Results: `bench/results_3way_pg.json`, `bench/results_3way_qdrant.json`.

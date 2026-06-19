@@ -27,7 +27,7 @@
 
 | 한계 | 근거 | 영향 트랙 |
 |------|------|----------|
-| 고선택도에서 Qdrant 대비 **1.6~4.4배 느림** | 3-way 벤치 | C |
+| 고선택도+matched-recall에서 Qdrant latency 갭 (**배수 미해결/INDICATIVE**) | `REPORT_qdrant_final`(250K, cross-substrate)·`COMPETITIVE_VERDICT` | C |
 | 대용량 빌드 **메모리 벽**: 그래프가 mwm 초과→on-disk 스필 | 2M@8GB·10M@32GB 실측 | B |
 | 병렬 빌드 **extension-lock 라이브락** (스필+다워커) | 10M/8워커 분당 2블록 정체 | B |
 | atomic allocator 회귀 (병렬 98 vs OLD 87분) | 빌드-perf 캠페인 | B |
@@ -73,12 +73,17 @@
 - **B4. spill 경로 견고화** — mwm 초과 시 graceful degrade (현재는 병렬 라이브락/직렬 초저속).
 
 ### Track C — 경쟁 갭: 고선택도 latency (승부처)
-*왜*: 측정상 고선택도에서 Qdrant 1.6~4.4배 느림 — 유일하게 명확한 패배 지점.
+*왜*: **recall은 Qdrant와 parity**(Z3 후 0.97-1.0). 남은 건 **고선택도+matched-recall의 latency
+갭** — 단 **크기 미해결**(INDICATIVE, cross-substrate). 권위 판정은 `bench/COMPETITIVE_VERDICT.md`.
+ledger(`OVERHEAD_LEDGER.md`)가 최대 수정가능 항목을 이미 짚음: `acorn_stream_expand`의
+**neighbor 이중로드**(element 페이지를 distance·heaptid용으로 2회 핀) = scan exec의 ~45%.
 
-- **C1. 고선택도 경로 프로파일링** — 시간 소비 분해(그래프 순회 vs heap fetch vs 거리계산).
-  처방의 전제. 저위험 진입.
-- **C2. 원인별 처방** — 후보 C 상한(`ef_search` cap, 기존 TODO), 거리계산 SIMD/양자화,
-  heap fetch 절감(→ Track D2 INCLUDE 연결). C1 결과로 결정.
+- **C0. (전제) 깨끗한 재측정** — same-protocol·median-basis(prepared·literal·median+p99 분리),
+  >=200K에서 Qdrant 갭 magnitude 확정. "1.6-4.4x"는 이게 끝나기 전엔 사실로 인용 금지.
+- **C1. neighbor 이중로드 dedup** (ledger route #2) — element 페이지 1회 핀으로 distance+heaptid+
+  deleted 동시 처리. 투영 ~1.5x(775→1170 QPS @ recall 0.953). C 변경, 저위험.
+- **C2. 추가 처방** — 후보 C 상한(`ef_search` cap, 기존 TODO), 거리계산 SIMD/양자화,
+  heap fetch 절감(→ Track D2 INCLUDE 연결). C0/C1 결과로 결정.
 
 > 주: 한때 저선택도용으로 기대했던 2-hop은 폐기됐고(Track A), 고선택도 갭은 애초에 별도 문제다.
 
@@ -100,7 +105,7 @@
 
 ```
 [지금]
- ├─ C1 (고선택도 프로파일링) ─────────→ C2 처방        ← 측정된 패배 지점, 저위험 진입
+ ├─ C0 (깨끗한 재측정) → C1 (이중로드 dedup) → C2     ← 갭 magnitude 미해결, 저위험 진입
  ├─ B1 (벌크 사전확장) ──→ B2/B4                        ← 대용량 빌드 잠금 해제, 자족적
  └─ A1 노드캐시 실현됨 · A2/A3 2-hop은 폐기(γ 승)        ← 트랙 강등, 부활은 투기적
                                   │
@@ -116,16 +121,16 @@
 
 | 순위 | 항목 | 근거 |
 |------|------|------|
-| **P0** | C1 고선택도 프로파일링 | 측정된 유일 패배 지점, 진입 저위험 |
+| **P0** | C0 깨끗한 재측정 → C1 이중로드 dedup | 유일 잔여 갭(magnitude 미해결), 진입 저위험 |
 | **P0** | B1 벌크 사전확장 | 대용량 빌드 라이브락 제거 — 자족적, 영향 큼 |
 | **P1** | E1 동시처리 실측 | "기본기 OK?" 미검증분 종결 |
-| **P2** | B2 flush 병렬화 / C2 고선택도 처방 | 상위 의존 |
+| **P2** | B2 flush 병렬화 / C2 추가 처방 | 상위 의존 |
 | **P3** | D 데이터모델 / 컬럼나 | 큰 아키텍처 결정, 실데이터 음상관 결과 보고 |
 | **보류** | A2 2-hop 부활(보수적 D-drain) | 이미 폐기됨(γ 승) — 투기적, 저신뢰 |
 
 ## 권장 다음 1~2 액션
 1. **B1 (벌크 사전확장)** — 대용량 빌드 라이브락/저속을 정공법으로 제거. 자족적·즉시 가치, A/C와 독립.
-2. **C1 (고선택도 프로파일링)** — Qdrant 갭 원인 분해. C2 처방의 전제.
+2. **C0/C1 (Qdrant 갭)** — 깨끗한 median-basis 재측정으로 magnitude 확정 + ledger route #2(neighbor 이중로드 dedup, ~1.5x) 구현.
 
 ---
 

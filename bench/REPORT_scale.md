@@ -1,5 +1,8 @@
 # Scaling study: filtered-KNN at 100K / 1M / 10M — pgvector native vs Qdrant vs pg_acorn
 
+> **2026-06-19:** absolute latency here is INDICATIVE (host jitter). For the
+> reconciled acorn-vs-Qdrant verdict cite `bench/COMPETITIVE_VERDICT.md`.
+
 Real Cohere wikipedia embeddings (1024-dim), a *hard correlated* payload filter, exact
 ground truth, on one dedicated host. Measures **build time + index size**, **recall@10**,
 **latency distribution** (median/p95/p99), and **real concurrent throughput** (a

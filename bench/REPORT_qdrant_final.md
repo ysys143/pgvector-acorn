@@ -1,5 +1,9 @@
 # acorn vs Qdrant — corrected, complete verdict (250K, correlated fixture)
 
+> **2026-06-19:** for the reconciled competitive position (this report's
+> "1.6-4.4x" is cross-substrate/INDICATIVE; `OVERHEAD_LEDGER.md` refines it),
+> cite `bench/COMPETITIVE_VERDICT.md` as the single source of truth.
+
 Date: 2026-06-14. Supersedes the recall claim in `REPORT_qdrant_rematch.md`
 (which used pre-Z3 acorn numbers). Sources: `results_qdrant_rematch.json`
 (Qdrant HNSW forced, gate recall 0.302), `results_gamma_sweep.json` (acorn
@@ -39,7 +43,10 @@ gamma sweep and cross-checked against post-Z3 `results_emission_250k_quiet`.
   and is modestly faster at high selectivity at matched recall (sel=20% r~0.95:
   g4 ef400 57 ms vs g2 ef800 82 ms). It narrows but does not close the gap.
   gamma 3/4 were never benchmarked before this; gamma=2 (the prior default
-  test point) under-sold acorn.
+  test point) under-sold acorn. **Note:** gamma=4's extra density is half-wasted
+  on the global half (`qdrant-borrow-list.md`); the independent `acorn_payload_m`
+  reloption (borrow P1) is the more efficient lever — same recall at ~1.7-2.8x
+  lower latency (`REPORT_payload_m.md`).
 
 ## Honest framing
 
