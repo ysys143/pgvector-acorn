@@ -1,5 +1,11 @@
 # pg_acorn
 
+> **Dormant branch — see [`main`](https://github.com/ysys143/pg_acorn/tree/main) for current docs.**
+> This `feat/macorn-penalty` branch is kept as a reference snapshot of the M-ACORN prototype and the
+> build-perf campaign. The canonical README, the consolidated competitive verdict
+> (`bench/COMPETITIVE_VERDICT.md`), the experiment ledger (`docs/project-log.md`), and the roadmap all
+> live on **`main`**.
+
 Filterable HNSW for PostgreSQL — filtered search without recall ceiling or expensive post-filter cost.
 
 **Built on** [pgvector](https://github.com/pgvector/pgvector) and [ACORN](https://arxiv.org/abs/2403.04871) approximate nearest neighbor filtering.
