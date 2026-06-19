@@ -3,8 +3,11 @@
 > 최초 작성: 2026-06-08 (SIGMOD 2026 FVS-in-PG 분석 기반, 쿼리-side Phase 0→3)
 > 현 시점 재정리: 2026-06-19 — 3-way 벤치·스케일링, 빌드-perf 캠페인(B1-B4/N1-N4),
 > M-ACORN 음성 결론, extension-lock 라이브락 발견을 반영해 **트랙 구조로 재편**.
-> 근거 문서: `docs/sigmod2026-fvs-postgresql-analysis.md`, `docs/macorn-penalty-findings.md`,
-> `docs/build-perf-backlog.md`, `bench/REPORT_scale.md`, `bench/REPORT_3way.md`.
+> 2026-06-19 (2차): **그랜드 플랜(North Star + 4-Phase) + Track S(안정화: 대용량·빌드병렬·
+> 다중세션, 1.0 게이트)** 추가.
+> 근거 문서: `docs/project-log.md`(마스터 원장), `bench/COMPETITIVE_VERDICT.md`(경쟁판정 SSOT),
+> `docs/sigmod2026-fvs-postgresql-analysis.md`, `docs/macorn-penalty-findings.md`,
+> `docs/build-perf-backlog.md`, `bench/OVERHEAD_LEDGER.md`.
 
 ---
 
@@ -37,7 +40,37 @@
 
 ---
 
-## 개발 축 — 3 메인 트랙 + 2 보조
+## 그랜드 플랜 — North Star + 4-Phase 아크
+
+**North Star:** *PostgreSQL 안에서 전용 벡터엔진(Qdrant/Pinecone)에 필적하는 필터드 ANN* —
+트랜잭션·SQL·조인·on-disk를 유지한 채. pgvector 초월은 이미 달성. 다음은 전용엔진과의
+**substrate(버퍼매니저) 갭**을 좁히는 것. 핵심 통찰(측정): 남은 갭은 거리계산이 아니라
+**per-neighbor 버퍼 비용** — 스캔 exec의 ~45%가 neighbor 이중로드(`OVERHEAD_LEDGER.md`).
+
+| Phase | 버전 | 목표 | 핵심 작업 | 졸업 기준 |
+|-------|------|------|-----------|-----------|
+| **I. 정직한 베이스라인 + quick win** | 0.1.x | 경쟁 숫자 확정 + 측정된 저위험 이득 | C0 재측정, **C1 이중로드 dedup(~1.5x)**, B1 벌크 사전확장, B3 atomic 게이트 | Qdrant 갭 단일 숫자 확정 + C1 실측 + 10M 병렬 빌드 완주 |
+| **II. substrate 갭 종결** (승부처) | 0.2.x | 버퍼 per-hop 비용 구조 제거 | shmem topology-colocated graph(~2.6x, ledger #4), D2 INCLUDE 컬럼나 | 고선택도서도 Qdrant 동급 latency |
+| **III. 스케일 & 폭** | 0.3.x+ | 대용량·필터 폭 | B2 flush 병렬화, mwm/spill 견고화, D1 멀티/범위 필터, upstream PR | 10M+ 깨끗한 빌드/쿼리, 새 질의클래스 |
+| **IV. 안정화 & 1.0** | 1.0 | 견고성·안정성 약속 | **Track S 전체(아래)**, API/포맷 안정화 | Track S exit 충족 + 논제 실증 |
+
+> **투영치(~1.5x, ~2.6x)는 ledger(n=30K) 근거의 예측**이며 Phase I C0가 스케일에서 확정한다.
+
+```
+0.1.0 (now) ── 이김:pgvector / parity:recall / 갭:substrate-buffer
+   │  Phase I  0.1.x ── C0 재측정 + C1 이중로드 dedup + B1 라이브락 제거
+   │  Phase II 0.2.x ── colocated graph + INCLUDE → 전용엔진 필적 [승부처]
+   │  Phase III 0.3.x ── 10M+ 빌드 / 범위·멀티필터 / upstream
+   └  Phase IV 1.0  ── Track S(안정화) 완수 + 논제 실증
+```
+
+**관통 규율(이번 정리의 제도화):** ① 측정 우선(레버는 page-I/O로 증명 후 주장) ② 경쟁 숫자는
+`COMPETITIVE_VERDICT.md` 단일 진실원, 단일 배수 quote 금지 ③ **반증 가설 재시도 금지**(two-pass·
+M-ACORN·2-hop·N1 — `project-log.md` disproven) ④ 매 항해 후 `project-log.md`+memory `project-map` 갱신.
+
+---
+
+## 개발 축 (트랙) — 메인(B/C/D) + 안정화(S, 1.0 게이트) + 강등된 A
 
 ### Track A — 쿼리 알고리즘: 2-hop은 시도·폐기됨 (강등)
 
@@ -99,6 +132,27 @@ ledger(`OVERHEAD_LEDGER.md`)가 최대 수정가능 항목을 이미 짚음: `ac
 - **E2. latency/throughput 정밀 측정** — 현재 INDICATIVE 단계 탈출(측정 환경 확정).
 - **E3. index-fits-in-RAM 특성화**, 단일노드 천장 문서화.
 
+> E1/E2/E3는 아래 Track S(안정화)의 *검증* 입력이다 — S가 그것을 하드닝 작업으로 흡수한다.
+
+### Track S — Stabilization / Hardening (**1.0 게이트**)
+*왜*: 성능 트랙(B/C/D)과 별개로, 견고성 3축을 명시적으로 안정화해야 1.0을 부를 수 있다.
+기반은 있으나(BUG-3 동시성 수정 + isolation 4종) **부하·스케일 하 검증·하드닝이 비어 있다.**
+
+- **S1. 대용량 안정화** — (a) index > shared_buffers 랜덤-IO 절벽 특성화 → PG17 prefetch/ReadStream
+  검토(ledger #7: 콜드일 때만 유효), (b) 10M+ 크래시복구·재시작 무결성 + 대규모 빌드 RSS 회귀 가드,
+  (c) spill 경로 graceful degrade(B1과 묶음). [E3 흡수]
+- **S2. 빌드 병렬 안정화** — (a) B1 후 **spill+병렬 stress 테스트 신설**(현 parity는 in-memory 위주),
+  (b) atomic 회귀 GUC 게이트(B3) + 워커 스케일링 상한 문서화, (c) build_seed 결정성 회귀 가드.
+- **S3. 다중세션 안전성 (최우선 보강)** — (a) **E1 부하 검증**: pgbench 16/32 동접 필터드-KNN QPS
+  코어 스케일링 + LWLock 경합 계측(pgvector #766 류), (b) code-cache **지속 churn + 고동접** stress
+  로 "ef=1600 크래시=환경적" 가설을 결정적으로 닫기, (c) 동시 insert/update/delete + scan + vacuum
+  race + MVCC 가시성 stress(현 `concurrent_insert_scan` 너머).
+  *exit*: 정의된 동접·스케일에서 0 크래시 · 0 잘못된결과 · QPS 선형 스케일 입증.
+
+> **자산**: 병렬빌드 parity/spill/stress 회귀(`tier2_build_parallel`), code-cache 동시성(BUG-3
+> dsa double-unpin 수정 + hazard ptr) + isolation 4종(`concurrent_insert_scan`/`cache_insert_scan`/
+> `cache_evict_scan`/`gamma_build`). S는 이 위에 **부하·스케일 차원**을 더한다.
+
 ---
 
 ## 의존성 그래프 / 시퀀스
@@ -119,14 +173,17 @@ ledger(`OVERHEAD_LEDGER.md`)가 최대 수정가능 항목을 이미 짚음: `ac
 
 ## 우선순위 요약
 
-| 순위 | 항목 | 근거 |
-|------|------|------|
-| **P0** | C0 깨끗한 재측정 → C1 이중로드 dedup | 유일 잔여 갭(magnitude 미해결), 진입 저위험 |
-| **P0** | B1 벌크 사전확장 | 대용량 빌드 라이브락 제거 — 자족적, 영향 큼 |
-| **P1** | E1 동시처리 실측 | "기본기 OK?" 미검증분 종결 |
-| **P2** | B2 flush 병렬화 / C2 추가 처방 | 상위 의존 |
-| **P3** | D 데이터모델 / 컬럼나 | 큰 아키텍처 결정, 실데이터 음상관 결과 보고 |
-| **보류** | A2 2-hop 부활(보수적 D-drain) | 이미 폐기됨(γ 승) — 투기적, 저신뢰 |
+| 순위 | 항목 | Phase | 근거 |
+|------|------|-------|------|
+| **P0** | C0 깨끗한 재측정 → C1 이중로드 dedup | I | 유일 잔여 성능 갭(magnitude 미해결), 진입 저위험, ~1.5x |
+| **P0** | B1 벌크 사전확장 | I | 대용량 빌드 라이브락 제거 — 자족적, S1·S2 교집합 |
+| **P1** | **S3 다중세션 안전성** (E1 부하검증부터) | I→IV | 가장 미검증·"기본기"의 핵심 — 프로덕션 신뢰 전제 |
+| **P2** | S1 대용량 안정화 / S2 빌드병렬 안정화 / B2 flush | III·IV | B1 위에서 하드닝; 1.0 게이트 |
+| **P2** | C2 추가 처방 (ef cap·SIMD·heap fetch) | II | C0/C1 결과로 결정 |
+| **P3** | colocated graph(II) / D 데이터모델·컬럼나 | II·III | 승부처·큰 아키텍처 결정 |
+| **보류** | A2 2-hop 부활(보수적 D-drain) | — | 이미 폐기됨(γ 승) — 투기적, 저신뢰 |
+
+> **1.0 게이트 = Track S 전체 exit 충족.** 성능(C/colocated)이 1.0을 부르지 않는다 — 견고성이 부른다.
 
 ## 권장 다음 1~2 액션
 1. **B1 (벌크 사전확장)** — 대용량 빌드 라이브락/저속을 정공법으로 제거. 자족적·즉시 가치, A/C와 독립.

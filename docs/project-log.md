@@ -48,6 +48,7 @@
 - **B1/B2 atomic allocator regression** — GUC-gate merge for 0.1.1 (separability analysis done).
 - **Build scalability** — extension-lock livelock on mwm-spill; bulk pre-extend + flush parallelization (roadmap Track B).
 - Roadmap Track A (query algorithm) is **demoted** (2-hop tried+shelved); Tracks C/B/D are the live frontier.
+- Forward plan = **grand plan (4-Phase) + Track S (Stabilization: 대용량·빌드병렬·다중세션, 1.0 gate)** in `docs/development-roadmap.md`. 1.0 is gated by robustness (Track S), not performance. First move: C1 double-load dedup + C0 re-measure; biggest open robustness gap: **S3 multi-session load verification** (E1, unverified).
 
 ## Where to look
 - Competitive position → `bench/COMPETITIVE_VERDICT.md` (single source of truth)
